@@ -1,0 +1,7 @@
+playwright>=1.44.0
+structlog>=24.1.0
+python-dotenv>=1.0.0
+httpx>=0.27.0
+fastapi>=0.100.0
+uvicorn>=0.20.0
+curl_cffi>=0.5.10
