@@ -238,3 +238,47 @@ def get_scraper_service() -> RedditScraperService:
     registry = get_registry()
     return RedditScraperService(registry)
 
+
+_global_youtube_service = None
+
+def get_youtube_scraper_service() -> YouTubeScraperService:
+    """Dependency provider for YouTubeScraperService singleton."""
+    global _global_youtube_service
+    if _global_youtube_service is None:
+        from api.services.youtube import YouTubeScraperService
+        _global_youtube_service = YouTubeScraperService()
+    return _global_youtube_service
+
+
+from fastapi import Security, HTTPException, status
+from fastapi.security import APIKeyHeader, APIKeyQuery
+
+API_KEY_NAME = "X-API-Key"
+api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
+api_key_query = APIKeyQuery(name="api_key", auto_error=False)
+
+async def verify_api_key(
+    header_key: Optional[str] = Security(api_key_header),
+    query_key: Optional[str] = Security(api_key_query)
+) -> str:
+    """
+    Validate the incoming request against the configured API_KEY in environment variables.
+    Supports authorization via X-API-Key header or api_key query parameter.
+    """
+    configured_key = os.getenv("API_KEY", "stealth_secret_key_123")
+    
+    # If the key is empty, authentication is disabled/bypassed
+    if not configured_key:
+        return ""
+        
+    if header_key == configured_key:
+        return header_key
+    if query_key == configured_key:
+        return query_key
+        
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid or missing API Key. Please provide it in the 'X-API-Key' header or 'api_key' query parameter."
+    )
+
+

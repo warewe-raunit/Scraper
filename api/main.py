@@ -9,7 +9,7 @@ import sys
 import time
 import logging
 from pathlib import Path
-from fastapi import FastAPI, Request, Response, status
+from fastapi import FastAPI, Request, Response, status, Depends
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import structlog
@@ -109,12 +109,14 @@ async def log_requests(request: Request, call_next):
         )
 
 # 5. Register Routes and Routers
-from api.routes import subreddits, posts, comments, users
+from api.routes import subreddits, posts, comments, users, youtube
+from api.dependencies import verify_api_key
 
-app.include_router(subreddits.router, prefix="/api/v1")
-app.include_router(posts.router, prefix="/api/v1")
-app.include_router(comments.router, prefix="/api/v1")
-app.include_router(users.router, prefix="/api/v1")
+app.include_router(subreddits.router, prefix="/api/v1", dependencies=[Depends(verify_api_key)])
+app.include_router(posts.router, prefix="/api/v1", dependencies=[Depends(verify_api_key)])
+app.include_router(comments.router, prefix="/api/v1", dependencies=[Depends(verify_api_key)])
+app.include_router(users.router, prefix="/api/v1", dependencies=[Depends(verify_api_key)])
+app.include_router(youtube.router, prefix="/api/v1", dependencies=[Depends(verify_api_key)])
 
 @app.get("/", include_in_schema=False)
 def index_redirect():

@@ -1,0 +1,205 @@
+"""
+api/routes/youtube.py — FastAPI router for YouTube scraping and exporting.
+"""
+
+from __future__ import annotations
+
+from typing import Optional
+from fastapi import APIRouter, Query, HTTPException, status, Depends, Response, BackgroundTasks
+from fastapi.responses import HTMLResponse, FileResponse
+import os
+import structlog
+
+from api.dependencies import get_youtube_scraper_service
+from api.services.youtube import YouTubeScraperService
+
+logger = structlog.get_logger(__name__)
+router = APIRouter(prefix="/youtube", tags=["YouTube"])
+
+def format_export_response(data: dict, export_type: str, requested_format: str, scraper: YouTubeScraperService) -> Response:
+    """Helper function to format response based on requested format (json, csv, excel, html, raw)."""
+    requested_format = requested_format.lower()
+    
+    if requested_format == "csv":
+        csv_content = scraper.export_to_csv(data, export_type)
+        return Response(
+            content=csv_content,
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename=youtube_{export_type}.csv"}
+        )
+    elif requested_format == "excel":
+        xls_content = scraper.export_to_excel(data, export_type)
+        return Response(
+            content=xls_content,
+            media_type="application/vnd.ms-excel",
+            headers={"Content-Disposition": f"attachment; filename=youtube_{export_type}.xls"}
+        )
+    elif requested_format == "html":
+        html_content = scraper.export_to_html(data, export_type)
+        return HTMLResponse(content=html_content)
+    elif requested_format == "raw":
+        import json
+        raw_payload = data.get("raw_payload", data)
+        json_content = json.dumps(raw_payload, indent=2)
+        video_id = data.get("video_id", "video")
+        return Response(
+            content=json_content,
+            media_type="application/json",
+            headers={"Content-Disposition": f"attachment; filename=youtube_payload_{video_id}.json"}
+        )
+    else:
+        # Default: JSON
+        return Response(
+            content=b"",
+            status_code=200
+        )
+
+@router.get(
+    "/search",
+    summary="Search YouTube videos",
+    description="Search YouTube videos stealthily with support for sorting, timeframe filters, limits, and exporting to CSV, Excel, or HTML."
+)
+async def search_youtube(
+    q: str = Query(..., description="The search query keyword"),
+    sort: str = Query("relevance", regex="^(relevance|date|views|rating)$", description="Criteria to sort search results"),
+    time: str = Query("all", regex="^(hour|day|week|month|year|all)$", description="Timeframe filter for search results"),
+    limit: int = Query(20, ge=1, le=500, description="Max number of search results to return"),
+    format: str = Query("json", regex="^(json|csv|excel|html)$", description="Output format for search results"),
+    scraper: YouTubeScraperService = Depends(get_youtube_scraper_service)
+):
+    try:
+        results = await scraper.search(q, sort, time, limit=limit)
+        if format != "json":
+            return format_export_response(results, "search", format, scraper)
+        return results
+    except Exception as e:
+        logger.error("youtube_search_failed", q=q, error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to search YouTube: {e}"
+        )
+
+@router.get(
+    "/video",
+    summary="Get video details and comments",
+    description="Fetch extensive video metadata (views, likes, stream URLs, description) and top comments."
+)
+async def get_video_details(
+    url: Optional[str] = Query(None, description="Full YouTube video URL (e.g., https://www.youtube.com/watch?v=dQw4w9WgXcQ)"),
+    video_id: Optional[str] = Query(None, description="11-character YouTube video ID"),
+    limit: int = Query(20, ge=0, le=500, description="Max number of comments to return"),
+    include_raw: bool = Query(False, description="Whether to include raw InnerTube API payloads for debugging or offline download"),
+    format: str = Query("json", regex="^(json|csv|excel|html|raw)$", description="Output format for details"),
+    scraper: YouTubeScraperService = Depends(get_youtube_scraper_service)
+):
+    if not url and not video_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Either 'url' or 'video_id' parameter must be provided."
+        )
+        
+    target = url or video_id
+    try:
+        fetch_raw = include_raw or (format == "raw")
+        results = await scraper.get_video_details(target, comments_limit=limit, include_raw=fetch_raw) # type: ignore
+        if format != "json":
+            return format_export_response(results, "video_details", format, scraper)
+        return results
+    except Exception as e:
+        logger.error("youtube_video_details_failed", target=target, error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch video details: {e}"
+        )
+
+@router.get(
+    "/channel/{channel_id}/videos",
+    summary="Get channel videos or streams",
+    description="Fetch list of videos or live streams uploaded by a specific YouTube channel."
+)
+async def get_channel_videos(
+    channel_id: str,
+    type: str = Query("videos", regex="^(videos|live)$", description="Select either 'videos' or 'live' streams"),
+    format: str = Query("json", regex="^(json|csv|excel|html)$", description="Output format for video list"),
+    scraper: YouTubeScraperService = Depends(get_youtube_scraper_service)
+):
+    try:
+        results = await scraper.get_channel_videos(channel_id, type)
+        if format != "json":
+            return format_export_response(results, "channel", format, scraper)
+        return results
+    except Exception as e:
+        logger.error("youtube_channel_videos_failed", channel_id=channel_id, type=type, error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch channel content: {e}"
+        )
+
+@router.get(
+    "/playlist/{playlist_id}",
+    summary="Get playlist videos",
+    description="Fetch list of videos inside a specific YouTube playlist."
+)
+async def get_playlist(
+    playlist_id: str,
+    format: str = Query("json", regex="^(json|csv|excel|html)$", description="Output format for video list"),
+    scraper: YouTubeScraperService = Depends(get_youtube_scraper_service)
+):
+    try:
+        results = await scraper.get_playlist(playlist_id)
+        if format != "json":
+            return format_export_response(results, "playlist", format, scraper)
+        return results
+    except Exception as e:
+        logger.error("youtube_playlist_failed", playlist_id=playlist_id, error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch playlist content: {e}"
+        )
+
+@router.get(
+    "/download",
+    summary="Download YouTube video",
+    description="Download a YouTube video as an MP4 file in a specified resolution."
+)
+async def download_youtube_video(
+    background_tasks: BackgroundTasks,
+    url: Optional[str] = Query(None, description="Full YouTube video URL"),
+    video_id: Optional[str] = Query(None, description="11-character YouTube video ID"),
+    resolution: str = Query("360p", regex="^(144p|240p|360p|480p|720p|1080p|1440p|2160p)$", description="Target video resolution"),
+    scraper: YouTubeScraperService = Depends(get_youtube_scraper_service)
+):
+    if not url and not video_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Either 'url' or 'video_id' parameter must be provided."
+        )
+        
+    target = url or video_id
+    clean_video_id = scraper.extract_video_id(target)
+    
+    try:
+        file_path = await scraper.download_video(target, resolution)
+        
+        # Cleanup file after sending
+        def remove_file(path: str):
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception as ex:
+                    logger.error("failed_to_cleanup_downloaded_file", path=path, error=str(ex))
+                    
+        background_tasks.add_task(remove_file, file_path)
+        
+        return FileResponse(
+            path=file_path,
+            media_type="video/mp4",
+            filename=f"youtube_{clean_video_id}_{resolution}.mp4"
+        )
+    except Exception as e:
+        logger.error("youtube_download_failed", target=target, resolution=resolution, error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to download video: {e}"
+        )
+
