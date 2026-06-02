@@ -6,8 +6,9 @@ from __future__ import annotations
 
 from typing import Optional
 from fastapi import APIRouter, Query, HTTPException, status, Depends, Response, BackgroundTasks
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 import os
+import httpx
 import structlog
 
 from api.dependencies import get_youtube_scraper_service
@@ -113,7 +114,7 @@ async def get_video_details(
         )
 
 @router.get(
-    "/channel/{channel_id}/videos",
+    "/channel/{channel_id:path}/videos",
     summary="Get channel videos or streams",
     description="Fetch list of videos or live streams uploaded by a specific YouTube channel."
 )
@@ -136,7 +137,7 @@ async def get_channel_videos(
         )
 
 @router.get(
-    "/playlist/{playlist_id}",
+    "/playlist/{playlist_id:path}",
     summary="Get playlist videos",
     description="Fetch list of videos inside a specific YouTube playlist."
 )
@@ -160,13 +161,45 @@ async def get_playlist(
 @router.get(
     "/download",
     summary="Download YouTube video",
-    description="Download a YouTube video as an MP4 file in a specified resolution."
+    response_class=StreamingResponse,
+    description=(
+        "Download a YouTube video from Swagger UI without saving the MP4 on the backend by leaving `format='stream'`.\n\n"
+        "Use `format='json'` for fast direct-link metadata, `format='html'` for a download page, "
+        "`format='redirect'` to redirect to YouTube's media URL, or `format='stream'` to proxy the "
+        "remote stream without first storing it on the server. Use `format='file'` only when you "
+        "explicitly want the backend to download a temporary MP4 before returning it."
+    ),
+    responses={
+        200: {
+            "description": "Video file download by default, or the selected alternate response format.",
+            "content": {
+                "video/mp4": {
+                    "schema": {
+                        "type": "string",
+                        "format": "binary",
+                    }
+                },
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                    }
+                },
+                "text/html": {
+                    "schema": {
+                        "type": "string",
+                    }
+                },
+            },
+        }
+    }
 )
 async def download_youtube_video(
     background_tasks: BackgroundTasks,
     url: Optional[str] = Query(None, description="Full YouTube video URL"),
     video_id: Optional[str] = Query(None, description="11-character YouTube video ID"),
     resolution: str = Query("360p", regex="^(144p|240p|360p|480p|720p|1080p|1440p|2160p)$", description="Target video resolution"),
+    stream_from_server: bool = Query(False, description="Legacy file mode. If True, the backend downloads a temporary MP4 before returning it."),
+    format: str = Query("stream", regex="^(stream|json|html|redirect|file)$", description="Response format: 'stream' (default) downloads in Swagger without saving a backend file, 'json' returns URL metadata, 'html' shows a page, 'redirect' redirects the browser, 'file' downloads a temporary backend file first."),
     scraper: YouTubeScraperService = Depends(get_youtube_scraper_service)
 ):
     if not url and not video_id:
@@ -179,6 +212,42 @@ async def download_youtube_video(
     clean_video_id = scraper.extract_video_id(target)
     
     try:
+        if not stream_from_server and format != "file":
+            # Return direct download info based on format
+            direct_url_info = await scraper.get_direct_download_url(target, resolution)
+            if format == "redirect":
+                return RedirectResponse(url=direct_url_info["download_url"])
+            elif format == "html":
+                html_content = scraper.export_download_page_html(direct_url_info)
+                return HTMLResponse(content=html_content)
+            elif format == "stream":
+                download_url = direct_url_info["download_url"]
+                proxy_url = direct_url_info.get("proxy")
+                request_headers = direct_url_info.get("http_headers") or {}
+                title = direct_url_info.get("title", f"youtube_{clean_video_id}")
+                # Sanitize filename
+                safe_title = "".join([c for c in title if c.isalnum() or c in (" ", "_", "-")]).strip()
+                safe_title = safe_title.replace(" ", "_") or f"youtube_{clean_video_id}"
+                
+                async def video_streamer():
+                    timeout = httpx.Timeout(connect=15.0, read=None, write=15.0, pool=15.0)
+                    async with httpx.AsyncClient(proxy=proxy_url, timeout=timeout, follow_redirects=True) as client:
+                        async with client.stream("GET", download_url, headers=request_headers) as r:
+                            r.raise_for_status()
+                            async for chunk in r.aiter_bytes(chunk_size=1024*64):
+                                yield chunk
+                
+                return StreamingResponse(
+                    video_streamer(),
+                    media_type="video/mp4",
+                    headers={
+                        "Content-Disposition": f'attachment; filename="{safe_title}_{resolution}.mp4"'
+                    }
+                )
+            else:
+                return JSONResponse(content=direct_url_info)
+            
+        # Fallback to downloading on backend and streaming file
         file_path = await scraper.download_video(target, resolution)
         
         # Cleanup file after sending
@@ -200,6 +269,5 @@ async def download_youtube_video(
         logger.error("youtube_download_failed", target=target, resolution=resolution, error=str(e))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to download video: {e}"
+            detail=f"Failed to process download request: {e}"
         )
-

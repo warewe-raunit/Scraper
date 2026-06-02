@@ -34,20 +34,57 @@ class YouTubeScraperService:
         self._api_key: Optional[str] = None
         self._api_key_lock = asyncio.Lock()
         
-        # Initialize proxy rotator
+        # Initialize proxy states and cooldown tracker
         accounts = parse_accounts_from_env()
-        self.proxies = [acc["proxy_url"] for acc in accounts if acc.get("proxy_url")]
+        raw_proxies = [acc["proxy_url"] for acc in accounts if acc.get("proxy_url")]
+        
+        # Deduplicate proxies and store as dictionary of {proxy_url: cooldown_until}
+        self.proxy_cooldowns: Dict[str, float] = {p: 0.0 for p in raw_proxies}
         self._proxy_index = 0
         
-        logger.info("youtube_scraper_service_initialized", proxy_count=len(self.proxies))
+        logger.info("youtube_scraper_service_initialized", proxy_count=len(self.proxy_cooldowns))
+
+    @property
+    def proxies(self) -> List[str]:
+        return list(self.proxy_cooldowns.keys())
+        
+    @proxies.setter
+    def proxies(self, val: List[str]):
+        # Keep existing cooldowns but update the keys
+        self.proxy_cooldowns = {p: self.proxy_cooldowns.get(p, 0.0) for p in val}
 
     def _get_next_proxy(self) -> Optional[str]:
-        """Rotate through the list of proxies in a round-robin fashion."""
-        if not self.proxies:
+        """Get the next healthy proxy that is not currently on cooldown."""
+        if not self.proxy_cooldowns:
             return None
-        proxy = self.proxies[self._proxy_index % len(self.proxies)]
+            
+        now = time.time()
+        proxies_list = list(self.proxy_cooldowns.keys())
+        
+        # Find all proxies whose cooldown has expired
+        healthy_proxies = [p for p in proxies_list if self.proxy_cooldowns[p] <= now]
+        
+        if not healthy_proxies:
+            # Fallback: All proxies are on cooldown. Pick the one with the shortest remaining cooldown
+            best_proxy = min(proxies_list, key=lambda p: self.proxy_cooldowns[p])
+            logger.warn("all_proxies_on_cooldown_falling_back", fallback_proxy=best_proxy[:30] + "...")
+            return best_proxy
+            
+        # Round-robin select from healthy proxies
+        proxy = healthy_proxies[self._proxy_index % len(healthy_proxies)]
         self._proxy_index += 1
         return proxy
+
+    def _cool_down_proxy(self, proxy: str, duration_seconds: int = 300):
+        """Put a proxy on cooldown (e.g. on connection errors or 503 response code)."""
+        if proxy in self.proxy_cooldowns:
+            self.proxy_cooldowns[proxy] = time.time() + duration_seconds
+            logger.warn(
+                "proxy_cooldown_activated",
+                proxy=proxy[:30] + "...",
+                duration_seconds=duration_seconds,
+                until=time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self.proxy_cooldowns[proxy]))
+            )
 
     async def _get_innertube_key(self, max_retries: int = 2) -> str:
         """
@@ -65,40 +102,50 @@ class YouTubeScraperService:
             if self._api_key:
                 return self._api_key
 
-            proxy = self._get_next_proxy()
-            
-            # Method 1: GET request extraction
-            try:
-                loop = asyncio.get_running_loop()
-                session = requests.Session()
-                if proxy:
-                    session.proxies = {"http": proxy, "https": proxy}
-                
-                headers = {
-                    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    "accept-language": "en-US,en;q=0.9",
-                }
-                
-                response = await loop.run_in_executor(
-                    None,
-                    lambda: session.get("https://www.youtube.com/", headers=headers, impersonate="chrome120", timeout=10)
-                )
-                
-                if response.status_code == 200:
-                    match = re.search(r'"INNERTUBE_API_KEY":"([^"]+)"', response.text)
-                    if match:
-                        self._api_key = match.group(1)
-                        logger.info("extracted_innertube_key_via_http", key=self._api_key[:10] + "...")
-                        return self._api_key
-            except Exception as e:
-                logger.warn("http_innertube_key_extraction_failed", error=str(e))
+            # Method 1: GET request extraction with retries
+            max_key_retries = 3
+            for attempt in range(1, max_key_retries + 1):
+                proxy = self._get_next_proxy()
+                try:
+                    loop = asyncio.get_running_loop()
+                    session = requests.Session()
+                    if proxy:
+                        session.proxies = {"http": proxy, "https": proxy}
+                    
+                    headers = {
+                        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                        "accept-language": "en-US,en;q=0.9",
+                    }
+                    
+                    response = await loop.run_in_executor(
+                        None,
+                        lambda: session.get("https://www.youtube.com/", headers=headers, impersonate="chrome120", timeout=10)
+                    )
+                    
+                    if response.status_code == 200:
+                        match = re.search(r'"INNERTUBE_API_KEY":"([^"]+)"', response.text)
+                        if match:
+                            self._api_key = match.group(1)
+                            logger.info("extracted_innertube_key_via_http", key=self._api_key[:10] + "...", attempt=attempt)
+                            return self._api_key
+                    else:
+                        if proxy:
+                            self._cool_down_proxy(proxy, duration_seconds=300)
+                        logger.warn("http_innertube_key_extraction_non_200", status=response.status_code, attempt=attempt)
+                except Exception as e:
+                    if proxy:
+                        self._cool_down_proxy(proxy, duration_seconds=300)
+                    logger.warn("http_innertube_key_extraction_failed", attempt=attempt, error=str(e))
+                    if attempt < max_key_retries:
+                        await asyncio.sleep(0.5)
 
             # Method 2: Playwright fallback
             try:
                 logger.info("falling_back_to_playwright_for_key")
+                pw_proxy = self._get_next_proxy()
                 pw, browser, context, page = await launch_browser(
                     account_id="acc_01",
-                    proxy_url=proxy,
+                    proxy_url=pw_proxy,
                     headless=True
                 )
                 try:
@@ -223,9 +270,65 @@ class YouTubeScraperService:
             "video_url": f"https://www.youtube.com/watch?v={video_id}" if video_id else ""
         }
 
+    def parse_lockup_view_model(self, vm: dict) -> dict:
+        """Extract metadata from a lockupViewModel object (new YouTube UI format)."""
+        video_id = vm.get("contentId", "")
+        metadata = vm.get("metadata", {}).get("lockupMetadataViewModel", {})
+        title = metadata.get("title", {}).get("content", "")
+        
+        # Extract views and published time
+        views_text = ""
+        published_time = ""
+        meta_parts = self.find_nested_keys(metadata, "text")
+        contents = []
+        for part in meta_parts:
+            if isinstance(part, dict) and "content" in part:
+                contents.append(part["content"])
+            elif isinstance(part, str):
+                contents.append(part)
+                
+        for c in contents:
+            if "views" in c.lower() or "watching" in c.lower():
+                views_text = c
+            elif "ago" in c.lower() or "streamed" in c.lower() or "new" in c.lower():
+                published_time = c
+                
+        # Duration
+        length_text = ""
+        badges = self.find_nested_keys(vm, "thumbnailBadgeViewModel")
+        for badge in badges:
+            if isinstance(badge, dict) and "text" in badge:
+                length_text = badge["text"]
+                break
+                
+        # Thumbnails
+        thumbnails = []
+        thumb_vm = vm.get("contentImage", {}).get("thumbnailViewModel", {})
+        sources = self.find_nested_keys(thumb_vm, "sources")
+        for src_list in sources:
+            if isinstance(src_list, list):
+                thumbnails.extend(src_list)
+                
+        return {
+            "id": video_id,
+            "video_id": video_id,
+            "title": title,
+            "description": "",
+            "views": views_text,
+            "published_time": published_time,
+            "duration": length_text,
+            "channel_name": "",
+            "channel_id": "",
+            "channel_url": "",
+            "thumbnails": thumbnails,
+            "video_url": f"https://www.youtube.com/watch?v={video_id}" if video_id else ""
+        }
+
     def extract_videos(self, json_data: Any) -> List[dict]:
         """Extract and clean all video items in a response."""
         videos = []
+        
+        # 1. Parse older renderers
         for key in ["videoRenderer", "gridVideoRenderer", "compactVideoRenderer", "playlistVideoRenderer"]:
             renderers = self.find_nested_keys(json_data, key)
             for r in renderers:
@@ -233,6 +336,15 @@ class YouTubeScraperService:
                     parsed = self.parse_video_renderer(r)
                     if parsed.get("id") and not any(v["id"] == parsed["id"] for v in videos):
                         videos.append(parsed)
+                        
+        # 2. Parse new lockupViewModel
+        lockups = self.find_nested_keys(json_data, "lockupViewModel")
+        for l in lockups:
+            if isinstance(l, dict) and l.get("contentType") == "LOCKUP_CONTENT_TYPE_VIDEO":
+                parsed = self.parse_lockup_view_model(l)
+                if parsed.get("id") and not any(v["id"] == parsed["id"] for v in videos):
+                    videos.append(parsed)
+                    
         return videos
 
     def parse_comment_renderer(self, renderer: dict) -> dict:
@@ -400,33 +512,56 @@ class YouTubeScraperService:
                 
         return url_or_id
 
-    async def _execute_post(self, endpoint: str, payload: dict) -> dict:
-        """Execute a POST request to an InnerTube endpoint with rotated proxies."""
-        key = await self._get_innertube_key()
-        url = f"https://www.youtube.com/youtubei/v1/{endpoint}?key={key}"
-        proxy = self._get_next_proxy()
-        
-        loop = asyncio.get_running_loop()
-        session = requests.Session()
-        if proxy:
-            session.proxies = {"http": proxy, "https": proxy}
+    async def _execute_post(self, endpoint: str, payload: dict, max_retries: int = 3) -> dict:
+        """Execute a POST request to an InnerTube endpoint with rotated proxies and retries."""
+        last_exception = None
+        for attempt in range(1, max_retries + 1):
+            key = await self._get_innertube_key()
+            url = f"https://www.youtube.com/youtubei/v1/{endpoint}?key={key}"
+            proxy = self._get_next_proxy()
             
-        headers = {
-            "content-type": "application/json",
-            "user-agent": payload.get("context", {}).get("client", {}).get("userAgent", "Mozilla/5.0"),
-            "accept": "*/*",
-            "origin": "https://www.youtube.com"
-        }
-        
-        response = await loop.run_in_executor(
-            None,
-            lambda: session.post(url, json=payload, headers=headers, impersonate="chrome120", timeout=15)
-        )
-        
-        if response.status_code != 200:
-            raise RuntimeError(f"InnerTube POST request failed with status {response.status_code}: {response.text[:200]}")
+            logger.info("executing_innertube_post", endpoint=endpoint, attempt=attempt, proxy=proxy[:30] + "..." if proxy else None)
             
-        return response.json()
+            try:
+                loop = asyncio.get_running_loop()
+                session = requests.Session()
+                if proxy:
+                    session.proxies = {"http": proxy, "https": proxy}
+                    
+                headers = {
+                    "content-type": "application/json",
+                    "user-agent": payload.get("context", {}).get("client", {}).get("userAgent", "Mozilla/5.0"),
+                    "accept": "*/*",
+                    "origin": "https://www.youtube.com"
+                }
+                
+                # Check status and response
+                response = await loop.run_in_executor(
+                    None,
+                    lambda: session.post(url, json=payload, headers=headers, impersonate="chrome120", timeout=15)
+                )
+                
+                if response.status_code == 200:
+                    return response.json()
+                
+                raise RuntimeError(f"InnerTube POST request failed with status {response.status_code}: {response.text[:200]}")
+            except Exception as e:
+                last_exception = e
+                # Flag the proxy as bad and put it on cooldown for 5 minutes
+                if proxy:
+                    self._cool_down_proxy(proxy, duration_seconds=300)
+                    
+                logger.warn(
+                    "innertube_post_attempt_failed",
+                    endpoint=endpoint,
+                    attempt=attempt,
+                    proxy=proxy[:30] + "..." if proxy else None,
+                    error=str(e)
+                )
+                if attempt < max_retries:
+                    await asyncio.sleep(0.5 * attempt)
+        
+        raise RuntimeError(f"All {max_retries} attempts failed for InnerTube POST to {endpoint}. Last error: {last_exception}")
 
     async def search(self, query: str, sort: str = "relevance", timeframe: str = "all", limit: int = 20) -> Dict[str, Any]:
         """Perform a stealth search request using InnerTube /v1/search with pagination support."""
@@ -677,15 +812,81 @@ class YouTubeScraperService:
             
         return res
 
+    def extract_playlist_id(self, url_or_id: str) -> str:
+        """Extract playlist ID from URL or return raw ID."""
+        url_or_id = url_or_id.strip()
+        parsed = urlparse(url_or_id)
+        if parsed.netloc:
+            qs = parse_qs(parsed.query)
+            if "list" in qs:
+                return qs["list"][0]
+        # Regex check for list= parameter
+        match = re.search(r"[?&]list=([^#\&\?]+)", url_or_id)
+        if match:
+            return match.group(1)
+        return url_or_id
+
+    async def resolve_channel_id(self, url_or_handle: str) -> str:
+        """Resolve a channel URL, handle, or username to a canonical channel ID (UC...)."""
+        url_or_handle = url_or_handle.strip()
+        
+        # 1. If it's already a UC ID, return it
+        if len(url_or_handle) == 24 and url_or_handle.startswith("UC"):
+            return url_or_handle
+            
+        # 2. Extract handle or name from URL if it's a URL
+        parsed = urlparse(url_or_handle)
+        handle_or_name = url_or_handle
+        if parsed.netloc:
+            path_parts = [p for p in parsed.path.split("/") if p]
+            if path_parts:
+                if path_parts[0] == "channel" and len(path_parts) > 1:
+                    if path_parts[1].startswith("UC") and len(path_parts[1]) == 24:
+                        return path_parts[1]
+                elif path_parts[0].startswith("@"):
+                    handle_or_name = path_parts[0]
+                elif path_parts[0] in ("c", "user") and len(path_parts) > 1:
+                    handle_or_name = path_parts[1]
+                else:
+                    handle_or_name = path_parts[0]
+                    
+        # Ensure we search with the @ prefix if it looks like a handle name
+        query = handle_or_name
+        if not query.startswith("@") and not query.startswith("UC"):
+            query = f"@{query}"
+            
+        logger.info("resolving_channel_id_via_search", query=query)
+        
+        # 3. Call InnerTube search to find the channel
+        try:
+            payload = {
+                "context": self._get_client_context("WEB"),
+                "query": query,
+            }
+            data = await self._execute_post("search", payload)
+            channel_renderers = self.find_nested_keys(data, "channelRenderer")
+            if channel_renderers and isinstance(channel_renderers[0], dict):
+                channel_id = channel_renderers[0].get("channelId")
+                if channel_id and channel_id.startswith("UC"):
+                    logger.info("resolved_channel_id_via_search", query=query, channel_id=channel_id)
+                    return channel_id
+        except Exception as e:
+            logger.warn("failed_to_resolve_channel_id_via_search", query=query, error=str(e))
+            
+        return handle_or_name
+
     async def get_channel_videos(self, channel_id: str, tab_type: str = "videos") -> Dict[str, Any]:
         """Fetch all videos or streams from a channel's videos tab using /v1/browse."""
+        # Resolve handle or URL to UC channel ID
+        resolved_channel_id = await self.resolve_channel_id(channel_id)
+        
         # Videos tab parameter: EgZ2aWRlb3PyBgQKAjoA
         # Live tab parameter: EgdzdHJlYW1z8gYECgJ6AA==
         params = "EgZ2aWRlb3PyBgQKAjoA" if tab_type == "videos" else "EgdzdHJlYW1z8gYECgJ6AA=="
         
         payload = {
             "context": self._get_client_context("WEB"),
-            "browseId": channel_id,
+            "browseId": resolved_channel_id,
             "params": params
         }
         
@@ -706,8 +907,17 @@ class YouTubeScraperService:
             metadata = data.get("metadata", {})
             channel_name = metadata.get("channelMetadataRenderer", {}).get("title", "")
             
+        # Backfill channel info into the videos list
+        for v in videos:
+            if not v.get("channel_id"):
+                v["channel_id"] = resolved_channel_id
+            if not v.get("channel_name"):
+                v["channel_name"] = channel_name
+            if not v.get("channel_url"):
+                v["channel_url"] = f"https://www.youtube.com/channel/{resolved_channel_id}"
+                
         return {
-            "channel_id": channel_id,
+            "channel_id": resolved_channel_id,
             "channel_name": channel_name,
             "tab_type": tab_type,
             "results_count": len(videos),
@@ -716,8 +926,11 @@ class YouTubeScraperService:
 
     async def get_playlist(self, playlist_id: str) -> Dict[str, Any]:
         """Fetch all videos inside a playlist using /v1/browse."""
+        # Extract playlist ID if full URL is passed
+        clean_playlist_id = self.extract_playlist_id(playlist_id)
+        
         # Playlists browseId starts with VL
-        browse_id = f"VL{playlist_id}" if not playlist_id.startswith("VL") else playlist_id
+        browse_id = f"VL{clean_playlist_id}" if not clean_playlist_id.startswith("VL") else clean_playlist_id
         
         payload = {
             "context": self._get_client_context("WEB"),
@@ -734,7 +947,7 @@ class YouTubeScraperService:
             playlist_title = metadata.get("playlistMetadataRenderer", {}).get("title", "")
             
         return {
-            "playlist_id": playlist_id,
+            "playlist_id": clean_playlist_id,
             "title": playlist_title,
             "results_count": len(videos),
             "videos": videos
@@ -1200,7 +1413,260 @@ class YouTubeScraperService:
 """
         return dashboard
 
-    async def download_video(self, url_or_id: str, resolution: str = "360p") -> str:
+    async def get_direct_download_url(self, url_or_id: str, resolution: str = "360p") -> Dict[str, Any]:
+        """
+        Extract format information and return the direct stream URL (googlevideo)
+        for local download.
+        """
+        import yt_dlp
+        
+        video_id = self.extract_video_id(url_or_id)
+        
+        try:
+            height = int(resolution.replace("p", ""))
+        except ValueError:
+            height = 360
+            
+        proxy = self._get_next_proxy()
+        
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "socket_timeout": 10,
+            "retries": 2,
+        }
+        if proxy:
+            ydl_opts["proxy"] = proxy
+            
+        loop = asyncio.get_running_loop()
+        def run_ytdlp():
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(video_id, download=False)
+                return info
+                
+        try:
+            info = await loop.run_in_executor(None, run_ytdlp)
+            
+            # Find best muxed mp4 format matching target height
+            best_format = None
+            for f in info.get("formats", []):
+                if f.get("acodec") != "none" and f.get("vcodec") != "none" and f.get("ext") == "mp4":
+                    h = f.get("height") or 0
+                    if h <= height:
+                        if not best_format or h > (best_format.get("height") or 0):
+                            best_format = f
+                            
+            if not best_format:
+                # Fallback to any muxed format
+                for f in info.get("formats", []):
+                    if f.get("acodec") != "none" and f.get("vcodec") != "none":
+                        best_format = f
+                        break
+                        
+            if not best_format:
+                raise ValueError("No suitable video stream format found.")
+                
+            return {
+                "title": info.get("title", f"YouTube Video {video_id}"),
+                "video_id": video_id,
+                "resolution": f"{best_format.get('height', height)}p",
+                "download_url": best_format.get("url"),
+                "http_headers": best_format.get("http_headers") or info.get("http_headers") or {},
+                "proxy": proxy,
+                "instructions": "Open the download_url in a new tab, right-click on the video player, and select 'Save Video As...' to download it directly to your device."
+            }
+        except Exception as e:
+            if proxy:
+                self._cool_down_proxy(proxy, duration_seconds=300)
+            logger.error("youtube_direct_url_extraction_failed", video_id=video_id, error=str(e))
+            raise RuntimeError(f"Failed to extract direct download URL: {e}")
+
+    def export_download_page_html(self, data: Dict[str, Any]) -> str:
+        """Render a gorgeous, premium HTML download page for local video download."""
+        title = data.get("title", "YouTube Video")
+        resolution = data.get("resolution", "360p")
+        download_url = data.get("download_url", "")
+        
+        return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Download {title}</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&display=swap" rel="stylesheet">
+    <style>
+        :root {{
+            --bg-dark: #0f172a;
+            --card-bg: rgba(30, 41, 59, 0.7);
+            --border-glow: rgba(59, 130, 246, 0.3);
+            --primary-accent: #3b82f6;
+            --accent-glow: #60a5fa;
+            --text-main: #f8fafc;
+            --text-secondary: #94a3b8;
+        }}
+        * {{
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }}
+        body {{
+            font-family: 'Outfit', sans-serif;
+            background: linear-gradient(135deg, #090d16 0%, var(--bg-dark) 100%);
+            color: var(--text-main);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }}
+        .container {{
+            max-width: 650px;
+            width: 100%;
+            background: var(--card-bg);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            border-radius: 24px;
+            backdrop-filter: blur(12px);
+            padding: 40px;
+            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.3);
+            text-align: center;
+            animation: fadeInUp 0.6s ease-out;
+        }}
+        .icon-container {{
+            margin-bottom: 25px;
+            display: inline-block;
+            background: linear-gradient(135deg, var(--primary-accent), #8b5cf6);
+            padding: 20px;
+            border-radius: 50%;
+            box-shadow: 0 8px 24px rgba(59, 130, 246, 0.3);
+        }}
+        .icon-container svg {{
+            width: 40px;
+            height: 40px;
+            fill: #fff;
+            display: block;
+        }}
+        h1 {{
+            font-size: 1.8rem;
+            font-weight: 800;
+            background: linear-gradient(to right, #3b82f6, #8b5cf6);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 15px;
+            line-height: 1.3;
+        }}
+        .meta-badge {{
+            display: inline-block;
+            background: rgba(255, 255, 255, 0.05);
+            padding: 6px 16px;
+            border-radius: 30px;
+            font-size: 0.9rem;
+            font-weight: 600;
+            color: var(--accent-glow);
+            margin-bottom: 30px;
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }}
+        .btn-download {{
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            width: 100%;
+            padding: 16px 32px;
+            background: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 100%);
+            color: #fff;
+            text-decoration: none;
+            font-size: 1.1rem;
+            font-weight: 600;
+            border-radius: 12px;
+            box-shadow: 0 4px 20px rgba(59, 130, 246, 0.3);
+            transition: all 0.3s ease;
+            margin-bottom: 25px;
+            border: none;
+            cursor: pointer;
+        }}
+        .btn-download:hover {{
+            transform: translateY(-3px);
+            box-shadow: 0 8px 30px rgba(59, 130, 246, 0.5);
+        }}
+        .instructions-card {{
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 12px;
+            padding: 20px;
+            text-align: left;
+            margin-top: 25px;
+            border: 1px solid rgba(255, 255, 255, 0.02);
+        }}
+        .instructions-card h3 {{
+            font-size: 1rem;
+            margin-bottom: 12px;
+            color: var(--text-main);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }}
+        .instructions-card h3 svg {{
+            width: 18px;
+            height: 18px;
+            fill: var(--accent-glow);
+            display: block;
+        }}
+        .instructions-card ol {{
+            padding-left: 20px;
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+            line-height: 1.6;
+        }}
+        .instructions-card li {{
+            margin-bottom: 8px;
+        }}
+        .footer-text {{
+            margin-top: 30px;
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+        }}
+        @keyframes fadeInUp {{
+            from {{ opacity: 0; transform: translateY(20px); }}
+            to {{ opacity: 1; transform: translateY(0); }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="icon-container">
+            <svg viewBox="0 0 24 24">
+                <path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM17 13l-5 5-5-5h3V9h4v4h3z"/>
+            </svg>
+        </div>
+        <h1>{title}</h1>
+        <div class="meta-badge">Resolution: {resolution}</div>
+        
+        <a href="{download_url}" target="_blank" download class="btn-download">
+            <svg style="width:20px;height:20px;fill:currentColor" viewBox="0 0 24 24">
+                <path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM17 13l-5 5-5-5h3V9h4v4h3z"/>
+            </svg>
+            Download Video
+        </a>
+
+        <div class="instructions-card">
+            <h3>
+                <svg viewBox="0 0 24 24">
+                    <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/>
+                </svg>
+                How to Download
+            </h3>
+            <ol>
+                <li>Click the <strong>Download Video</strong> button above to open the video stream in a new tab.</li>
+                <li>In the new tab, <strong>right-click</strong> on the video player.</li>
+                <li>Select <strong>"Save Video As..."</strong> (or press <code>Ctrl + S</code>) to save the file directly to your local device.</li>
+            </ol>
+        </div>
+        
+        <p class="footer-text">Reddit Stealth Scraper — Bypass Server Storage</p>
+    </div>
+</body>
+</html>"""
+
+    async def download_video(self, url_or_id: str, resolution: str = "360p", max_retries: int = 3) -> str:
         """
         Download a YouTube video at a specific resolution (muxed format without ffmpeg)
         using yt-dlp and rotated proxies.
@@ -1217,60 +1683,71 @@ class YouTubeScraperService:
         except ValueError:
             height = 360
             
-        # Rotate proxy
-        proxy = self._get_next_proxy()
-        
         # Prepare unique download location
         downloads_dir = ROOT / "downloads"
         downloads_dir.mkdir(exist_ok=True)
         
-        # To avoid name conflicts, append a short UUID
-        unique_suffix = str(uuid.uuid4())[:8]
-        out_tmpl = str(downloads_dir / f"{video_id}_{resolution}_{unique_suffix}.%(ext)s")
-        
-        # Use single-format selection to ensure we don't trigger merge errors without ffmpeg
-        ydl_opts = {
-            "format": f"best[height<={height}][ext=mp4]/best[height<={height}]/best",
-            "outtmpl": out_tmpl,
-            "quiet": True,
-            "no_warnings": True,
-        }
-        if proxy:
-            ydl_opts["proxy"] = proxy
+        last_exception = None
+        for attempt in range(1, max_retries + 1):
+            # Rotate proxy
+            proxy = self._get_next_proxy()
             
-        logger.info("youtube_video_download_started", video_id=video_id, resolution=resolution, proxy=proxy[:15] + "..." if proxy else None)
-        
-        # Run yt-dlp in an executor to avoid blocking the asyncio event loop
-        loop = asyncio.get_running_loop()
-        
-        def run_ytdlp():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(video_id, download=True)
-                filename = ydl.prepare_filename(info)
-                return filename, info
+            # To avoid name conflicts, append a short UUID
+            unique_suffix = str(uuid.uuid4())[:8]
+            out_tmpl = str(downloads_dir / f"{video_id}_{resolution}_{unique_suffix}.%(ext)s")
+            
+            # Use single-format selection to ensure we don't trigger merge errors without ffmpeg
+            ydl_opts = {
+                "format": f"best[height<={height}][ext=mp4]/best[height<={height}]/best",
+                "outtmpl": out_tmpl,
+                "quiet": True,
+                "no_warnings": True,
+                "socket_timeout": 10,
+                "retries": 2,
+            }
+            if proxy:
+                ydl_opts["proxy"] = proxy
                 
-        try:
-            filename, info = await loop.run_in_executor(None, run_ytdlp)
+            logger.info("youtube_video_download_attempt", video_id=video_id, resolution=resolution, attempt=attempt, proxy=proxy[:15] + "..." if proxy else None)
             
-            # Find the actual downloaded file (handling possible ext change by yt-dlp)
-            actual_file = None
-            if os.path.exists(filename):
-                actual_file = filename
-            else:
-                # Fallback search in downloads dir
-                expected_prefix = f"{video_id}_{resolution}_{unique_suffix}"
-                for entry in downloads_dir.iterdir():
-                    if entry.stem == expected_prefix:
-                        actual_file = str(entry)
-                        break
-                        
-            if not actual_file or not os.path.exists(actual_file):
-                raise FileNotFoundError(f"yt-dlp completed download but the expected file was not found on disk.")
+            # Run yt-dlp in an executor to avoid blocking the asyncio event loop
+            loop = asyncio.get_running_loop()
+            
+            def run_ytdlp():
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(video_id, download=True)
+                    filename = ydl.prepare_filename(info)
+                    return filename, info
+                    
+            try:
+                filename, info = await loop.run_in_executor(None, run_ytdlp)
                 
-            logger.info("youtube_video_download_completed", video_id=video_id, file_path=actual_file, file_size=os.path.getsize(actual_file))
-            return actual_file
-            
-        except Exception as e:
-            logger.error("youtube_video_download_failed", video_id=video_id, resolution=resolution, error=str(e))
-            raise RuntimeError(f"Failed to download video: {e}")
-
+                # Find the actual downloaded file (handling possible ext change by yt-dlp)
+                actual_file = None
+                if os.path.exists(filename):
+                    actual_file = filename
+                else:
+                    # Fallback search in downloads dir
+                    expected_prefix = f"{video_id}_{resolution}_{unique_suffix}"
+                    for entry in downloads_dir.iterdir():
+                        if entry.stem == expected_prefix:
+                            actual_file = str(entry)
+                            break
+                            
+                if not actual_file or not os.path.exists(actual_file):
+                    raise FileNotFoundError(f"yt-dlp completed download but the expected file was not found on disk.")
+                    
+                logger.info("youtube_video_download_completed", video_id=video_id, file_path=actual_file, file_size=os.path.getsize(actual_file))
+                return actual_file
+                
+            except Exception as e:
+                last_exception = e
+                # Flag the proxy as bad and put it on cooldown
+                if proxy:
+                    self._cool_down_proxy(proxy, duration_seconds=300)
+                logger.warn("youtube_video_download_attempt_failed", video_id=video_id, resolution=resolution, attempt=attempt, error=str(e))
+                if attempt < max_retries:
+                    await asyncio.sleep(1)
+                    
+        logger.error("youtube_video_download_failed_all_attempts", video_id=video_id, resolution=resolution, error=str(last_exception))
+        raise RuntimeError(f"Failed to download video after {max_retries} attempts: {last_exception}")

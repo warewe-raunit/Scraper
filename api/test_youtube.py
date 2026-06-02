@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from api.main import app
+from api.dependencies import get_youtube_scraper_service
 from api.services.youtube import YouTubeScraperService
 
 client = TestClient(app)
@@ -120,6 +121,20 @@ def test_youtube_channel_videos():
     else:
         assert response.status_code in (200, 500)
 
+def test_youtube_channel_videos_url():
+    """Verify channel videos endpoint with a handle URL."""
+    import urllib.parse
+    encoded_url = urllib.parse.quote("https://youtube.com/@T-Series", safe="")
+    response = client.get(f"/api/v1/youtube/channel/{encoded_url}/videos", params={"type": "videos", "format": "json"})
+    if response.status_code == 200:
+        data = response.json()
+        assert "channel_id" in data
+        assert data["channel_id"] == "UCq-Fj5jknLsUf-MWSy4_brA"
+        assert "videos" in data
+        assert isinstance(data["videos"], list)
+    else:
+        assert response.status_code in (200, 500)
+
 def test_youtube_playlist():
     """Verify playlist videos endpoint."""
     response = client.get(f"/api/v1/youtube/playlist/{TEST_PLAYLIST_ID}", params={"format": "json"})
@@ -131,9 +146,135 @@ def test_youtube_playlist():
     else:
         assert response.status_code in (200, 500)
 
-def test_youtube_download_video():
-    """Verify that video download endpoint starts the process and returns mp4 file response."""
-    response = client.get("/api/v1/youtube/download", params={"video_id": TEST_VIDEO_ID, "resolution": "360p"})
+def test_youtube_playlist_url():
+    """Verify playlist videos endpoint with a playlist URL."""
+    import urllib.parse
+    encoded_url = urllib.parse.quote("https://youtube.com/playlist?list=PLTYbelo0OEJ4pN4rdNQKJ_MswWqQ3KfHT", safe="")
+    response = client.get(f"/api/v1/youtube/playlist/{encoded_url}", params={"format": "json"})
+    if response.status_code == 200:
+        data = response.json()
+        assert "playlist_id" in data
+        assert data["playlist_id"] == "PLTYbelo0OEJ4pN4rdNQKJ_MswWqQ3KfHT"
+        assert "videos" in data
+        assert isinstance(data["videos"], list)
+    else:
+        assert response.status_code in (200, 500)
+
+def test_youtube_download_video_json():
+    """Verify that video download endpoint returns direct download info as JSON."""
+    class FakeYouTubeScraperService:
+        def extract_video_id(self, target):
+            return TEST_VIDEO_ID
+
+        async def get_direct_download_url(self, target, resolution):
+            return {
+                "download_url": "https://example.com/video.mp4",
+                "video_id": TEST_VIDEO_ID,
+            }
+
+    app.dependency_overrides[get_youtube_scraper_service] = lambda: FakeYouTubeScraperService()
+    try:
+        response = client.get("/api/v1/youtube/download", params={"video_id": TEST_VIDEO_ID, "resolution": "360p", "format": "json"})
+    finally:
+        app.dependency_overrides.pop(get_youtube_scraper_service, None)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["download_url"] == "https://example.com/video.mp4"
+    assert data["video_id"] == TEST_VIDEO_ID
+
+def test_youtube_download_video_html():
+    """Verify that video download endpoint returns HTML download page when format=html."""
+    response = client.get("/api/v1/youtube/download", params={"video_id": TEST_VIDEO_ID, "resolution": "360p", "format": "html"})
+    if response.status_code == 200:
+        assert "text/html" in response.headers.get("content-type", "")
+        assert "Download" in response.text
+        assert "youtube" in response.text or "googlevideo" in response.text or "Video" in response.text
+    else:
+        assert response.status_code in (200, 500)
+
+def test_youtube_download_video_stream_direct():
+    """Verify that video download endpoint streams video content directly from YouTube when format=stream."""
+    response = client.get("/api/v1/youtube/download", params={"video_id": TEST_VIDEO_ID, "resolution": "360p", "format": "stream"})
+    if response.status_code == 200:
+        assert "video/mp4" in response.headers.get("content-type", "")
+        assert "attachment; filename=" in response.headers.get("content-disposition", "")
+        assert len(response.content) > 0
+    else:
+        assert response.status_code in (200, 500)
+
+def test_youtube_download_video_default(monkeypatch):
+    """Verify that the default Swagger path streams without backend temp-file download."""
+    class FakeYouTubeScraperService:
+        def extract_video_id(self, target):
+            return TEST_VIDEO_ID
+
+        async def get_direct_download_url(self, target, resolution):
+            return {
+                "download_url": "https://example.com/video.mp4",
+                "video_id": TEST_VIDEO_ID,
+                "title": "Example Video",
+                "proxy": None,
+                "http_headers": {"User-Agent": "pytest"},
+            }
+
+        async def download_video(self, target, resolution):
+            raise AssertionError("default download path should not download a backend file")
+
+    class FakeStream:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+        async def aiter_bytes(self, chunk_size):
+            yield b"fake mp4 content"
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def stream(self, method, url, headers=None):
+            assert method == "GET"
+            assert url == "https://example.com/video.mp4"
+            assert headers == {"User-Agent": "pytest"}
+            return FakeStream()
+
+    monkeypatch.setattr("api.routes.youtube.httpx.AsyncClient", FakeAsyncClient)
+
+    app.dependency_overrides[get_youtube_scraper_service] = lambda: FakeYouTubeScraperService()
+    try:
+        response = client.get("/api/v1/youtube/download", params={"video_id": TEST_VIDEO_ID, "resolution": "360p"})
+    finally:
+        app.dependency_overrides.pop(get_youtube_scraper_service, None)
+
+    assert response.status_code == 200
+    assert "video/mp4" in response.headers.get("content-type", "")
+    assert "attachment; filename=" in response.headers.get("content-disposition", "")
+    assert response.content == b"fake mp4 content"
+
+def test_youtube_download_video_redirect():
+    """Verify that video download endpoint can redirect to the direct download URL."""
+    response = client.get("/api/v1/youtube/download", params={"video_id": TEST_VIDEO_ID, "resolution": "360p", "format": "redirect"}, follow_redirects=False)
+    if response.status_code == 307:
+        assert "location" in response.headers
+        assert "googlevideo" in response.headers["location"]
+    else:
+        assert response.status_code in (307, 200, 500)
+
+def test_youtube_download_video_stream():
+    """Verify that video download endpoint can download and stream file when stream_from_server=True."""
+    response = client.get("/api/v1/youtube/download", params={"video_id": TEST_VIDEO_ID, "resolution": "360p", "stream_from_server": True})
     if response.status_code == 200:
         assert "video/mp4" in response.headers.get("content-type", "")
         assert "attachment; filename=" in response.headers.get("content-disposition", "")
@@ -149,5 +290,3 @@ def test_youtube_unauthenticated():
     response = unauth_client.get("/api/v1/youtube/search", params={"q": "python"})
     assert response.status_code == 401
     assert "Invalid or missing API Key" in response.json().get("detail", "")
-
-
