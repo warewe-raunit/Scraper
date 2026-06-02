@@ -9,6 +9,7 @@ import re
 import sys
 import time
 import asyncio
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Union
 from urllib.parse import urlparse
@@ -173,6 +174,42 @@ class RedditScraperService:
         
         raise RuntimeError(f"Failed to fetch data from Reddit API after {max_retries} attempts.")
 
+    def _published_at(self, created_utc: Any) -> Optional[str]:
+        if created_utc is None:
+            return None
+        try:
+            return datetime.fromtimestamp(float(created_utc), tz=timezone.utc).isoformat().replace("+00:00", "Z")
+        except (TypeError, ValueError, OSError):
+            return None
+
+    def _published_ago(self, created_utc: Any) -> Optional[str]:
+        if created_utc is None:
+            return None
+        try:
+            delta_seconds = int(time.time() - float(created_utc))
+        except (TypeError, ValueError):
+            return None
+
+        if delta_seconds < 0:
+            delta_seconds = abs(delta_seconds)
+            suffix = "from now"
+        else:
+            suffix = "ago"
+
+        intervals = [
+            ("year", 365 * 24 * 60 * 60),
+            ("month", 30 * 24 * 60 * 60),
+            ("day", 24 * 60 * 60),
+            ("hour", 60 * 60),
+            ("minute", 60),
+        ]
+        for label, seconds in intervals:
+            value = delta_seconds // seconds
+            if value:
+                plural = "s" if value != 1 else ""
+                return f"{value} {label}{plural} {suffix}"
+        return f"{delta_seconds} seconds {suffix}"
+
     def clean_post_data(self, post: Dict[str, Any]) -> Dict[str, Any]:
         """Extract and clean standard fields from a raw Reddit post (t3) object."""
         d = post.get("data", {})
@@ -196,6 +233,7 @@ class RedditScraperService:
                     img_url = source["url"].replace("&amp;", "&")
                     images.append(img_url)
                     
+        created_utc = d.get("created_utc")
         return {
             "id": post_id,
             "fullname": d.get("name"),
@@ -208,7 +246,9 @@ class RedditScraperService:
             "num_comments": d.get("num_comments"),
             "upvotes": d.get("score"),
             "upvote_ratio": d.get("upvote_ratio"),
-            "created_utc": d.get("created_utc"),
+            "created_utc": created_utc,
+            "published_at": self._published_at(created_utc),
+            "published_ago": self._published_ago(created_utc),
             "url": post_url,
             "original_url": d.get("url"),
             "is_video": d.get("is_video", False),
@@ -233,6 +273,7 @@ class RedditScraperService:
         if not comment_url and subreddit and actual_post_id and comment_id:
             comment_url = f"https://www.reddit.com/r/{subreddit}/comments/{actual_post_id}/_/{comment_id}/"
             
+        created_utc = d.get("created_utc")
         return {
             "id": comment_id,
             "fullname": d.get("name"),
@@ -243,7 +284,9 @@ class RedditScraperService:
             "body_html": d.get("body_html"),
             "points": d.get("score"),
             "score": d.get("score"),
-            "created_utc": d.get("created_utc"),
+            "created_utc": created_utc,
+            "published_at": self._published_at(created_utc),
+            "published_ago": self._published_ago(created_utc),
             "subreddit": subreddit,
             "url": comment_url,
             "replies_count": len(d.get("replies", {}).get("data", {}).get("children", [])) if isinstance(d.get("replies"), dict) else 0

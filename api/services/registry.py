@@ -19,10 +19,10 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from api.dependencies import parse_accounts_from_env, get_available_session_accounts
 from multi_account_login import login_account
 
 logger = structlog.get_logger(__name__)
+SESSION_MAX_AGE_SECONDS = int(os.getenv("REDDIT_SESSION_MAX_AGE_SECONDS", str(24 * 60 * 60)))
 
 class AccountState:
     def __init__(self, account_id: str, username: str, proxy_url: Optional[str] = None):
@@ -83,6 +83,8 @@ class AccountRegistry:
 
     def initialize_registry(self):
         """Initialise account states from .env and sessions directory."""
+        from api.dependencies import parse_accounts_from_env, get_available_session_accounts
+
         accounts_info = parse_accounts_from_env()
         available_sessions = get_available_session_accounts()
 
@@ -106,7 +108,7 @@ class AccountRegistry:
         return self.states.get(account_id)
 
     def check_proactive_expiry(self, account_id: str):
-        """Check if the session token is close to expiry (within 5 minutes)."""
+        """Mark sessions for relogin when token expiry or saved-session age requires it."""
         state = self.states.get(account_id)
         if not state or state.status == "needs_relogin":
             return
@@ -114,16 +116,32 @@ class AccountRegistry:
         from api.dependencies import find_session_file
         session_file = find_session_file(account_id)
         if not session_file:
+            state.status = "needs_relogin"
+            logger.warning("session_file_missing_relogin_required", account_id=account_id)
             return
             
         try:
+            now = time.time()
+            session_age_seconds = max(0.0, now - session_file.stat().st_mtime)
+            if session_age_seconds >= SESSION_MAX_AGE_SECONDS:
+                state.status = "needs_relogin"
+                logger.info(
+                    "proactive_session_age_relogin_required",
+                    account_id=account_id,
+                    session_file=str(session_file),
+                    age_seconds=round(session_age_seconds, 1),
+                    max_age_seconds=SESSION_MAX_AGE_SECONDS,
+                    saved_at=time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(session_file.stat().st_mtime))
+                )
+                return
+
             with open(session_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
             for cookie in data.get("cookies", []):
                 if cookie.get("name") == "token_v2":
                     expires = cookie.get("expires", 0)
                     # If expired or expiring within 5 minutes (300 seconds)
-                    if expires and time.time() >= expires - 300:
+                    if expires and now >= expires - 300:
                         logger.info(
                             "proactive_token_expiry_detected",
                             account_id=account_id,
@@ -145,6 +163,8 @@ class AccountRegistry:
                 state = self.states.get(requested_account_id)
                 if not state:
                     # Attempt to register dynamically if it exists in available sessions
+                    from api.dependencies import get_available_session_accounts
+
                     available_sessions = get_available_session_accounts()
                     if requested_account_id in available_sessions:
                         self.initialize_registry()
@@ -246,12 +266,16 @@ class AccountRegistry:
         async with state.lock:
             # Check if another thread/request already resolved it
             if state.status == "healthy":
-                logger.info("relogin_skipped_already_healthy", account_id=account_id)
-                return True
+                self.check_proactive_expiry(account_id)
+                if state.status == "healthy":
+                    logger.info("relogin_skipped_already_healthy", account_id=account_id)
+                    return True
 
             logger.info("relogin_triggered_for_account", account_id=account_id, username=state.username)
 
             # Resolve credentials
+            from api.dependencies import parse_accounts_from_env
+
             accounts_info = parse_accounts_from_env()
             target_acc = None
             for acc in accounts_info:
