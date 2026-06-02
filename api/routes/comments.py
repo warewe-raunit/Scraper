@@ -4,10 +4,11 @@ api/routes/comments.py — FastAPI router for comment scraping.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 from fastapi import APIRouter, Query, HTTPException, status, Depends
 import structlog
 from api.dependencies import get_scraper_service
+from api.routes import csv_response
 from api.services.scraper import RedditScraperService
 
 logger = structlog.get_logger(__name__)
@@ -62,11 +63,13 @@ async def get_post_comments(
     depth: Optional[int] = Query(None, ge=1, le=10, description="Max depth of comment replies tree to fetch"),
     limit: int = Query(100, ge=1, le=500, description="Max number of comments to return"),
     account_id: Optional[str] = Query(None, description="Specify a specific account ID to use. If omitted, rotates available sessions."),
+    format: Literal["json", "csv"] = Query("json", description="Output format"),
     scraper: RedditScraperService = Depends(get_scraper_service)
 ):
     post_id = extract_post_id(url)
     try:
-        return await scraper.scrape_post(post_id, sort=sort, depth=depth, limit=limit, account_id=account_id)
+        results = await scraper.scrape_post(post_id, sort=sort, depth=depth, limit=limit, account_id=account_id)
+        return csv_response(results, "reddit_post_comments") if format == "csv" else results
     except Exception as e:
         logger.error("get_post_comments_failed", url=url, post_id=post_id, error=str(e))
         raise HTTPException(

@@ -4,10 +4,11 @@ api/routes/posts.py — FastAPI router for post scraping, searching, and URL scr
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 from fastapi import APIRouter, Query, HTTPException, status, Depends
 import structlog
 from api.dependencies import get_scraper_service
+from api.routes import csv_response
 from api.services.scraper import RedditScraperService
 
 logger = structlog.get_logger(__name__)
@@ -26,10 +27,12 @@ async def search_posts(
     limit: int = Query(25, ge=1, le=100, description="Max number of search results to return"),
     after: Optional[str] = Query(None, description="Pagination token (after) for the next page"),
     account_id: Optional[str] = Query(None, description="Specify a specific account ID to use. If omitted, rotates available sessions."),
+    format: Literal["json", "csv"] = Query("json", description="Output format"),
     scraper: RedditScraperService = Depends(get_scraper_service)
 ):
     try:
-        return await scraper.search_posts(q, subreddit, sort, time, limit, after, account_id=account_id)
+        results = await scraper.search_posts(q, subreddit, sort, time, limit, after, account_id=account_id)
+        return csv_response(results, "reddit_post_search") if format == "csv" else results
     except Exception as e:
         logger.error("search_posts_failed", q=q, subreddit=subreddit, error=str(e))
         raise HTTPException(
@@ -45,10 +48,12 @@ async def search_posts(
 async def scrape_by_url(
     url: str = Query(..., description="The full Reddit URL to scrape (e.g. https://www.reddit.com/r/SaaS/comments/1tnnyd4/my_post/)"),
     account_id: Optional[str] = Query(None, description="Specify a specific account ID to use. If omitted, rotates available sessions."),
+    format: Literal["json", "csv"] = Query("json", description="Output format"),
     scraper: RedditScraperService = Depends(get_scraper_service)
 ):
     try:
-        return await scraper.scrape_by_url(url, account_id=account_id)
+        results = await scraper.scrape_by_url(url, account_id=account_id)
+        return csv_response(results, "reddit_by_url") if format == "csv" else results
     except ValueError as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -69,11 +74,12 @@ async def scrape_by_url(
 async def get_post_details(
     post_id: str,
     account_id: Optional[str] = Query(None, description="Specify a specific account ID to use. If omitted, rotates available sessions."),
+    format: Literal["json", "csv"] = Query("json", description="Output format"),
     scraper: RedditScraperService = Depends(get_scraper_service)
 ):
     try:
         res = await scraper.scrape_post(post_id, limit=0, account_id=account_id)
-        return res["post"]
+        return csv_response(res["post"], "reddit_post_details") if format == "csv" else res["post"]
     except Exception as e:
         logger.error("get_post_details_failed", post_id=post_id, error=str(e))
         raise HTTPException(

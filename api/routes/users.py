@@ -4,10 +4,11 @@ api/routes/users.py — FastAPI router for user details, posts, and comments scr
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 from fastapi import APIRouter, Query, HTTPException, status, Depends
 import structlog
 from api.dependencies import get_scraper_service
+from api.routes import csv_response
 from api.services.scraper import RedditScraperService
 
 logger = structlog.get_logger(__name__)
@@ -21,10 +22,12 @@ router = APIRouter(prefix="/user", tags=["Users"])
 async def get_user_about(
     username: str,
     account_id: Optional[str] = Query(None, description="Specify a specific account ID to use. If omitted, rotates available sessions."),
+    format: Literal["json", "csv"] = Query("json", description="Output format"),
     scraper: RedditScraperService = Depends(get_scraper_service)
 ):
     try:
-        return await scraper.scrape_user_about(username, account_id=account_id)
+        results = await scraper.scrape_user_about(username, account_id=account_id)
+        return csv_response(results, "reddit_user_about") if format == "csv" else results
     except Exception as e:
         logger.error("get_user_about_failed", username=username, error=str(e))
         raise HTTPException(
@@ -44,10 +47,12 @@ async def get_user_posts(
     limit: int = Query(25, ge=1, le=100, description="Max number of posts to return"),
     after: Optional[str] = Query(None, description="Pagination token (after) for the next page"),
     account_id: Optional[str] = Query(None, description="Specify a specific account ID to use. If omitted, rotates available sessions."),
+    format: Literal["json", "csv"] = Query("json", description="Output format"),
     scraper: RedditScraperService = Depends(get_scraper_service)
 ):
     try:
-        return await scraper.scrape_user_posts(username, sort, time, limit, after, account_id=account_id)
+        results = await scraper.scrape_user_posts(username, sort, time, limit, after, account_id=account_id)
+        return csv_response(results, "reddit_user_posts") if format == "csv" else results
     except Exception as e:
         logger.error("get_user_posts_failed", username=username, error=str(e))
         raise HTTPException(
@@ -67,10 +72,12 @@ async def get_user_comments(
     limit: int = Query(25, ge=1, le=100, description="Max number of comments to return"),
     after: Optional[str] = Query(None, description="Pagination token (after) for the next page"),
     account_id: Optional[str] = Query(None, description="Specify a specific account ID to use. If omitted, rotates available sessions."),
+    format: Literal["json", "csv"] = Query("json", description="Output format"),
     scraper: RedditScraperService = Depends(get_scraper_service)
 ):
     try:
-        return await scraper.scrape_user_comments(username, sort, time, limit, after, account_id=account_id)
+        results = await scraper.scrape_user_comments(username, sort, time, limit, after, account_id=account_id)
+        return csv_response(results, "reddit_user_comments") if format == "csv" else results
     except Exception as e:
         logger.error("get_user_comments_failed", username=username, error=str(e))
         raise HTTPException(
