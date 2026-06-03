@@ -833,6 +833,7 @@ async def launch_browser(
             context = await browser.new_context(**context_args)
             page = await context.new_page()
 
+    # Reddit-specific orphan backdrop watcher — only install for Reddit pages
     await _install_reddit_orphan_backdrop_watcher(page)
 
     evasion_mgr = BotDetectionEvasionManager()
@@ -840,12 +841,22 @@ async def launch_browser(
 
     loop = asyncio.get_running_loop()
 
+    def _is_reddit_page(p: Page) -> bool:
+        """Check if the page is currently on a Reddit domain."""
+        try:
+            url = p.url or ""
+            return "reddit.com" in url.lower()
+        except Exception:
+            return False
+
     async def _post_load_check(p: Page) -> None:
         try:
             await evasion_mgr.post_load_check(p)
         except Exception:
             pass
-        await _post_navigation_cleanup(p)
+        # Only run Reddit backdrop cleanup on Reddit pages
+        if _is_reddit_page(p):
+            await _post_navigation_cleanup(p)
 
     async def _post_navigation_cleanup(p: Page) -> None:
         for delay_s in (0.0, 0.8, 2.0):
@@ -859,12 +870,14 @@ async def launch_browser(
                 pass
 
     page.on("load", lambda p: loop.create_task(_post_load_check(p)))
-    page.on("domcontentloaded", lambda p: loop.create_task(_post_navigation_cleanup(p)))
+    page.on("domcontentloaded", lambda p: loop.create_task(
+        _post_navigation_cleanup(p) if _is_reddit_page(p) else asyncio.sleep(0)
+    ))
     page.on(
         "framenavigated",
         lambda frame: (
             loop.create_task(_post_navigation_cleanup(page))
-            if frame == page.main_frame else None
+            if frame == page.main_frame and _is_reddit_page(page) else None
         ),
     )
 

@@ -38,6 +38,8 @@ def _csv_rows(data: Any) -> list[dict[str, Any]]:
             return data["posts"]
         if isinstance(data.get("comments"), list):
             return data["comments"]
+        if isinstance(data.get("tweets"), list):
+            return data["tweets"]
         if isinstance(data.get("post"), dict):
             return [data["post"]]
         if isinstance(data.get("details"), dict):

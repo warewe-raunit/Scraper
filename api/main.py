@@ -5,6 +5,7 @@ Configures structured logging, routes, error handling, and documentation.
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 import logging
@@ -23,6 +24,14 @@ if str(ROOT) not in sys.path:
 # Load environment variables
 load_dotenv(override=True)
 
+import asyncio
+if sys.platform == "win32":
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    except Exception:
+        pass
+
+
 # 1. Setup Structured Logging with structlog
 logging.basicConfig(
     format="%(message)s",
@@ -30,16 +39,23 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
+log_format = os.getenv("LOG_FORMAT", "console").lower()
+processors = [
+    structlog.contextvars.merge_contextvars,
+    structlog.stdlib.add_log_level,
+    structlog.stdlib.add_logger_name,
+    structlog.processors.TimeStamper(fmt="iso" if log_format == "json" else "%Y-%m-%d %H:%M:%S"),
+    structlog.processors.StackInfoRenderer(),
+    structlog.processors.format_exc_info,
+]
+
+if log_format == "json":
+    processors.append(structlog.processors.JSONRenderer())
+else:
+    processors.append(structlog.dev.ConsoleRenderer(colors=True))
+
 structlog.configure(
-    processors=[
-        structlog.contextvars.merge_contextvars,
-        structlog.stdlib.add_log_level,
-        structlog.stdlib.add_logger_name,
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.StackInfoRenderer(),
-        structlog.processors.format_exc_info,
-        structlog.processors.JSONRenderer(),
-    ],
+    processors=processors,
     context_class=dict,
     logger_factory=structlog.stdlib.LoggerFactory(),
     wrapper_class=structlog.stdlib.BoundLogger,
@@ -109,7 +125,7 @@ async def log_requests(request: Request, call_next):
         )
 
 # 5. Register Routes and Routers
-from api.routes import subreddits, posts, comments, users, youtube
+from api.routes import subreddits, posts, comments, users, youtube, x
 from api.dependencies import verify_api_key
 
 app.include_router(subreddits.router, prefix="/api/v1", dependencies=[Depends(verify_api_key)])
@@ -117,6 +133,7 @@ app.include_router(posts.router, prefix="/api/v1", dependencies=[Depends(verify_
 app.include_router(comments.router, prefix="/api/v1", dependencies=[Depends(verify_api_key)])
 app.include_router(users.router, prefix="/api/v1", dependencies=[Depends(verify_api_key)])
 app.include_router(youtube.router, prefix="/api/v1", dependencies=[Depends(verify_api_key)])
+app.include_router(x.router, prefix="/api/v1", dependencies=[Depends(verify_api_key)])
 
 @app.get("/", include_in_schema=False)
 def index_redirect():
@@ -145,4 +162,12 @@ def health_check():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("api.main:app", host="127.0.0.1", port=8000, reload=True)
+    
+    if sys.platform == "win32":
+        # Force Uvicorn to run on the Proactor event loop under Windows
+        # to support Playwright subprocesses.
+        config = uvicorn.Config("api.main:app", host="127.0.0.1", port=8000, reload=False, loop="asyncio")
+        server = uvicorn.Server(config)
+        asyncio.run(server.serve())
+    else:
+        uvicorn.run("api.main:app", host="127.0.0.1", port=8000, reload=True)

@@ -250,6 +250,17 @@ def get_youtube_scraper_service() -> YouTubeScraperService:
     return _global_youtube_service
 
 
+_global_x_service = None
+
+def get_x_scraper_service() -> XScraperService:
+    """Dependency provider for XScraperService singleton."""
+    global _global_x_service
+    if _global_x_service is None:
+        from api.services.x import XScraperService
+        _global_x_service = XScraperService()
+    return _global_x_service
+
+
 from fastapi import Security, HTTPException, status
 from fastapi.security import APIKeyHeader, APIKeyQuery
 

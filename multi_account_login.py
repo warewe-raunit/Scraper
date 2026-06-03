@@ -15,12 +15,16 @@ from tools.login_tool import run_tool as login
 from reddit_login_state import reddit_login_state
 
 # Setup logging
-structlog.configure(
-    processors=[
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.JSONRenderer(),
-    ]
-)
+log_format = os.getenv("LOG_FORMAT", "console").lower()
+processors = [
+    structlog.processors.TimeStamper(fmt="iso" if log_format == "json" else "%Y-%m-%d %H:%M:%S"),
+]
+if log_format == "json":
+    processors.append(structlog.processors.JSONRenderer())
+else:
+    processors.append(structlog.dev.ConsoleRenderer(colors=True))
+
+structlog.configure(processors=processors)
 logger = structlog.get_logger("multi_account_login")
 
 def parse_accounts_from_env() -> list[dict]:
