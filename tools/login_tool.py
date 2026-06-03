@@ -32,7 +32,7 @@ from tools.stealth.helpers import (
 )
 from tools.stealth.captcha import solve_login_recaptcha, inject_grecaptcha_override
 from tools.reddit_urls import reddit_url
-from reddit_login_state import reddit_login_state
+from tools.reddit_login_state import reddit_login_state
 
 logger = structlog.get_logger(__name__)
 

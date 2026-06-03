@@ -25,7 +25,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from api.dependencies import parse_accounts_from_env
-from browser_manager import launch_browser, close_browser
+from tools.browser_manager import launch_browser, close_browser
 
 logger = structlog.get_logger(__name__)
 

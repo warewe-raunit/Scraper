@@ -10,9 +10,9 @@ import structlog
 # Add current directory to path if not present
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from browser_manager import LazyBrowser
+from tools.browser_manager import LazyBrowser
 from tools.login_tool import run_tool as login
-from reddit_login_state import reddit_login_state
+from tools.reddit_login_state import reddit_login_state
 
 # Setup logging
 log_format = os.getenv("LOG_FORMAT", "console").lower()

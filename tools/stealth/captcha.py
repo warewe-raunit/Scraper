@@ -16,7 +16,7 @@ from typing import Optional
 
 import structlog
 
-from proxy_config import capsolver_proxy_url
+from tools.proxy_config import capsolver_proxy_url
 from tools.reddit_urls import reddit_url
 
 logger = structlog.get_logger(__name__)

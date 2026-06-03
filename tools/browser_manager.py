@@ -26,13 +26,13 @@ import httpx
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Playwright
 import structlog
 
-from proxy_config import playwright_proxy_config
-from session_store import load_session, save_session
+from tools.proxy_config import playwright_proxy_config
+from tools.session_store import load_session, save_session
 from tools.stealth.fingerprint import BrowserProfileManager
 from tools.stealth.bot_detection_evasion import BotDetectionEvasionManager
 
 logger = structlog.get_logger(__name__)
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 PERSISTENT_PROFILE_ROOT = ROOT / "sessions" / "browser_profiles"
 
 # Cached IP-geolocation lookup per proxy URL. Pixelscan and similar checks

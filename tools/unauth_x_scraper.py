@@ -19,8 +19,8 @@ from playwright.async_api import Page
 from bs4 import BeautifulSoup
 from curl_cffi import requests as cffi_requests
 
-from browser_manager import LazyBrowser, active_profile_session_id
-from session_store import load_session
+from tools.browser_manager import LazyBrowser, active_profile_session_id
+from tools.session_store import load_session
 from tools.stealth.fingerprint import BrowserProfileManager
 from tools.stealth.helpers import _delay, _random_scroll
 

@@ -21,7 +21,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tools.stealth.fingerprint import BrowserProfileManager
-from browser_manager import _profile_http_headers
+from tools.browser_manager import _profile_http_headers
 
 logger = structlog.get_logger(__name__)
 

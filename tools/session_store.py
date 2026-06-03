@@ -9,7 +9,7 @@ import json
 import os
 from pathlib import Path
 
-SESSIONS_DIR = Path(__file__).parent / "sessions"
+SESSIONS_DIR = Path(__file__).parent.parent / "sessions"
 
 
 def _session_path(account_id: str) -> Path:
