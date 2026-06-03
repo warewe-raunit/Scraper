@@ -6,26 +6,39 @@ Supports silent bypass mode when Supabase is not configured.
 from __future__ import annotations
 
 import os
+import re
 from typing import Any, Dict, List, Optional
 import structlog
 from supabase import create_client, Client
 
 logger = structlog.get_logger(__name__)
 
+_SUFFIX_MULT = {"k": 1_000, "m": 1_000_000, "b": 1_000_000_000}
+
+
 def _parse_int(val: Any) -> int:
-    """Helper to convert string numbers with commas/letters into plain integers."""
-    if not val:
+    """Convert messy count values into plain integers for BIGINT columns.
+
+    Handles ints/floats, comma grouping, K/M/B suffixes, and display strings
+    with trailing words, e.g. "1.2M views" -> 1200000, "1,234 subscribers" ->
+    1234, "12K" -> 12000. Returns 0 when nothing numeric can be extracted.
+    """
+    if val is None or val == "":
         return 0
+    if isinstance(val, bool):
+        return int(val)
     if isinstance(val, int):
         return val
+    if isinstance(val, float):
+        return int(val)
+    # Pull the first number-like token plus an optional K/M/B magnitude suffix.
+    match = re.search(r"([\d,]+(?:\.\d+)?)\s*([KkMmBb])?", str(val))
+    if not match:
+        return 0
     try:
-        cleaned = str(val).replace(",", "").strip()
-        # Parse suffixes like K, M
-        if cleaned.lower().endswith("k"):
-            return int(float(cleaned[:-1]) * 1000)
-        if cleaned.lower().endswith("m"):
-            return int(float(cleaned[:-1]) * 1000000)
-        return int(float(cleaned))
+        number = float(match.group(1).replace(",", ""))
+        mult = _SUFFIX_MULT.get((match.group(2) or "").lower(), 1)
+        return int(number * mult)
     except Exception:
         return 0
 
@@ -79,8 +92,8 @@ class DatabaseService:
                     "author_fullname": post.get("author_fullname"),
                     "subreddit": post.get("subreddit"),
                     "subreddit_id": post.get("subreddit_id"),
-                    "num_comments": post.get("num_comments"),
-                    "upvotes": post.get("upvotes") or post.get("score"),
+                    "num_comments": _parse_int(post.get("num_comments")),
+                    "upvotes": _parse_int(post.get("upvotes") or post.get("score")),
                     "upvote_ratio": post.get("upvote_ratio"),
                     "created_utc": post.get("created_utc"),
                     "published_at": post.get("published_at"),
@@ -93,7 +106,7 @@ class DatabaseService:
                     "spoiler": post.get("spoiler", False),
                     "pinned": post.get("pinned", False),
                     "category": post.get("category"),
-                    "score": post.get("score") or post.get("upvotes")
+                    "score": _parse_int(post.get("score") or post.get("upvotes"))
                 }
                 records.append(record)
                 
@@ -122,13 +135,13 @@ class DatabaseService:
                     "username": comment.get("username"),
                     "body": comment.get("body"),
                     "body_html": comment.get("body_html"),
-                    "points": comment.get("points") or comment.get("score"),
-                    "score": comment.get("score") or comment.get("points"),
+                    "points": _parse_int(comment.get("points") or comment.get("score")),
+                    "score": _parse_int(comment.get("score") or comment.get("points")),
                     "created_utc": comment.get("created_utc"),
                     "published_at": comment.get("published_at"),
                     "subreddit": comment.get("subreddit"),
                     "url": comment.get("url"),
-                    "replies_count": comment.get("replies_count", 0)
+                    "replies_count": _parse_int(comment.get("replies_count"))
                 }
                 records.append(record)
                 
@@ -268,7 +281,8 @@ class DatabaseService:
                     "id": video_id,
                     "title": video.get("title"),
                     "description": video.get("description"),
-                    "views": str(video.get("views") or video.get("view_count") or ""),
+                    # Keep the raw display string for fidelity ("1.2M views")
+                    "views": (str(video.get("views")) if video.get("views") is not None else None),
                     "published_time": video.get("published_time"),
                     "duration": video.get("duration"),
                     "channel_name": video.get("channel_name"),
@@ -276,9 +290,9 @@ class DatabaseService:
                     "channel_url": video.get("channel_url"),
                     "thumbnails": video.get("thumbnails"),
                     "video_url": video.get("video_url") or f"https://www.youtube.com/watch?v={video_id}",
-                    "view_count": str(video.get("view_count") or video.get("views") or ""),
-                    "like_count": str(video.get("like_count") or ""),
-                    "length_seconds": video.get("length_seconds")
+                    "view_count": str(_parse_int(video.get("view_count") or video.get("views"))),
+                    "like_count": str(_parse_int(video.get("like_count"))),
+                    "length_seconds": _parse_int(video.get("length_seconds")),
                 }
                 records.append(record)
                 
@@ -311,7 +325,7 @@ class DatabaseService:
                     "author_id": c.get("author_id"),
                     "text": c.get("text"),
                     "published_time": c.get("published_time"),
-                    "like_count": str(c.get("like_count", "0")),
+                    "like_count": str(_parse_int(c.get("like_count"))),
                     "video_id": video_id
                 }
                 records.append(record)
@@ -339,7 +353,9 @@ class DatabaseService:
             record = {
                 "id": channel_id,
                 "name": channel.get("name"),
-                "subscribers": str(channel.get("subscribers" or "")),
+                # BUG FIX: was `channel.get("subscribers" or "")` which evaluates
+                # to channel.get("subscribers") with no default -> stored "None".
+                "subscribers": (str(channel.get("subscribers")) if channel.get("subscribers") is not None else None),
                 "url": channel.get("url") or f"https://www.youtube.com/channel/{channel_id}"
             }
             self.client.table("youtube_channels").upsert(record).execute()
@@ -348,3 +364,131 @@ class DatabaseService:
         except Exception as e:
             logger.error("failed_to_save_youtube_channel", error=str(e))
             return False
+
+    # ===================== Read / Query methods =====================
+    # All reads are bypass-safe: they return [] / None when Supabase is not
+    # configured, so callers never crash in local/no-DB mode. Use these instead
+    # of re-scraping when the data already exists in the database.
+
+    def _query(
+        self,
+        table: str,
+        *,
+        filters: Optional[Dict[str, Any]] = None,
+        limit: int = 50,
+        offset: int = 0,
+        order_by: Optional[str] = None,
+        descending: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Generic select with equality filters, ordering and pagination."""
+        if self.bypass_mode or not self.client:
+            return []
+        try:
+            q = self.client.table(table).select("*")
+            for col, val in (filters or {}).items():
+                if val is not None:
+                    q = q.eq(col, val)
+            if order_by:
+                q = q.order(order_by, desc=descending)
+            start = max(0, int(offset))
+            end = start + max(1, int(limit)) - 1
+            resp = q.range(start, end).execute()
+            return resp.data or []
+        except Exception as e:
+            logger.error("db_query_failed", table=table, error=str(e))
+            return []
+
+    def _query_one(self, table: str, filters: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        rows = self._query(table, filters=filters, limit=1)
+        return rows[0] if rows else None
+
+    # ----- Reddit -----
+    async def get_reddit_posts(
+        self,
+        subreddit: Optional[str] = None,
+        username: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        return self._query(
+            "reddit_posts",
+            filters={"subreddit": subreddit, "username": username},
+            limit=limit,
+            offset=offset,
+            order_by="created_utc",
+        )
+
+    async def get_reddit_post(self, post_id: str) -> Optional[Dict[str, Any]]:
+        return self._query_one("reddit_posts", {"id": post_id})
+
+    async def get_reddit_comments(
+        self,
+        post_id: Optional[str] = None,
+        username: Optional[str] = None,
+        subreddit: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        return self._query(
+            "reddit_comments",
+            filters={"post_id": post_id, "username": username, "subreddit": subreddit},
+            limit=limit,
+            offset=offset,
+            order_by="created_utc",
+        )
+
+    async def get_reddit_user(self, username: str) -> Optional[Dict[str, Any]]:
+        return self._query_one("reddit_users", {"username": username})
+
+    # ----- X (Twitter) -----
+    async def get_x_tweets(
+        self,
+        username: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        return self._query(
+            "x_tweets",
+            filters={"username": username},
+            limit=limit,
+            offset=offset,
+            order_by="date",
+        )
+
+    async def get_x_profile(self, username: str) -> Optional[Dict[str, Any]]:
+        return self._query_one("x_profiles", {"username": username})
+
+    # ----- YouTube -----
+    async def get_youtube_videos(
+        self,
+        channel_id: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        return self._query(
+            "youtube_videos",
+            filters={"channel_id": channel_id},
+            limit=limit,
+            offset=offset,
+            order_by="view_count",
+        )
+
+    async def get_youtube_video(self, video_id: str) -> Optional[Dict[str, Any]]:
+        return self._query_one("youtube_videos", {"id": video_id})
+
+    async def get_youtube_comments(
+        self,
+        video_id: str,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        return self._query(
+            "youtube_comments",
+            filters={"video_id": video_id},
+            limit=limit,
+            offset=offset,
+            order_by="like_count",
+        )
+
+    async def get_youtube_channel(self, channel_id: str) -> Optional[Dict[str, Any]]:
+        return self._query_one("youtube_channels", {"id": channel_id})

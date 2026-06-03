@@ -313,4 +313,32 @@ class AccountRegistry:
 
             if not target_acc:
                 logger.error("relogin_failed_credentials_missing", account_id=account_id)
-   
+                return False
+
+            # Captcha resolver configuration
+            captcha_provider = os.getenv("CAPTCHA_PROVIDER")
+            captcha_api_key = os.getenv("CAPTCHA_API_KEY")
+            captcha_config = None
+            if captcha_provider and captcha_api_key:
+                captcha_config = {
+                    "provider": captcha_provider.strip(),
+                    "api_key": captcha_api_key.strip()
+                }
+
+            # Run Playwright login flow asynchronously
+            try:
+                success = await login_account(target_acc, captcha_config, headless=True)
+                if success:
+                    state.status = "healthy"
+                    self._pool.clear(account_id)  # lift any active cooldown timer
+                    logger.info("relogin_completed_successfully", account_id=account_id)
+                    return True
+                else:
+                    # Login failed, cooldown account to avoid lockout
+                    self.cool_down_account(account_id, duration_seconds=600)  # cooldown for 10 minutes
+                    logger.error("relogin_flow_failed", account_id=account_id)
+                    return False
+            except Exception as e:
+                self.cool_down_account(account_id, duration_seconds=600)
+                logger.error("relogin_exception_occurred", account_id=account_id, error=str(e))
+                return False

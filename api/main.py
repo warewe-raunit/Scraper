@@ -5,10 +5,8 @@ Configures structured logging, routes, error handling, and documentation.
 
 from __future__ import annotations
 
-import os
 import sys
 import time
-import logging
 from pathlib import Path
 from fastapi import FastAPI, Request, Response, status, Depends
 from fastapi.responses import JSONResponse
@@ -32,35 +30,11 @@ if sys.platform == "win32":
         pass
 
 
-# 1. Setup Structured Logging with structlog
-logging.basicConfig(
-    format="%(message)s",
-    stream=sys.stdout,
-    level=logging.INFO,
-)
-
-log_format = os.getenv("LOG_FORMAT", "console").lower()
-processors = [
-    structlog.contextvars.merge_contextvars,
-    structlog.stdlib.add_log_level,
-    structlog.stdlib.add_logger_name,
-    structlog.processors.TimeStamper(fmt="iso" if log_format == "json" else "%Y-%m-%d %H:%M:%S"),
-    structlog.processors.StackInfoRenderer(),
-    structlog.processors.format_exc_info,
-]
-
-if log_format == "json":
-    processors.append(structlog.processors.JSONRenderer())
-else:
-    processors.append(structlog.dev.ConsoleRenderer(colors=True))
-
-structlog.configure(
-    processors=processors,
-    context_class=dict,
-    logger_factory=structlog.stdlib.LoggerFactory(),
-    wrapper_class=structlog.stdlib.BoundLogger,
-    cache_logger_on_first_use=True,
-)
+# 1. Configure logging — structlog stays the API, Loguru is the sink/renderer.
+#    (Pretty colored stdout + rotating compressed JSON file; LOG_LEVEL/LOG_FORMAT
+#    env vars still apply.) See tools/logging_config.py.
+from tools.logging_config import configure_logging
+configure_logging()
 
 logger = structlog.get_logger("api_gateway")
 
