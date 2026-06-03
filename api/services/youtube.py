@@ -26,6 +26,7 @@ if str(ROOT) not in sys.path:
 
 from api.dependencies import parse_accounts_from_env
 from tools.browser_manager import launch_browser, close_browser
+from tools.rotation import CooldownPool
 
 logger = structlog.get_logger(__name__)
 
@@ -34,58 +35,31 @@ class YouTubeScraperService:
         self.db = db
         self._api_key: Optional[str] = None
         self._api_key_lock = asyncio.Lock()
-        
-        # Initialize proxy states and cooldown tracker
+
+        # Proxy rotation + cooldown is delegated to the shared CooldownPool so
+        # the X and YouTube services use one identical implementation.
         accounts = parse_accounts_from_env()
         raw_proxies = [acc["proxy_url"] for acc in accounts if acc.get("proxy_url")]
-        
-        # Deduplicate proxies and store as dictionary of {proxy_url: cooldown_until}
-        self.proxy_cooldowns: Dict[str, float] = {p: 0.0 for p in raw_proxies}
-        self._proxy_index = 0
-        
-        logger.info("youtube_scraper_service_initialized", proxy_count=len(self.proxy_cooldowns))
+        self.proxy_pool = CooldownPool(raw_proxies, label="youtube_proxy", default_cooldown=300)
+
+        logger.info("youtube_scraper_service_initialized", proxy_count=len(self.proxy_pool))
 
     @property
     def proxies(self) -> List[str]:
-        return list(self.proxy_cooldowns.keys())
-        
+        return self.proxy_pool.items
+
     @proxies.setter
     def proxies(self, val: List[str]):
-        # Keep existing cooldowns but update the keys
-        self.proxy_cooldowns = {p: self.proxy_cooldowns.get(p, 0.0) for p in val}
+        # Preserves existing cooldowns for surviving proxies (handled by the pool).
+        self.proxy_pool.set_items(val)
 
     def _get_next_proxy(self) -> Optional[str]:
-        """Get the next healthy proxy that is not currently on cooldown."""
-        if not self.proxy_cooldowns:
-            return None
-            
-        now = time.time()
-        proxies_list = list(self.proxy_cooldowns.keys())
-        
-        # Find all proxies whose cooldown has expired
-        healthy_proxies = [p for p in proxies_list if self.proxy_cooldowns[p] <= now]
-        
-        if not healthy_proxies:
-            # Fallback: All proxies are on cooldown. Pick the one with the shortest remaining cooldown
-            best_proxy = min(proxies_list, key=lambda p: self.proxy_cooldowns[p])
-            logger.warn("all_proxies_on_cooldown_falling_back", fallback_proxy=best_proxy[:30] + "...")
-            return best_proxy
-            
-        # Round-robin select from healthy proxies
-        proxy = healthy_proxies[self._proxy_index % len(healthy_proxies)]
-        self._proxy_index += 1
-        return proxy
+        """Next healthy proxy (round-robin), or shortest-cooldown fallback."""
+        return self.proxy_pool.get_next()
 
     def _cool_down_proxy(self, proxy: str, duration_seconds: int = 300):
         """Put a proxy on cooldown (e.g. on connection errors or 503 response code)."""
-        if proxy in self.proxy_cooldowns:
-            self.proxy_cooldowns[proxy] = time.time() + duration_seconds
-            logger.warn(
-                "proxy_cooldown_activated",
-                proxy=proxy[:30] + "...",
-                duration_seconds=duration_seconds,
-                until=time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self.proxy_cooldowns[proxy]))
-            )
+        self.proxy_pool.cool_down(proxy, duration_seconds)
 
     async def _get_innertube_key(self, max_retries: int = 2) -> str:
         """

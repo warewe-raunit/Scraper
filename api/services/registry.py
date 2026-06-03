@@ -20,32 +20,47 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from multi_account_login import login_account
+from tools.rotation import CooldownPool
 
 logger = structlog.get_logger(__name__)
 SESSION_MAX_AGE_SECONDS = int(os.getenv("REDDIT_SESSION_MAX_AGE_SECONDS", str(24 * 60 * 60)))
 
 class AccountState:
-    def __init__(self, account_id: str, username: str, proxy_url: Optional[str] = None):
+    def __init__(
+        self,
+        account_id: str,
+        username: str,
+        proxy_url: Optional[str] = None,
+        pool: Optional[CooldownPool] = None,
+    ):
         self.account_id = account_id
         self.username = username
         self.proxy_url = proxy_url
         self.status = "healthy"  # "healthy", "cool_down", "needs_relogin"
-        self.cool_down_until: Optional[float] = None
+        # The cool-down timer is owned by the shared CooldownPool (one cooldown
+        # implementation across proxies and accounts). `pool` is injected by the
+        # registry; is_healthy/time_remaining_cooldown read it for this account.
+        self.pool = pool
         self.lock = asyncio.Lock()  # Ensure only one login attempt happens at a time for this account
         self.ratelimit_remaining = 100
         self.ratelimit_reset_at: Optional[float] = None
 
+    def _cooldown_active(self, now: float) -> bool:
+        """Whether the shared pool still has this account resting."""
+        if self.pool is None:
+            return False
+        return not self.pool.is_healthy(self.account_id, now)
+
     def is_healthy(self) -> bool:
         now = time.time()
-        
-        # 1. Standard cool_down check
+
+        # 1. Standard cool_down check (timer lives in the shared CooldownPool)
         if self.status == "cool_down":
-            if self.cool_down_until and now >= self.cool_down_until:
+            if not self._cooldown_active(now):
                 self.status = "healthy"
-                self.cool_down_until = None
                 return True
             return False
-            
+
         # 2. Proactive rate limit exhaustion check
         if self.ratelimit_remaining <= 1:
             if self.ratelimit_reset_at:
@@ -58,26 +73,31 @@ class AccountState:
                     return True
             else:
                 return True
-                
+
         return self.status == "healthy"
 
     def time_remaining_cooldown(self) -> float:
         now = time.time()
-        
-        # Standard cool_down
-        if self.status == "cool_down" and self.cool_down_until:
-            return max(0.0, self.cool_down_until - now)
-            
+
+        # Standard cool_down (timer lives in the shared CooldownPool)
+        if self.status == "cool_down" and self.pool is not None:
+            remaining = self.pool.time_remaining(self.account_id, now)
+            if remaining > 0:
+                return remaining
+
         # Proactive rate limit reset cooldown
         if self.ratelimit_remaining <= 1 and self.ratelimit_reset_at:
             return max(0.0, self.ratelimit_reset_at - now)
-            
+
         return 0.0
 
 class AccountRegistry:
     def __init__(self):
         self.states: Dict[str, AccountState] = {}
-        self._rotation_index = 0
+        # Shared rotation + cooldown engine for accounts (same class the X and
+        # YouTube proxy pools use). Created once and reused across re-inits so
+        # cooldown timers survive dynamic re-registration.
+        self._pool = CooldownPool(label="reddit_account", default_cooldown=300, redact=str)
         self._sync_lock = asyncio.Lock()
         self.initialize_registry()
 
@@ -94,9 +114,14 @@ class AccountRegistry:
                 self.states[account_id] = AccountState(
                     account_id=account_id,
                     username=acc["username"],
-                    proxy_url=acc.get("proxy_url")
+                    proxy_url=acc.get("proxy_url"),
+                    pool=self._pool,
                 )
-        
+
+        # Register account ids with the shared pool (preserves existing
+        # cooldown timers for accounts that survive a dynamic re-init).
+        self._pool.set_items(list(self.states.keys()))
+
         logger.info(
             "account_registry_initialized",
             configured_accounts=len(accounts_info),
@@ -218,9 +243,12 @@ class AccountRegistry:
                     f"Nearest account is '{best_account}', cooling down for {round(shortest_cooldown, 1)} seconds."
                 )
 
-            # Round-robin selection
-            selected = healthy_ids[self._rotation_index % len(healthy_ids)]
-            self._rotation_index += 1
+            # Round-robin selection via the shared CooldownPool (restricted to the
+            # accounts we just deemed healthy; all are cooldown-clear by definition).
+            selected = self._pool.get_next(candidates=healthy_ids, fallback_to_shortest=False)
+            if selected is None:
+                # Defensive: healthy_ids is non-empty here, so fall back to its head.
+                selected = healthy_ids[0]
             return selected
 
     def cool_down_account(self, account_id: str, duration_seconds: int = 300):
@@ -228,12 +256,12 @@ class AccountRegistry:
         state = self.states.get(account_id)
         if state:
             state.status = "cool_down"
-            state.cool_down_until = time.time() + duration_seconds
+            self._pool.cool_down(account_id, duration_seconds)
             logger.warn(
                 "account_cooldown_activated",
                 account_id=account_id,
                 duration_seconds=duration_seconds,
-                until=time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(state.cool_down_until))
+                until=time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time() + duration_seconds))
             )
 
     def update_account_limits(self, account_id: str, remaining: int, reset_seconds: int):
@@ -285,32 +313,4 @@ class AccountRegistry:
 
             if not target_acc:
                 logger.error("relogin_failed_credentials_missing", account_id=account_id)
-                return False
-
-            # Captcha resolver configuration
-            captcha_provider = os.getenv("CAPTCHA_PROVIDER")
-            captcha_api_key = os.getenv("CAPTCHA_API_KEY")
-            captcha_config = None
-            if captcha_provider and captcha_api_key:
-                captcha_config = {
-                    "provider": captcha_provider.strip(),
-                    "api_key": captcha_api_key.strip()
-                }
-
-            # Run Playwright login flow asynchronously
-            try:
-                success = await login_account(target_acc, captcha_config, headless=True)
-                if success:
-                    state.status = "healthy"
-                    state.cool_down_until = None
-                    logger.info("relogin_completed_successfully", account_id=account_id)
-                    return True
-                else:
-                    # Login failed, cooldown account to avoid lockout
-                    self.cool_down_account(account_id, duration_seconds=600)  # cooldown for 10 minutes
-                    logger.error("relogin_flow_failed", account_id=account_id)
-                    return False
-            except Exception as e:
-                self.cool_down_account(account_id, duration_seconds=600)
-                logger.error("relogin_exception_occurred", account_id=account_id, error=str(e))
-                return False
+   
