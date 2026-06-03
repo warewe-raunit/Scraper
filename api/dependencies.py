@@ -242,9 +242,9 @@ def get_database_service() -> Any:
         _global_db_service = DatabaseService()
     return _global_db_service
 
-def get_scraper_service(db: Any = Depends(get_database_service)) -> RedditScraperService:
+def get_reddit_scraper_service(db: Any = Depends(get_database_service)) -> RedditScraperService:
     """Dependency provider for RedditScraperService with registered accounts failover."""
-    from api.services.scraper import RedditScraperService
+    from api.services.reddit import RedditScraperService
     registry = get_registry()
     return RedditScraperService(registry, db=db)
 

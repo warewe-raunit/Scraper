@@ -7,9 +7,9 @@ from __future__ import annotations
 from typing import Literal, Optional
 from fastapi import APIRouter, Query, HTTPException, status, Depends
 import structlog
-from api.dependencies import get_scraper_service
+from api.dependencies import get_reddit_scraper_service
 from api.routes import csv_response
-from api.services.scraper import RedditScraperService
+from api.services.reddit import RedditScraperService
 
 logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/posts", tags=["Posts"])
@@ -28,7 +28,7 @@ async def search_posts(
     after: Optional[str] = Query(None, description="Pagination token (after) for the next page"),
     account_id: Optional[str] = Query(None, description="Specify a specific account ID to use. If omitted, rotates available sessions."),
     format: Literal["json", "csv"] = Query("json", description="Output format"),
-    scraper: RedditScraperService = Depends(get_scraper_service)
+    scraper: RedditScraperService = Depends(get_reddit_scraper_service)
 ):
     try:
         results = await scraper.search_posts(q, subreddit, sort, time, limit, after, account_id=account_id)
@@ -49,7 +49,7 @@ async def scrape_by_url(
     url: str = Query(..., description="The full Reddit URL to scrape (e.g. https://www.reddit.com/r/SaaS/comments/1tnnyd4/my_post/)"),
     account_id: Optional[str] = Query(None, description="Specify a specific account ID to use. If omitted, rotates available sessions."),
     format: Literal["json", "csv"] = Query("json", description="Output format"),
-    scraper: RedditScraperService = Depends(get_scraper_service)
+    scraper: RedditScraperService = Depends(get_reddit_scraper_service)
 ):
     try:
         results = await scraper.scrape_by_url(url, account_id=account_id)
@@ -75,7 +75,7 @@ async def get_post_details(
     post_id: str,
     account_id: Optional[str] = Query(None, description="Specify a specific account ID to use. If omitted, rotates available sessions."),
     format: Literal["json", "csv"] = Query("json", description="Output format"),
-    scraper: RedditScraperService = Depends(get_scraper_service)
+    scraper: RedditScraperService = Depends(get_reddit_scraper_service)
 ):
     try:
         res = await scraper.scrape_post(post_id, limit=0, account_id=account_id)

@@ -7,9 +7,9 @@ from __future__ import annotations
 from typing import Literal, Optional
 from fastapi import APIRouter, Query, HTTPException, status, Depends
 import structlog
-from api.dependencies import get_scraper_service
+from api.dependencies import get_reddit_scraper_service
 from api.routes import csv_response
-from api.services.scraper import RedditScraperService
+from api.services.reddit import RedditScraperService
 
 logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/post", tags=["Comments"])
@@ -64,7 +64,7 @@ async def get_post_comments(
     limit: int = Query(100, ge=1, le=500, description="Max number of comments to return"),
     account_id: Optional[str] = Query(None, description="Specify a specific account ID to use. If omitted, rotates available sessions."),
     format: Literal["json", "csv"] = Query("json", description="Output format"),
-    scraper: RedditScraperService = Depends(get_scraper_service)
+    scraper: RedditScraperService = Depends(get_reddit_scraper_service)
 ):
     post_id = extract_post_id(url)
     try:
