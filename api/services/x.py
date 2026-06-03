@@ -21,7 +21,8 @@ from api.dependencies import parse_accounts_from_env
 logger = structlog.get_logger(__name__)
 
 class XScraperService:
-    def __init__(self):
+    def __init__(self, db: Optional[Any] = None):
+        self.db = db
         # Initialize proxy states and cooldown tracker
         accounts = parse_accounts_from_env()
         raw_proxies = [acc["proxy_url"] for acc in accounts if acc.get("proxy_url")]
@@ -102,6 +103,11 @@ class XScraperService:
             )
             
             if result.get("success"):
+                if self.db:
+                    if result.get("profile"):
+                        await self.db.save_x_profile(result["profile"])
+                    if result.get("tweets"):
+                        await self.db.save_x_tweets(result["tweets"])
                 return result
                 
             last_result = result
@@ -147,6 +153,9 @@ class XScraperService:
             )
             
             if result.get("success"):
+                if self.db:
+                    if result.get("tweets"):
+                        await self.db.save_x_tweets(result["tweets"])
                 return result
                 
             last_result = result

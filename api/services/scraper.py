@@ -27,8 +27,9 @@ from api.services.registry import AccountRegistry
 logger = structlog.get_logger(__name__)
 
 class RedditScraperService:
-    def __init__(self, registry: AccountRegistry):
+    def __init__(self, registry: AccountRegistry, db: Optional[Any] = None):
         self.registry = registry
+        self.db = db
 
     async def _execute_with_failover(
         self,
@@ -321,6 +322,9 @@ class RedditScraperService:
             if child.get("kind") == "t3":
                 posts_list.append(self.clean_post_data(child))
                 
+        if self.db:
+            await self.db.save_reddit_posts(posts_list)
+            
         return {
             "subreddit": subreddit,
             "sort": sort,
@@ -379,6 +383,12 @@ class RedditScraperService:
                         
         recurse_comments(raw_comments)
         
+        if self.db:
+            if post_details:
+                await self.db.save_reddit_posts([post_details])
+            if comments:
+                await self.db.save_reddit_comments(comments)
+        
         return {
             "post": post_details,
             "comments_count": len(comments),
@@ -420,6 +430,9 @@ class RedditScraperService:
             if child.get("kind") == "t3":
                 posts_list.append(self.clean_post_data(child))
                 
+        if self.db:
+            await self.db.save_reddit_posts(posts_list)
+            
         return {
             "query": query,
             "subreddit": subreddit,
@@ -440,7 +453,7 @@ class RedditScraperService:
         d = raw_data.get("data", {})
         sub = d.get("subreddit", {})
         
-        return {
+        user_profile = {
             "username": d.get("name"),
             "fullname": d.get("name"),
             "id": d.get("id"),
@@ -458,6 +471,9 @@ class RedditScraperService:
             "profile_description": sub.get("public_description"),
             "url": f"https://www.reddit.com/user/{username}/"
         }
+        if self.db:
+            await self.db.save_reddit_user(user_profile)
+        return user_profile
 
     async def scrape_user_posts(
         self,
@@ -484,6 +500,9 @@ class RedditScraperService:
             if child.get("kind") == "t3":
                 posts_list.append(self.clean_post_data(child))
                 
+        if self.db:
+            await self.db.save_reddit_posts(posts_list)
+            
         return {
             "username": username,
             "sort": sort,
@@ -520,6 +539,9 @@ class RedditScraperService:
             if child.get("kind") == "t1":
                 comments_list.append(self.clean_comment_data(child))
                 
+        if self.db:
+            await self.db.save_reddit_comments(comments_list)
+            
         return {
             "username": username,
             "sort": sort,

@@ -30,7 +30,8 @@ from browser_manager import launch_browser, close_browser
 logger = structlog.get_logger(__name__)
 
 class YouTubeScraperService:
-    def __init__(self):
+    def __init__(self, db: Optional[Any] = None):
+        self.db = db
         self._api_key: Optional[str] = None
         self._api_key_lock = asyncio.Lock()
         
@@ -634,6 +635,9 @@ class YouTubeScraperService:
         # Slice results to requested limit
         videos = videos[:limit]
         
+        if self.db:
+            await self.db.save_youtube_videos(videos)
+            
         return {
             "query": query,
             "sort": sort,
@@ -810,6 +814,18 @@ class YouTubeScraperService:
                 "next": next_data
             }
             
+        if self.db:
+            if channel_id:
+                await self.db.save_youtube_channel({
+                    "id": channel_id,
+                    "name": channel_name,
+                    "subscribers": subscribers,
+                    "url": f"https://www.youtube.com/channel/{channel_id}"
+                })
+            await self.db.save_youtube_videos([res])
+            if comments:
+                await self.db.save_youtube_comments(comments, video_id)
+                
         return res
 
     def extract_playlist_id(self, url_or_id: str) -> str:
@@ -916,6 +932,15 @@ class YouTubeScraperService:
             if not v.get("channel_url"):
                 v["channel_url"] = f"https://www.youtube.com/channel/{resolved_channel_id}"
                 
+        if self.db:
+            await self.db.save_youtube_channel({
+                "id": resolved_channel_id,
+                "name": channel_name,
+                "subscribers": "",
+                "url": f"https://www.youtube.com/channel/{resolved_channel_id}"
+            })
+            await self.db.save_youtube_videos(videos)
+            
         return {
             "channel_id": resolved_channel_id,
             "channel_name": channel_name,
@@ -946,472 +971,15 @@ class YouTubeScraperService:
         if metadata:
             playlist_title = metadata.get("playlistMetadataRenderer", {}).get("title", "")
             
+        if self.db:
+            await self.db.save_youtube_videos(videos)
+            
         return {
             "playlist_id": clean_playlist_id,
             "title": playlist_title,
             "results_count": len(videos),
             "videos": videos
         }
-
-    # ================= Export Format Generators =================
-
-    def export_to_csv(self, data: Union[Dict, List], export_type: str) -> str:
-        """Export scraped content to standard CSV string."""
-        output = io.StringIO()
-        writer = csv.writer(output)
-        
-        if export_type == "search" or export_type == "channel" or export_type == "playlist":
-            videos = data.get("videos", []) if isinstance(data, dict) else data
-            writer.writerow(["Video ID", "Title", "Channel Name", "Channel ID", "Views", "Published Time", "Duration", "Video URL"])
-            for v in videos:
-                writer.writerow([
-                    v.get("video_id", ""),
-                    v.get("title", ""),
-                    v.get("channel_name", ""),
-                    v.get("channel_id", ""),
-                    v.get("views", ""),
-                    v.get("published_time", ""),
-                    v.get("duration", ""),
-                    v.get("video_url", "")
-                ])
-        elif export_type == "comments":
-            comments = data.get("comments", []) if isinstance(data, dict) else data
-            writer.writerow(["Comment ID", "Author", "Comment Text", "Published Time", "Like Count"])
-            for c in comments:
-                writer.writerow([
-                    c.get("comment_id", ""),
-                    c.get("author", ""),
-                    c.get("text", ""),
-                    c.get("published_time", ""),
-                    c.get("like_count", "")
-                ])
-        elif export_type == "video_details":
-            # Flatten main metadata
-            writer.writerow(["Field", "Value"])
-            writer.writerow(["Video ID", data.get("video_id", "")])
-            writer.writerow(["Title", data.get("title", "")])
-            writer.writerow(["Views", data.get("view_count", "")])
-            writer.writerow(["Likes", data.get("like_count", "")])
-            writer.writerow(["Duration (seconds)", data.get("length_seconds", "")])
-            channel = data.get("channel", {})
-            writer.writerow(["Channel Name", channel.get("name", "")])
-            writer.writerow(["Channel ID", channel.get("id", "")])
-            writer.writerow(["Subscribers", channel.get("subscribers", "")])
-            writer.writerow(["Description", data.get("description", "")])
-            
-        return output.getvalue()
-
-    def export_to_excel(self, data: Union[Dict, List], export_type: str) -> str:
-        """Export scraped content to an Excel-compatible HTML Spreadsheet."""
-        html = '<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:x="urn:schemas-microsoft-com:office:excel" xmlns="http://www.w3.org/TR/REC-html40">\n'
-        html += '<head><meta http-equiv="Content-type" content="text/html;charset=utf-8" />\n'
-        html += '<style>td { border: 0.5pt solid #cccccc; } th { background-color: #f2f2f2; font-weight: bold; border: 0.5pt solid #cccccc; }</style></head>\n'
-        html += '<body><table>\n'
-        
-        if export_type in ("search", "channel", "playlist"):
-            videos = data.get("videos", []) if isinstance(data, dict) else data
-            html += '<tr><th>Video ID</th><th>Title</th><th>Channel Name</th><th>Channel ID</th><th>Views</th><th>Published Time</th><th>Duration</th><th>Video URL</th></tr>\n'
-            for v in videos:
-                html += f'<tr><td>{v.get("video_id", "")}</td><td>{v.get("title", "")}</td><td>{v.get("channel_name", "")}</td><td>{v.get("channel_id", "")}</td><td>{v.get("views", "")}</td><td>{v.get("published_time", "")}</td><td>{v.get("duration", "")}</td><td>{v.get("video_url", "")}</td></tr>\n'
-        elif export_type == "comments":
-            comments = data.get("comments", []) if isinstance(data, dict) else data
-            html += '<tr><th>Comment ID</th><th>Author</th><th>Comment Text</th><th>Published Time</th><th>Like Count</th></tr>\n'
-            for c in comments:
-                html += f'<tr><td>{c.get("comment_id", "")}</td><td>{c.get("author", "")}</td><td>{c.get("text", "")}</td><td>{c.get("published_time", "")}</td><td>{c.get("like_count", "")}</td></tr>\n'
-        elif export_type == "video_details":
-            html += '<tr><th colspan="2">Video Details</th></tr>\n'
-            html += f'<tr><td>Video ID</td><td>{data.get("video_id", "")}</td></tr>\n'
-            html += f'<tr><td>Title</td><td>{data.get("title", "")}</td></tr>\n'
-            html += f'<tr><td>Views</td><td>{data.get("view_count", "")}</td></tr>\n'
-            html += f'<tr><td>Likes</td><td>{data.get("like_count", "")}</td></tr>\n'
-            html += f'<tr><td>Duration (seconds)</td><td>{data.get("length_seconds", "")}</td></tr>\n'
-            channel = data.get("channel", {})
-            html += f'<tr><td>Channel Name</td><td>{channel.get("name", "")}</td></tr>\n'
-            html += f'<tr><td>Channel ID</td><td>{channel.get("id", "")}</td></tr>\n'
-            html += f'<tr><td>Subscribers</td><td>{channel.get("subscribers", "")}</td></tr>\n'
-            html += f'<tr><td>Description</td><td>{data.get("description", "")}</td></tr>\n'
-            
-        html += '</table></body></html>'
-        return html
-
-    def export_to_html(self, data: Union[Dict, List], export_type: str) -> str:
-        """Export scraped content to a gorgeous, premium HTML Dashboard view."""
-        # Aesthetic dashboard container
-        dashboard = """<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>YouTube Stealth Scraper Export</title>
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&display=swap" rel="stylesheet">
-    <style>
-        :root {
-            --bg-dark: #0f172a;
-            --card-bg: rgba(30, 41, 59, 0.7);
-            --border-glow: rgba(59, 130, 246, 0.3);
-            --primary-accent: #3b82f6;
-            --accent-glow: #60a5fa;
-            --text-main: #f8fafc;
-            --text-secondary: #94a3b8;
-        }
-        * {
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
-        }
-        body {
-            font-family: 'Outfit', sans-serif;
-            background: linear-gradient(135deg, #090d16 0%, var(--bg-dark) 100%);
-            color: var(--text-main);
-            min-height: 100vh;
-            padding: 40px 20px;
-        }
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-        }
-        header {
-            text-align: center;
-            margin-bottom: 50px;
-            animation: fadeInDown 0.8s ease-out;
-        }
-        header h1 {
-            font-size: 3rem;
-            font-weight: 800;
-            background: linear-gradient(to right, #3b82f6, #8b5cf6);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            margin-bottom: 10px;
-        }
-        header p {
-            color: var(--text-secondary);
-            font-size: 1.1rem;
-        }
-        .dashboard-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
-            gap: 30px;
-            animation: fadeInUp 0.8s ease-out;
-        }
-        .card {
-            background: var(--card-bg);
-            border: 1px solid rgba(255, 255, 255, 0.05);
-            border-radius: 16px;
-            backdrop-filter: blur(12px);
-            overflow: hidden;
-            transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
-            display: flex;
-            flex-direction: column;
-        }
-        .card:hover {
-            transform: translateY(-8px);
-            border-color: var(--primary-accent);
-            box-shadow: 0 10px 30px rgba(59, 130, 246, 0.15);
-        }
-        .thumbnail-container {
-            position: relative;
-            width: 100%;
-            padding-top: 56.25%; /* 16:9 Aspect Ratio */
-            background-color: #000;
-            overflow: hidden;
-        }
-        .thumbnail-container img {
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            object-fit: cover;
-            transition: transform 0.6s;
-        }
-        .card:hover .thumbnail-container img {
-            transform: scale(1.05);
-        }
-        .duration-badge {
-            position: absolute;
-            bottom: 10px;
-            right: 10px;
-            background: rgba(0, 0, 0, 0.85);
-            color: #fff;
-            padding: 4px 8px;
-            border-radius: 6px;
-            font-size: 0.8rem;
-            font-weight: 600;
-        }
-        .card-content {
-            padding: 20px;
-            display: flex;
-            flex-direction: column;
-            flex-grow: 1;
-        }
-        .card-title {
-            font-size: 1.15rem;
-            font-weight: 600;
-            line-height: 1.4;
-            margin-bottom: 12px;
-            display: -webkit-box;
-            -webkit-line-clamp: 2;
-            -webkit-box-orient: vertical;
-            overflow: hidden;
-            color: var(--text-main);
-        }
-        .card-channel {
-            font-size: 0.9rem;
-            color: var(--primary-accent);
-            margin-bottom: 15px;
-            text-decoration: none;
-            display: inline-block;
-        }
-        .card-channel:hover {
-            text-decoration: underline;
-        }
-        .card-meta {
-            display: flex;
-            justify-content: space-between;
-            font-size: 0.85rem;
-            color: var(--text-secondary);
-            margin-top: auto;
-        }
-        .video-details-container {
-            background: var(--card-bg);
-            border: 1px solid rgba(255, 255, 255, 0.05);
-            border-radius: 24px;
-            backdrop-filter: blur(12px);
-            padding: 40px;
-            margin-bottom: 40px;
-            animation: fadeInUp 0.8s ease-out;
-        }
-        .video-header {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 40px;
-            margin-bottom: 40px;
-        }
-        @media (max-width: 768px) {
-            .video-header {
-                grid-template-columns: 1fr;
-            }
-        }
-        .video-player-mockup {
-            width: 100%;
-            border-radius: 16px;
-            overflow: hidden;
-            box-shadow: 0 10px 40px rgba(0,0,0,0.5);
-        }
-        .video-info h2 {
-            font-size: 2rem;
-            margin-bottom: 15px;
-            line-height: 1.3;
-        }
-        .video-stats {
-            display: flex;
-            gap: 20px;
-            margin-bottom: 25px;
-            flex-wrap: wrap;
-        }
-        .stat-badge {
-            background: rgba(255, 255, 255, 0.05);
-            padding: 8px 16px;
-            border-radius: 30px;
-            font-size: 0.95rem;
-            font-weight: 600;
-            color: var(--accent-glow);
-        }
-        .video-desc {
-            background: rgba(0, 0, 0, 0.2);
-            padding: 20px;
-            border-radius: 12px;
-            color: var(--text-secondary);
-            font-size: 0.95rem;
-            line-height: 1.6;
-            max-height: 200px;
-            overflow-y: auto;
-            white-space: pre-wrap;
-        }
-        .comments-section {
-            margin-top: 40px;
-        }
-        .comments-section h3 {
-            font-size: 1.5rem;
-            margin-bottom: 25px;
-            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-            padding-bottom: 10px;
-        }
-        .comment-item {
-            display: flex;
-            gap: 15px;
-            padding: 20px;
-            background: rgba(255, 255, 255, 0.02);
-            border-radius: 12px;
-            margin-bottom: 15px;
-            border: 1px solid rgba(255, 255, 255, 0.02);
-        }
-        .comment-avatar {
-            width: 44px;
-            height: 44px;
-            border-radius: 50%;
-            overflow: hidden;
-            background: #fff;
-            flex-shrink: 0;
-        }
-        .comment-avatar img {
-            width: 100%;
-            height: 100%;
-            object-fit: cover;
-        }
-        .comment-body h4 {
-            font-size: 0.95rem;
-            font-weight: 600;
-            margin-bottom: 6px;
-            color: var(--text-main);
-        }
-        .comment-body p {
-            color: var(--text-secondary);
-            font-size: 0.95rem;
-            line-height: 1.5;
-            margin-bottom: 8px;
-        }
-        .comment-meta {
-            font-size: 0.85rem;
-            color: var(--text-secondary);
-            display: flex;
-            gap: 15px;
-        }
-        @keyframes fadeInDown {
-            from { opacity: 0; transform: translateY(-20px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-        @keyframes fadeInUp {
-            from { opacity: 0; transform: translateY(20px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-"""
-        
-        # Close elements based on export type
-        if export_type in ("search", "channel", "playlist"):
-            title = "Search Results"
-            subtitle = f"Query: {data.get('query', '')}" if export_type == "search" else f"Channel: {data.get('channel_name', '')}"
-            if export_type == "playlist":
-                title = "Playlist Videos"
-                subtitle = f"Playlist: {data.get('title', '')}"
-                
-            dashboard += f"""
-        <header>
-            <h1>{title}</h1>
-            <p>{subtitle} — {data.get('results_count', 0)} videos extracted</p>
-        </header>
-        <div class="dashboard-grid">
-"""
-            videos = data.get("videos", [])
-            for v in videos:
-                thumb = v.get("thumbnails", [{}])[0].get("url", "")
-                dashboard += f"""
-            <div class="card">
-                <div class="thumbnail-container">
-                    <img src="{thumb}" alt="thumbnail">
-                    <span class="duration-badge">{v.get("duration", "")}</span>
-                </div>
-                <div class="card-content">
-                    <h3 class="card-title">{v.get("title", "")}</h3>
-                    <a href="{v.get("channel_url", "#")}" target="_blank" class="card-channel">{v.get("channel_name", "")}</a>
-                    <div class="card-meta">
-                        <span>{v.get("views", "")}</span>
-                        <span>{v.get("published_time", "")}</span>
-                    </div>
-                </div>
-            </div>
-"""
-            dashboard += "</div>"
-            
-        elif export_type == "video_details":
-            thumb = data.get("thumbnails", [{}])[-1].get("url", "")
-            channel = data.get("channel", {})
-            dashboard += f"""
-        <header>
-            <h1>Video Insights</h1>
-            <p>Stealth Data Extraction Report</p>
-        </header>
-        <div class="video-details-container">
-            <div class="video-header">
-                <div>
-                    <img src="{thumb}" class="video-player-mockup" alt="thumbnail">
-                </div>
-                <div class="video-info">
-                    <h2>{data.get("title", "")}</h2>
-                    <div class="video-stats">
-                        <span class="stat-badge">{data.get("view_count", "0")} views</span>
-                        <span class="stat-badge">{data.get("like_count", "0")} likes</span>
-                        <span class="stat-badge">{data.get("length_seconds", "0")}s duration</span>
-                    </div>
-                    <div style="margin-bottom: 20px;">
-                        <a href="{channel.get("url", "#")}" target="_blank" style="color: var(--primary-accent); text-decoration: none; font-weight: 600; font-size: 1.1rem;">
-                            {channel.get("name", "")}
-                        </a>
-                        <span style="color: var(--text-secondary); margin-left: 10px; font-size: 0.95rem;">{channel.get("subscribers", "")}</span>
-                    </div>
-                    <div class="video-desc">{data.get("description", "")}</div>
-                </div>
-            </div>
-            
-            <div class="comments-section">
-                <h3>Top Comments ({len(data.get("comments", []))})</h3>
-"""
-            for c in data.get("comments", []):
-                dashboard += f"""
-                <div class="comment-item">
-                    <div class="comment-avatar">
-                        <img src="{c.get("author_thumbnail", "")}" alt="avatar">
-                    </div>
-                    <div class="comment-body">
-                        <h4>{c.get("author", "")}</h4>
-                        <p>{c.get("text", "")}</p>
-                        <div class="comment-meta">
-                            <span>Likes: {c.get("like_count", "0")}</span>
-                            <span>{c.get("published_time", "")}</span>
-                        </div>
-                    </div>
-                </div>
-"""
-            dashboard += """
-            </div>
-        </div>
-"""
-        elif export_type == "comments":
-            dashboard += f"""
-        <header>
-            <h1>Comment Thread Export</h1>
-            <p>{len(data.get("comments", []))} comments extracted</p>
-        </header>
-        <div class="comments-section" style="max-width: 800px; margin: 0 auto;">
-"""
-            for c in data.get("comments", []):
-                dashboard += f"""
-            <div class="comment-item" style="background: var(--card-bg);">
-                <div class="comment-avatar">
-                    <img src="{c.get("author_thumbnail", "")}" alt="avatar">
-                </div>
-                <div class="comment-body">
-                    <h4>{c.get("author", "")}</h4>
-                    <p>{c.get("text", "")}</p>
-                    <div class="comment-meta">
-                        <span>Likes: {c.get("like_count", "0")}</span>
-                        <span>{c.get("published_time", "")}</span>
-                    </div>
-                </div>
-            </div>
-"""
-            dashboard += "</div>"
-            
-        dashboard += """
-    </div>
-</body>
-</html>
-"""
-        return dashboard
 
     async def get_direct_download_url(self, url_or_id: str, resolution: str = "360p") -> Dict[str, Any]:
         """
@@ -1480,191 +1048,6 @@ class YouTubeScraperService:
                 self._cool_down_proxy(proxy, duration_seconds=300)
             logger.error("youtube_direct_url_extraction_failed", video_id=video_id, error=str(e))
             raise RuntimeError(f"Failed to extract direct download URL: {e}")
-
-    def export_download_page_html(self, data: Dict[str, Any]) -> str:
-        """Render a gorgeous, premium HTML download page for local video download."""
-        title = data.get("title", "YouTube Video")
-        resolution = data.get("resolution", "360p")
-        download_url = data.get("download_url", "")
-        
-        return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Download {title}</title>
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&display=swap" rel="stylesheet">
-    <style>
-        :root {{
-            --bg-dark: #0f172a;
-            --card-bg: rgba(30, 41, 59, 0.7);
-            --border-glow: rgba(59, 130, 246, 0.3);
-            --primary-accent: #3b82f6;
-            --accent-glow: #60a5fa;
-            --text-main: #f8fafc;
-            --text-secondary: #94a3b8;
-        }}
-        * {{
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
-        }}
-        body {{
-            font-family: 'Outfit', sans-serif;
-            background: linear-gradient(135deg, #090d16 0%, var(--bg-dark) 100%);
-            color: var(--text-main);
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 20px;
-        }}
-        .container {{
-            max-width: 650px;
-            width: 100%;
-            background: var(--card-bg);
-            border: 1px solid rgba(255, 255, 255, 0.05);
-            border-radius: 24px;
-            backdrop-filter: blur(12px);
-            padding: 40px;
-            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.3);
-            text-align: center;
-            animation: fadeInUp 0.6s ease-out;
-        }}
-        .icon-container {{
-            margin-bottom: 25px;
-            display: inline-block;
-            background: linear-gradient(135deg, var(--primary-accent), #8b5cf6);
-            padding: 20px;
-            border-radius: 50%;
-            box-shadow: 0 8px 24px rgba(59, 130, 246, 0.3);
-        }}
-        .icon-container svg {{
-            width: 40px;
-            height: 40px;
-            fill: #fff;
-            display: block;
-        }}
-        h1 {{
-            font-size: 1.8rem;
-            font-weight: 800;
-            background: linear-gradient(to right, #3b82f6, #8b5cf6);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            margin-bottom: 15px;
-            line-height: 1.3;
-        }}
-        .meta-badge {{
-            display: inline-block;
-            background: rgba(255, 255, 255, 0.05);
-            padding: 6px 16px;
-            border-radius: 30px;
-            font-size: 0.9rem;
-            font-weight: 600;
-            color: var(--accent-glow);
-            margin-bottom: 30px;
-            border: 1px solid rgba(255, 255, 255, 0.05);
-        }}
-        .btn-download {{
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            gap: 10px;
-            width: 100%;
-            padding: 16px 32px;
-            background: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 100%);
-            color: #fff;
-            text-decoration: none;
-            font-size: 1.1rem;
-            font-weight: 600;
-            border-radius: 12px;
-            box-shadow: 0 4px 20px rgba(59, 130, 246, 0.3);
-            transition: all 0.3s ease;
-            margin-bottom: 25px;
-            border: none;
-            cursor: pointer;
-        }}
-        .btn-download:hover {{
-            transform: translateY(-3px);
-            box-shadow: 0 8px 30px rgba(59, 130, 246, 0.5);
-        }}
-        .instructions-card {{
-            background: rgba(0, 0, 0, 0.2);
-            border-radius: 12px;
-            padding: 20px;
-            text-align: left;
-            margin-top: 25px;
-            border: 1px solid rgba(255, 255, 255, 0.02);
-        }}
-        .instructions-card h3 {{
-            font-size: 1rem;
-            margin-bottom: 12px;
-            color: var(--text-main);
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }}
-        .instructions-card h3 svg {{
-            width: 18px;
-            height: 18px;
-            fill: var(--accent-glow);
-            display: block;
-        }}
-        .instructions-card ol {{
-            padding-left: 20px;
-            color: var(--text-secondary);
-            font-size: 0.9rem;
-            line-height: 1.6;
-        }}
-        .instructions-card li {{
-            margin-bottom: 8px;
-        }}
-        .footer-text {{
-            margin-top: 30px;
-            font-size: 0.8rem;
-            color: var(--text-secondary);
-        }}
-        @keyframes fadeInUp {{
-            from {{ opacity: 0; transform: translateY(20px); }}
-            to {{ opacity: 1; transform: translateY(0); }}
-        }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="icon-container">
-            <svg viewBox="0 0 24 24">
-                <path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM17 13l-5 5-5-5h3V9h4v4h3z"/>
-            </svg>
-        </div>
-        <h1>{title}</h1>
-        <div class="meta-badge">Resolution: {resolution}</div>
-        
-        <a href="{download_url}" target="_blank" download class="btn-download">
-            <svg style="width:20px;height:20px;fill:currentColor" viewBox="0 0 24 24">
-                <path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM17 13l-5 5-5-5h3V9h4v4h3z"/>
-            </svg>
-            Download Video
-        </a>
-
-        <div class="instructions-card">
-            <h3>
-                <svg viewBox="0 0 24 24">
-                    <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/>
-                </svg>
-                How to Download
-            </h3>
-            <ol>
-                <li>Click the <strong>Download Video</strong> button above to open the video stream in a new tab.</li>
-                <li>In the new tab, <strong>right-click</strong> on the video player.</li>
-                <li>Select <strong>"Save Video As..."</strong> (or press <code>Ctrl + S</code>) to save the file directly to your local device.</li>
-            </ol>
-        </div>
-        
-        <p class="footer-text">Reddit Stealth Scraper — Bypass Server Storage</p>
-    </div>
-</body>
-</html>"""
 
     async def download_video(self, url_or_id: str, resolution: str = "360p", max_retries: int = 3) -> str:
         """

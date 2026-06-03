@@ -223,7 +223,9 @@ def create_stealth_client(account_id: Optional[str] = None) -> requests.Session:
 
 # Initialize Global AccountRegistry Singleton
 from api.services.registry import AccountRegistry
+from fastapi import Depends
 _global_registry = None
+_global_db_service = None
 
 def get_registry() -> AccountRegistry:
     """Dependency provider for global AccountRegistry singleton."""
@@ -232,32 +234,40 @@ def get_registry() -> AccountRegistry:
         _global_registry = AccountRegistry()
     return _global_registry
 
-def get_scraper_service() -> RedditScraperService:
+def get_database_service() -> Any:
+    """Dependency provider for the global DatabaseService singleton."""
+    global _global_db_service
+    if _global_db_service is None:
+        from api.services.database import DatabaseService
+        _global_db_service = DatabaseService()
+    return _global_db_service
+
+def get_scraper_service(db: Any = Depends(get_database_service)) -> RedditScraperService:
     """Dependency provider for RedditScraperService with registered accounts failover."""
     from api.services.scraper import RedditScraperService
     registry = get_registry()
-    return RedditScraperService(registry)
+    return RedditScraperService(registry, db=db)
 
 
 _global_youtube_service = None
 
-def get_youtube_scraper_service() -> YouTubeScraperService:
+def get_youtube_scraper_service(db: Any = Depends(get_database_service)) -> YouTubeScraperService:
     """Dependency provider for YouTubeScraperService singleton."""
     global _global_youtube_service
     if _global_youtube_service is None:
         from api.services.youtube import YouTubeScraperService
-        _global_youtube_service = YouTubeScraperService()
+        _global_youtube_service = YouTubeScraperService(db=db)
     return _global_youtube_service
 
 
 _global_x_service = None
 
-def get_x_scraper_service() -> XScraperService:
+def get_x_scraper_service(db: Any = Depends(get_database_service)) -> XScraperService:
     """Dependency provider for XScraperService singleton."""
     global _global_x_service
     if _global_x_service is None:
         from api.services.x import XScraperService
-        _global_x_service = XScraperService()
+        _global_x_service = XScraperService(db=db)
     return _global_x_service
 
 

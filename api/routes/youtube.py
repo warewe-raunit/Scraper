@@ -13,30 +13,22 @@ import structlog
 
 from api.dependencies import get_youtube_scraper_service
 from api.services.youtube import YouTubeScraperService
+from api.utils.exporters import export_to_csv, export_to_excel, export_to_html_dashboard, export_download_page_html
 
 logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/youtube", tags=["YouTube"])
 
-def format_export_response(data: dict, export_type: str, requested_format: str, scraper: YouTubeScraperService) -> Response:
+def format_export_response(data: dict, export_type: str, requested_format: str, scraper: Optional[YouTubeScraperService] = None) -> Response:
     """Helper function to format response based on requested format (json, csv, excel, html, raw)."""
     requested_format = requested_format.lower()
+    filename = f"youtube_{export_type}"
     
     if requested_format == "csv":
-        csv_content = scraper.export_to_csv(data, export_type)
-        return Response(
-            content=csv_content,
-            media_type="text/csv",
-            headers={"Content-Disposition": f"attachment; filename=youtube_{export_type}.csv"}
-        )
+        return export_to_csv(data, filename)
     elif requested_format == "excel":
-        xls_content = scraper.export_to_excel(data, export_type)
-        return Response(
-            content=xls_content,
-            media_type="application/vnd.ms-excel",
-            headers={"Content-Disposition": f"attachment; filename=youtube_{export_type}.xls"}
-        )
+        return export_to_excel(data, filename)
     elif requested_format == "html":
-        html_content = scraper.export_to_html(data, export_type)
+        html_content = export_to_html_dashboard(data, "youtube")
         return HTMLResponse(content=html_content)
     elif requested_format == "raw":
         import json
@@ -218,7 +210,7 @@ async def download_youtube_video(
             if format == "redirect":
                 return RedirectResponse(url=direct_url_info["download_url"])
             elif format == "html":
-                html_content = scraper.export_download_page_html(direct_url_info)
+                html_content = export_download_page_html(direct_url_info)
                 return HTMLResponse(content=html_content)
             elif format == "stream":
                 download_url = direct_url_info["download_url"]

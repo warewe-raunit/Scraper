@@ -6,3 +6,4 @@ fastapi>=0.100.0
 uvicorn>=0.20.0
 curl_cffi>=0.5.10
 yt-dlp>=2026.3.17
+supabase>=2.0.0
