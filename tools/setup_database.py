@@ -129,8 +129,10 @@ CREATE TABLE IF NOT EXISTS public.youtube_videos (
     channel_url TEXT,
     thumbnails JSONB,
     video_url TEXT,
-    view_count TEXT,
-    like_count TEXT,
+    -- Numeric counts so ORDER BY / range queries sort correctly (were TEXT, which
+    -- sorted lexicographically: '9' > '1000000'). `views` keeps the display string.
+    view_count BIGINT DEFAULT 0,
+    like_count BIGINT DEFAULT 0,
     length_seconds BIGINT DEFAULT 0
 );
 
@@ -141,7 +143,7 @@ CREATE TABLE IF NOT EXISTS public.youtube_comments (
     author_id TEXT,
     text TEXT,
     published_time TEXT,
-    like_count TEXT,
+    like_count BIGINT DEFAULT 0,
     video_id TEXT
 );
 
@@ -152,6 +154,16 @@ CREATE TABLE IF NOT EXISTS public.cooldown_registry (
     cooldown_until TIMESTAMP WITH TIME ZONE NOT NULL,
     fail_count INTEGER DEFAULT 0
 );
+
+-- 5. Migrations for existing databases (CREATE TABLE IF NOT EXISTS won't alter
+--    columns on tables that already exist). Safe to re-run; no-ops once applied.
+--    The stored values are already digit-only, so the USING casts cannot fail.
+ALTER TABLE public.youtube_videos
+    ALTER COLUMN view_count TYPE BIGINT USING NULLIF(view_count, '')::BIGINT,
+    ALTER COLUMN like_count TYPE BIGINT USING NULLIF(like_count, '')::BIGINT;
+
+ALTER TABLE public.youtube_comments
+    ALTER COLUMN like_count TYPE BIGINT USING NULLIF(like_count, '')::BIGINT;
 """
 
 def main():

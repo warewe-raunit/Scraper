@@ -57,6 +57,7 @@ class DatabaseService:
         
         self.client: Optional[Client] = None
         self.bypass_mode = not is_configured
+        self.degraded = False
         
         if self.bypass_mode:
             logger.warning(
@@ -69,12 +70,32 @@ class DatabaseService:
                 logger.info("database_service_initialized", url=self.url)
             except Exception as e:
                 logger.error("database_service_initialization_failed", error=str(e))
-                self.bypass_mode = True
+                self.degraded = True
+
+    def _persist_guard(self) -> Optional[bool]:
+        """Decide whether a write should proceed.
+
+        Returns None when the caller should proceed with the upsert. Otherwise
+        returns the bool the caller should hand back:
+          - True  when Supabase is intentionally unconfigured (silent no-op success).
+          - False when Supabase is configured but unavailable; this is logged at
+            error level and reported as a failure so data loss is never silent.
+        """
+        if self.bypass_mode:
+            return True
+        if self.client is None or self.degraded:
+            logger.error(
+                "database_degraded_write_dropped",
+                reason="Supabase is configured but the client is unavailable; scraped data was NOT persisted.",
+            )
+            return False
+        return None
 
     async def save_reddit_posts(self, posts: List[Dict[str, Any]]) -> bool:
         """Upsert a list of Reddit posts to public.reddit_posts."""
-        if self.bypass_mode or not self.client:
-            return True
+        guard = self._persist_guard()
+        if guard is not None:
+            return guard
         if not posts:
             return True
             
@@ -119,8 +140,9 @@ class DatabaseService:
 
     async def save_reddit_comments(self, comments: List[Dict[str, Any]]) -> bool:
         """Upsert a list of Reddit comments to public.reddit_comments."""
-        if self.bypass_mode or not self.client:
-            return True
+        guard = self._persist_guard()
+        if guard is not None:
+            return guard
         if not comments:
             return True
             
@@ -154,8 +176,9 @@ class DatabaseService:
 
     async def save_reddit_user(self, user: Dict[str, Any]) -> bool:
         """Upsert Reddit user details to public.reddit_users."""
-        if self.bypass_mode or not self.client:
-            return True
+        guard = self._persist_guard()
+        if guard is not None:
+            return guard
         if not user:
             return True
             
@@ -187,8 +210,9 @@ class DatabaseService:
 
     async def save_x_tweets(self, tweets: List[Dict[str, Any]]) -> bool:
         """Upsert a list of X tweets to public.x_tweets."""
-        if self.bypass_mode or not self.client:
-            return True
+        guard = self._persist_guard()
+        if guard is not None:
+            return guard
         if not tweets:
             return True
             
@@ -233,8 +257,9 @@ class DatabaseService:
 
     async def save_x_profile(self, profile: Dict[str, Any]) -> bool:
         """Upsert X user profile details to public.x_profiles."""
-        if self.bypass_mode or not self.client:
-            return True
+        guard = self._persist_guard()
+        if guard is not None:
+            return guard
         if not profile:
             return True
             
@@ -265,8 +290,9 @@ class DatabaseService:
 
     async def save_youtube_videos(self, videos: List[Dict[str, Any]]) -> bool:
         """Upsert a list of YouTube video objects to public.youtube_videos."""
-        if self.bypass_mode or not self.client:
-            return True
+        guard = self._persist_guard()
+        if guard is not None:
+            return guard
         if not videos:
             return True
             
@@ -290,8 +316,10 @@ class DatabaseService:
                     "channel_url": video.get("channel_url"),
                     "thumbnails": video.get("thumbnails"),
                     "video_url": video.get("video_url") or f"https://www.youtube.com/watch?v={video_id}",
-                    "view_count": str(_parse_int(video.get("view_count") or video.get("views"))),
-                    "like_count": str(_parse_int(video.get("like_count"))),
+                    # Numeric so the DB can sort/range correctly. The human-readable
+                    # form is preserved in "views" above.
+                    "view_count": _parse_int(video.get("view_count") or video.get("views")),
+                    "like_count": _parse_int(video.get("like_count")),
                     "length_seconds": _parse_int(video.get("length_seconds")),
                 }
                 records.append(record)
@@ -306,8 +334,9 @@ class DatabaseService:
 
     async def save_youtube_comments(self, comments: List[Dict[str, Any]], video_id: str) -> bool:
         """Upsert a list of YouTube comments to public.youtube_comments."""
-        if self.bypass_mode or not self.client:
-            return True
+        guard = self._persist_guard()
+        if guard is not None:
+            return guard
         if not comments:
             return True
             
@@ -325,7 +354,7 @@ class DatabaseService:
                     "author_id": c.get("author_id"),
                     "text": c.get("text"),
                     "published_time": c.get("published_time"),
-                    "like_count": str(_parse_int(c.get("like_count"))),
+                    "like_count": _parse_int(c.get("like_count")),
                     "video_id": video_id
                 }
                 records.append(record)
@@ -340,8 +369,9 @@ class DatabaseService:
 
     async def save_youtube_channel(self, channel: Dict[str, Any]) -> bool:
         """Upsert YouTube channel header details to public.youtube_channels."""
-        if self.bypass_mode or not self.client:
-            return True
+        guard = self._persist_guard()
+        if guard is not None:
+            return guard
         if not channel:
             return True
             

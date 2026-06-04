@@ -460,7 +460,14 @@ class RedditScraperService:
             "created_utc": d.get("created_utc"),
             "link_karma": d.get("link_karma"),
             "comment_karma": d.get("comment_karma"),
-            "total_karma": d.get("total_karma", d.get("link_karma", 0) + d.get("comment_karma", 0)),
+            # `.get(key, default)` returns None when the key exists with a null value
+            # (common for suspended/restricted users), so guard each operand with `or 0`
+            # to avoid `None + None` TypeErrors crashing the whole request.
+            "total_karma": (
+                d.get("total_karma")
+                if d.get("total_karma") is not None
+                else (d.get("link_karma") or 0) + (d.get("comment_karma") or 0)
+            ),
             "is_employee": d.get("is_employee"),
             "is_gold": d.get("is_gold"),
             "is_mod": d.get("is_mod"),
