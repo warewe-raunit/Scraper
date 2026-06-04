@@ -20,7 +20,7 @@ from bs4 import BeautifulSoup
 from curl_cffi import requests as cffi_requests
 
 from tools.browser_manager import LazyBrowser, active_profile_session_id
-from tools.session_store import load_session
+from tools.session_store import load_session, session_age_seconds
 from tools.stealth.fingerprint import BrowserProfileManager
 from tools.stealth.helpers import _delay, _random_scroll
 
@@ -134,8 +134,18 @@ def _parse_html_timeline(html: str) -> dict:
             "is_pinned": is_pinned
         })
         
-    next_link_el = soup.select_one(".show-more a")
-    next_link = next_link_el.get("href", "") if next_link_el else ""
+    # Nitter renders up to two ".show-more" links once you are on a cursored page:
+    # a top "Load newest" (points back to newer tweets we've already collected) and
+    # a bottom "Load more" (the genuine next/older page). select_one() returned the
+    # first, so from page 2 onward pagination followed "Load newest", re-fetched
+    # already-seen tweets, and stopped early with 0 new. Pick the last link that is
+    # not "Load newest" — that is the real next-page cursor (and on the final page,
+    # where only "Load newest" remains, this correctly yields no next link).
+    next_link = ""
+    for anchor in soup.select(".show-more a"):
+        if "newest" in anchor.get_text(" ", strip=True).lower():
+            continue
+        next_link = anchor.get("href", "")
     
     return {
         "profile": profile,
@@ -173,6 +183,25 @@ async def _attempt_direct_scrape(
     if not cookie_str:
         log.info("unauth_x.direct_scrape.no_saved_session")
         return None
+
+    # Time-limit the cached session. The cookies/clearance token the browser
+    # obtained for this proxy+instance are short-lived; past the TTL, skip the
+    # (likely-stale) direct replay and return None so the caller falls back to the
+    # browser, which re-solves and re-persists a fresh session. Tune via
+    # X_SESSION_TTL_SECONDS (default 1500s = 25 min); set to 0 to disable.
+    try:
+        ttl = int(os.getenv("X_SESSION_TTL_SECONDS", "1500"))
+    except ValueError:
+        ttl = 1500
+    if ttl > 0:
+        age = session_age_seconds(active_profile_session_id(account_id))
+        if age is not None and age >= ttl:
+            log.info(
+                "unauth_x.direct_scrape.session_expired",
+                age_seconds=round(age, 1),
+                ttl_seconds=ttl,
+            )
+            return None
         
     headers = {
         "User-Agent": user_agent,
@@ -301,9 +330,18 @@ PARSE_TIMELINE_SCRIPT = """() => {
         });
     });
     
-    // 3. Next page cursor/link
-    const nextLinkEl = document.querySelector('.show-more a');
-    const nextLink = nextLinkEl ? nextLinkEl.getAttribute('href') : null;
+    // 3. Next page cursor/link.
+    // Nitter shows a top "Load newest" and a bottom "Load more" on cursored pages;
+    // querySelector picked the first ("Load newest"), which loops back to tweets we
+    // already have and stops pagination early. Pick the last non-"newest" link — the
+    // real next/older page cursor (and none on the final page, where only "Load
+    // newest" remains).
+    let nextLink = null;
+    document.querySelectorAll('.show-more a').forEach(a => {
+        const txt = (a.textContent || '').trim().toLowerCase();
+        if (txt.indexOf('newest') !== -1) return;
+        nextLink = a.getAttribute('href');
+    });
     
     return {
         profile: fullname ? {

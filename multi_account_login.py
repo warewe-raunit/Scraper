@@ -14,17 +14,27 @@ from tools.browser_manager import LazyBrowser
 from tools.login_tool import run_tool as login
 from tools.reddit_login_state import reddit_login_state
 
-# Setup logging
-log_format = os.getenv("LOG_FORMAT", "console").lower()
-processors = [
-    structlog.processors.TimeStamper(fmt="iso" if log_format == "json" else "%Y-%m-%d %H:%M:%S"),
-]
-if log_format == "json":
-    processors.append(structlog.processors.JSONRenderer())
-else:
-    processors.append(structlog.dev.ConsoleRenderer(colors=True))
+def _configure_cli_logging() -> None:
+    """Configure standalone structlog rendering for CLI use ONLY.
 
-structlog.configure(processors=processors)
+    Do NOT call this at import time. This module is imported as a library by the
+    API (api/services/registry.py imports login_account); calling
+    structlog.configure() on import clobbers the central Loguru pipeline set up by
+    tools.logging_config.configure_logging(), which silently changes the console
+    format and detaches the rotating logs/app.log file sink. Only configure when
+    this file is run directly as a script.
+    """
+    log_format = os.getenv("LOG_FORMAT", "console").lower()
+    processors = [
+        structlog.processors.TimeStamper(fmt="iso" if log_format == "json" else "%Y-%m-%d %H:%M:%S"),
+    ]
+    if log_format == "json":
+        processors.append(structlog.processors.JSONRenderer())
+    else:
+        processors.append(structlog.dev.ConsoleRenderer(colors=True))
+    structlog.configure(processors=processors)
+
+
 logger = structlog.get_logger("multi_account_login")
 
 def parse_accounts_from_env() -> list[dict]:
@@ -211,4 +221,5 @@ async def main():
     print("=========================\n")
 
 if __name__ == "__main__":
+    _configure_cli_logging()
     asyncio.run(main())

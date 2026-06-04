@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 
 SESSIONS_DIR = Path(__file__).parent.parent / "sessions"
@@ -39,3 +40,16 @@ def delete_session(account_id: str) -> None:
     path = _session_path(account_id)
     if path.exists():
         path.unlink()
+
+
+def session_age_seconds(account_id: str) -> float | None:
+    """Seconds since the session file was last written, or None if it doesn't exist.
+
+    The session file is (re)written each time a browser context is persisted, so its
+    mtime tracks how fresh the saved cookies/token are. Callers use this to expire
+    short-lived clearance tokens and force a fresh solve.
+    """
+    path = _session_path(account_id)
+    if not path.exists():
+        return None
+    return max(0.0, time.time() - path.stat().st_mtime)

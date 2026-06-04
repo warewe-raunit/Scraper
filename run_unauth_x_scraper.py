@@ -19,17 +19,23 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from tools.unauth_x_scraper import scrape_profile, scrape_search
 
-# Setup structured logging
-log_format = os.getenv("LOG_FORMAT", "console").lower()
-processors = [
-    structlog.processors.TimeStamper(fmt="iso" if log_format == "json" else "%Y-%m-%d %H:%M:%S"),
-]
-if log_format == "json":
-    processors.append(structlog.processors.JSONRenderer())
-else:
-    processors.append(structlog.dev.ConsoleRenderer(colors=True))
+def _configure_cli_logging() -> None:
+    """Configure standalone structlog rendering for CLI use ONLY.
 
-structlog.configure(processors=processors)
+    Not called at import time so that importing this module never clobbers the
+    central Loguru logging pipeline (see tools/logging_config.py).
+    """
+    log_format = os.getenv("LOG_FORMAT", "console").lower()
+    processors = [
+        structlog.processors.TimeStamper(fmt="iso" if log_format == "json" else "%Y-%m-%d %H:%M:%S"),
+    ]
+    if log_format == "json":
+        processors.append(structlog.processors.JSONRenderer())
+    else:
+        processors.append(structlog.dev.ConsoleRenderer(colors=True))
+    structlog.configure(processors=processors)
+
+
 logger = structlog.get_logger("run_unauth_x_scraper")
 
 
@@ -141,6 +147,7 @@ async def main():
 
 
 if __name__ == "__main__":
+    _configure_cli_logging()
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
