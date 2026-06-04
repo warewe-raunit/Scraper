@@ -11,11 +11,11 @@ Environment=PYTHONUNBUFFERED=1
 # Auto-detect if a virtual environment exists in either venv/ or myenv312/ and run uvicorn
 ExecStart=/bin/bash -c '\
   if [ -f venv/bin/uvicorn ]; then \
-    exec venv/bin/python -m uvicorn api.main:app --host 0.0.0.0 --port 8000; \
+    exec venv/bin/python -m uvicorn api.main:app --host 0.0.0.0 --port 18080; \
   elif [ -f myenv312/bin/uvicorn ]; then \
-    exec myenv312/bin/python -m uvicorn api.main:app --host 0.0.0.0 --port 8000; \
+    exec myenv312/bin/python -m uvicorn api.main:app --host 0.0.0.0 --port 18080; \
   else \
-    exec python3 -m uvicorn api.main:app --host 0.0.0.0 --port 8000; \
+    exec python3 -m uvicorn api.main:app --host 0.0.0.0 --port 18080; \
   fi'
 
 Restart=always

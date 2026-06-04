@@ -44,7 +44,7 @@ fi
 echo -e "${GREEN}==> Starting API server in background using ${PYTHON_CMD}...${NC}"
 
 # Launch in background using nohup and redirect stdout/stderr to log file
-nohup ${PYTHON_CMD} -m uvicorn api.main:app --host 0.0.0.0 --port 8000 > "${LOG_FILE}" 2>&1 &
+nohup ${PYTHON_CMD} -m uvicorn api.main:app --host 0.0.0.0 --port 18080 > "${LOG_FILE}" 2>&1 &
 
 # Save PID
 PID=$!
