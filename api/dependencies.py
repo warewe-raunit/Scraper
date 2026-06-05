@@ -44,19 +44,18 @@ def parse_accounts_from_env() -> List[Dict[str, Any]]:
         if pattern.match(key):
             try:
                 parts = value.split("|")
-                if len(parts) != 4:
+                if len(parts) < 3:
                     continue
-                account_id, username, password, proxy_url = parts
-                
+                account_id, username, password = parts[0], parts[1], parts[2]
+
                 # Skip placeholders
                 if "your_username" in username or "your_password" in password:
                     continue
-                    
+
                 accounts.append({
                     "account_id": account_id.strip(),
                     "username": username.strip(),
                     "password": password.strip(),
-                    "proxy_url": proxy_url.strip() if proxy_url.strip() else None
                 })
             except Exception as e:
                 logger.error("error_parsing_account_env", key=key, error=str(e))
@@ -165,27 +164,14 @@ def create_stealth_client(account_id: Optional[str] = None) -> requests.Session:
     if not token_v2:
         raise ValueError(f"Could not find token_v2 in cookies for account {selected_account}")
         
-    # 3. Resolve Proxy (Sticky Proxy)
-    # Parse accounts from .env to find proxy settings for this account
-    accounts_info = parse_accounts_from_env()
-    proxy_url = None
-    for acc in accounts_info:
-        if acc["account_id"] == selected_account:
-            proxy_url = acc.get("proxy_url")
-            break
-
-    # Global rotating proxy override (good-proxies.ru). When enabled this
-    # supersedes the per-account sticky proxy for EVERY request, so the rotating
-    # pool applies across all services. NOTE: rotating IP/country on an
-    # authenticated Reddit session increases ban risk; opt-in via
-    # GOODPROXIES_ENABLED.
+    # 3. Resolve Proxy (global rotating pool only).
+    # The per-account sticky .env proxy has been removed; proxies now come solely
+    # from the good-proxies.ru provider. When it is disabled/empty, proxy_url is
+    # None and the request goes out DIRECT (on the host IP).
     from tools.proxy_provider import get_proxy_provider
     _provider = get_proxy_provider()
-    if _provider.is_enabled():
-        _rotating = _provider.get_next()
-        if _rotating:
-            proxy_url = _rotating
-            
+    proxy_url = _provider.get_next() if _provider.is_enabled() else None
+
     # Clean proxy output for log security
     display_proxy = "Direct"
     if proxy_url:

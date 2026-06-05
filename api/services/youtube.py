@@ -24,10 +24,8 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from api.dependencies import parse_accounts_from_env
 from tools.proxy_provider import get_proxy_provider
 from tools.browser_manager import launch_browser, close_browser
-from tools.rotation import CooldownPool
 
 logger = structlog.get_logger(__name__)
 
@@ -37,43 +35,21 @@ class YouTubeScraperService:
         self._api_key: Optional[str] = None
         self._api_key_lock = asyncio.Lock()
 
-        # Proxy rotation + cooldown is delegated to the shared CooldownPool so
-        # the X and YouTube services use one identical implementation.
-        accounts = parse_accounts_from_env()
-        raw_proxies = [acc["proxy_url"] for acc in accounts if acc.get("proxy_url")]
-        self.proxy_pool = CooldownPool(raw_proxies, label="youtube_proxy", default_cooldown=300)
-
-        logger.info("youtube_scraper_service_initialized", proxy_count=len(self.proxy_pool))
-
-    @property
-    def proxies(self) -> List[str]:
-        return self.proxy_pool.items
-
-    @proxies.setter
-    def proxies(self, val: List[str]):
-        # Preserves existing cooldowns for surviving proxies (handled by the pool).
-        self.proxy_pool.set_items(val)
+        logger.info("youtube_scraper_service_initialized")
 
     def _get_next_proxy(self) -> Optional[str]:
-        """Next healthy proxy (round-robin), or shortest-cooldown fallback.
-
-        When the global GoodProxies provider is enabled, proxies come from the
-        rotating good-proxies.ru pool; otherwise we use the per-account pool
-        built from .env (original behavior).
-        """
+        """Next proxy from the global rotating pool, or None (DIRECT) when the
+        provider is disabled. The old per-account .env proxy pool was removed."""
         provider = get_proxy_provider()
         if provider.is_enabled():
-            p = provider.get_next()
-            if p:
-                return p
-        return self.proxy_pool.get_next()
+            return provider.get_next()
+        return None
 
     def _cool_down_proxy(self, proxy: str, duration_seconds: int = 300):
-        """Put a proxy on cooldown (e.g. on connection errors or 503 response code)."""
+        """Rest a misbehaving proxy in the global pool."""
         provider = get_proxy_provider()
         if provider.is_enabled():
             provider.cool_down(proxy, duration_seconds)
-        self.proxy_pool.cool_down(proxy, duration_seconds)
 
     async def _get_innertube_key(self, max_retries: int = 2) -> str:
         """
