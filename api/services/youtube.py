@@ -25,6 +25,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from api.dependencies import parse_accounts_from_env
+from tools.proxy_provider import get_proxy_provider
 from tools.browser_manager import launch_browser, close_browser
 from tools.rotation import CooldownPool
 
@@ -54,11 +55,24 @@ class YouTubeScraperService:
         self.proxy_pool.set_items(val)
 
     def _get_next_proxy(self) -> Optional[str]:
-        """Next healthy proxy (round-robin), or shortest-cooldown fallback."""
+        """Next healthy proxy (round-robin), or shortest-cooldown fallback.
+
+        When the global GoodProxies provider is enabled, proxies come from the
+        rotating good-proxies.ru pool; otherwise we use the per-account pool
+        built from .env (original behavior).
+        """
+        provider = get_proxy_provider()
+        if provider.is_enabled():
+            p = provider.get_next()
+            if p:
+                return p
         return self.proxy_pool.get_next()
 
     def _cool_down_proxy(self, proxy: str, duration_seconds: int = 300):
         """Put a proxy on cooldown (e.g. on connection errors or 503 response code)."""
+        provider = get_proxy_provider()
+        if provider.is_enabled():
+            provider.cool_down(proxy, duration_seconds)
         self.proxy_pool.cool_down(proxy, duration_seconds)
 
     async def _get_innertube_key(self, max_retries: int = 2) -> str:

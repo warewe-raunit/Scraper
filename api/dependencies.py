@@ -173,6 +173,18 @@ def create_stealth_client(account_id: Optional[str] = None) -> requests.Session:
         if acc["account_id"] == selected_account:
             proxy_url = acc.get("proxy_url")
             break
+
+    # Global rotating proxy override (good-proxies.ru). When enabled this
+    # supersedes the per-account sticky proxy for EVERY request, so the rotating
+    # pool applies across all services. NOTE: rotating IP/country on an
+    # authenticated Reddit session increases ban risk; opt-in via
+    # GOODPROXIES_ENABLED.
+    from tools.proxy_provider import get_proxy_provider
+    _provider = get_proxy_provider()
+    if _provider.is_enabled():
+        _rotating = _provider.get_next()
+        if _rotating:
+            proxy_url = _rotating
             
     # Clean proxy output for log security
     display_proxy = "Direct"
@@ -211,6 +223,7 @@ def create_stealth_client(account_id: Optional[str] = None) -> requests.Session:
     # Attach helper attributes to session for diagnostics/logging
     session.account_id = selected_account
     session.proxy_display = display_proxy
+    session.proxy_url = proxy_url
     
     logger.info(
         "created_stealth_client",

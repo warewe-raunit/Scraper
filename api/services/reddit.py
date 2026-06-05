@@ -164,6 +164,13 @@ class RedditScraperService:
 
             except requests.errors.RequestsError as e:
                 log.error("network_or_proxy_connection_failed", error=str(e))
+                try:
+                    from tools.proxy_provider import get_proxy_provider
+                    _prov = get_proxy_provider()
+                    if _prov.is_enabled() and getattr(session, "proxy_url", None):
+                        _prov.cool_down(session.proxy_url)
+                except Exception:
+                    pass
                 self.registry.cool_down_account(account_id, duration_seconds=180) # 3 min cooldown
                 current_account_id = None
                 continue

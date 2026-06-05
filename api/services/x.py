@@ -18,6 +18,7 @@ if str(ROOT) not in sys.path:
 from tools.unauth_x_scraper import scrape_profile, scrape_search
 from tools.rotation import CooldownPool
 from api.dependencies import parse_accounts_from_env
+from tools.proxy_provider import get_proxy_provider
 
 logger = structlog.get_logger(__name__)
 
@@ -41,12 +42,33 @@ class XScraperService:
         # Preserves existing cooldowns for surviving proxies (handled by the pool).
         self.proxy_pool.set_items(val)
 
+    def _available_proxy_count(self) -> int:
+        """How many proxies we can realistically try this call."""
+        provider = get_proxy_provider()
+        if provider.is_enabled():
+            provider.refresh()
+            return max(len(provider.pool), len(self.proxies), 3)
+        return len(self.proxies)
+
     def _get_next_proxy(self) -> Optional[str]:
-        """Next healthy proxy (round-robin), or shortest-cooldown fallback."""
+        """Next healthy proxy (round-robin), or shortest-cooldown fallback.
+
+        When the global GoodProxies provider is enabled, proxies come from the
+        rotating good-proxies.ru pool; otherwise we use the per-account pool
+        built from .env (original behavior).
+        """
+        provider = get_proxy_provider()
+        if provider.is_enabled():
+            p = provider.get_next()
+            if p:
+                return p
         return self.proxy_pool.get_next()
 
     def _cool_down_proxy(self, proxy: str, duration_seconds: int = 300):
         """Put a proxy on cooldown (e.g. on connection errors or scrape failure)."""
+        provider = get_proxy_provider()
+        if provider.is_enabled():
+            provider.cool_down(proxy, duration_seconds)
         self.proxy_pool.cool_down(proxy, duration_seconds)
 
     async def get_profile(
@@ -57,7 +79,7 @@ class XScraperService:
         headless: bool = True
     ) -> Dict[str, Any]:
         """Scrape a user profile and their tweets without authentication, with proxy rotation and retries."""
-        max_attempts = 1 if proxy_url else min(3, max(1, len(self.proxies)))
+        max_attempts = 1 if proxy_url else min(3, max(1, self._available_proxy_count()))
         last_result = {"success": False, "profile": {}, "tweets": [], "error": "No proxies available."}
         
         for attempt in range(1, max_attempts + 1):
@@ -107,7 +129,7 @@ class XScraperService:
         headless: bool = True
     ) -> Dict[str, Any]:
         """Scrape tweets matching a search query without authentication, with proxy rotation and retries."""
-        max_attempts = 1 if proxy_url else min(3, max(1, len(self.proxies)))
+        max_attempts = 1 if proxy_url else min(3, max(1, self._available_proxy_count()))
         last_result = {"success": False, "tweets": [], "error": "No proxies available."}
         
         for attempt in range(1, max_attempts + 1):
