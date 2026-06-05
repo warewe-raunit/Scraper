@@ -30,10 +30,12 @@ class AccountState:
         self,
         account_id: str,
         username: str,
+        proxy_url: Optional[str] = None,
         pool: Optional[CooldownPool] = None,
     ):
         self.account_id = account_id
         self.username = username
+        self.proxy_url = proxy_url
         self.status = "healthy"  # "healthy", "cool_down", "needs_relogin"
         # The cool-down timer is owned by the shared CooldownPool (one cooldown
         # implementation across proxies and accounts). `pool` is injected by the
@@ -112,6 +114,7 @@ class AccountRegistry:
                 self.states[account_id] = AccountState(
                     account_id=account_id,
                     username=acc["username"],
+                    proxy_url=acc.get("proxy_url"),
                     pool=self._pool,
                 )
 

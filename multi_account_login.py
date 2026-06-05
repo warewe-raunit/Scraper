@@ -47,16 +47,18 @@ def parse_accounts_from_env() -> list[dict]:
         if pattern.match(key):
             try:
                 parts = value.split("|")
-                if len(parts) < 3:
+                if len(parts) not in (3, 4):
                     logger.warning(
                         "invalid_account_format",
                         key=key,
                         value=value,
-                        expected="account_id|username|password"
+                        expected="account_id|username|password[|proxy_url]"
                     )
                     continue
-
-                account_id, username, password = parts[0], parts[1], parts[2]
+                
+                account_id = parts[0]
+                username = parts[1]
+                password = parts[2]
                 
                 # Check for placeholders
                 if "your_username" in username or "your_password" in password:
@@ -72,6 +74,7 @@ def parse_accounts_from_env() -> list[dict]:
                     "account_id": account_id.strip(),
                     "username": username.strip(),
                     "password": password.strip(),
+                    "proxy_url": None
                 })
             except Exception as e:
                 logger.error("error_parsing_account", key=key, error=str(e))
@@ -84,11 +87,7 @@ async def login_account(account: dict, captcha_config: dict | None, headless: bo
     account_id = account["account_id"]
     username = account["username"]
     password = account["password"]
-    # Proxy now comes from the global rotating pool (good-proxies.ru), not .env.
-    # When the provider is disabled/empty, login runs DIRECT (host IP).
-    from tools.proxy_provider import get_proxy_provider
-    _provider = get_proxy_provider()
-    proxy_url = _provider.get_next() if _provider.is_enabled() else None
+    proxy_url = account["proxy_url"]
     
     # Clean proxy url representation for logging
     display_proxy = "Direct"

@@ -16,6 +16,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tools.unauth_x_scraper import scrape_profile, scrape_search
+from tools.rotation import CooldownPool
+from api.dependencies import parse_accounts_from_env
 from tools.proxy_provider import get_proxy_provider
 
 logger = structlog.get_logger(__name__)
@@ -23,29 +25,51 @@ logger = structlog.get_logger(__name__)
 class XScraperService:
     def __init__(self, db: Optional[Any] = None):
         self.db = db
-        logger.info("x_scraper_service_initialized")
+        # Proxy rotation + cooldown is delegated to the shared CooldownPool so
+        # the X and YouTube services use one identical implementation.
+        accounts = parse_accounts_from_env()
+        raw_proxies = [acc["proxy_url"] for acc in accounts if acc.get("proxy_url")]
+        self.proxy_pool = CooldownPool(raw_proxies, label="x_proxy", default_cooldown=300)
+
+        logger.info("x_scraper_service_initialized", proxy_count=len(self.proxy_pool))
+
+    @property
+    def proxies(self) -> List[str]:
+        return self.proxy_pool.items
+
+    @proxies.setter
+    def proxies(self, val: List[str]):
+        # Preserves existing cooldowns for surviving proxies (handled by the pool).
+        self.proxy_pool.set_items(val)
 
     def _available_proxy_count(self) -> int:
         """How many proxies we can realistically try this call."""
         provider = get_proxy_provider()
         if provider.is_enabled():
             provider.refresh()
-            return max(len(provider.pool), 3)
-        return 1  # no proxy pool -> single DIRECT attempt
+            return max(len(provider.pool), len(self.proxies), 3)
+        return len(self.proxies)
 
     def _get_next_proxy(self) -> Optional[str]:
-        """Next proxy from the global rotating pool, or None (DIRECT) when the
-        provider is disabled. The old per-account .env proxy pool was removed."""
+        """Next healthy proxy (round-robin), or shortest-cooldown fallback.
+
+        When the global GoodProxies provider is enabled, proxies come from the
+        rotating good-proxies.ru pool; otherwise we use the per-account pool
+        built from .env (original behavior).
+        """
         provider = get_proxy_provider()
         if provider.is_enabled():
-            return provider.get_next()
-        return None
+            p = provider.get_next()
+            if p:
+                return p
+        return self.proxy_pool.get_next()
 
     def _cool_down_proxy(self, proxy: str, duration_seconds: int = 300):
-        """Rest a misbehaving proxy in the global pool."""
+        """Put a proxy on cooldown (e.g. on connection errors or scrape failure)."""
         provider = get_proxy_provider()
         if provider.is_enabled():
             provider.cool_down(proxy, duration_seconds)
+        self.proxy_pool.cool_down(proxy, duration_seconds)
 
     async def get_profile(
         self, 

@@ -83,8 +83,6 @@ class GoodProxiesProvider:
         self.min_works = (os.getenv("GOODPROXIES_MIN_WORKS") or "").strip()
         self.country = (os.getenv("GOODPROXIES_COUNTRY") or "").strip()
         self.cooldown_seconds = float(os.getenv("GOODPROXIES_COOLDOWN_SECONDS") or "120")
-        # Sort each fetched batch fastest-first so rotation prefers low latency.
-        self.sort_by_latency = _env_bool("GOODPROXIES_SORT_BY_LATENCY", True)
         self.refresh_seconds = max(
             self.MIN_REFRESH_SECONDS,
             float(os.getenv("GOODPROXIES_REFRESH_SECONDS") or "60"),
@@ -102,7 +100,7 @@ class GoodProxiesProvider:
             "type": self.types,
             "count": str(self.count),
             "get": "json",
-            "fields": "ip,type,ping,works",
+            "fields": "ip,type",
         }
         if self.max_ping:
             params["ping"] = self.max_ping
@@ -111,13 +109,6 @@ class GoodProxiesProvider:
         if self.country:
             params["country"] = self.country
         return params
-
-    @staticmethod
-    def _as_float(value, default: float) -> float:
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return default
 
     @classmethod
     def _to_proxy_url(cls, entry: dict) -> Optional[str]:
@@ -145,25 +136,14 @@ class GoodProxiesProvider:
         data = resp.json()
         if isinstance(data, dict):  # wrap=1 envelope, defensive
             data = data.get("data", [])
-        min_works = self._as_float(self.min_works, 0.0) if self.min_works else 0.0
-        rows = []  # (url, ping, works)
+        urls: List[str] = []
         seen = set()
         for entry in data or []:
             url = self._to_proxy_url(entry)
-            if not url or url in seen:
-                continue
-            works = self._as_float(entry.get("works"), 0.0)
-            if min_works and works < min_works:
-                continue  # client-side reliability ("speed") guard
-            # NOTE: the request `ping` filter is in ms, but the JSON `ping`
-            # field is response time in seconds. We only use it to SORT
-            # (unit-agnostic, fastest first); the ms ceiling stays server-side.
-            ping = self._as_float(entry.get("ping"), float("inf"))
-            seen.add(url)
-            rows.append((url, ping, works))
-        if self.sort_by_latency:
-            rows.sort(key=lambda r: r[1])  # lowest latency first
-        return [u for (u, _ping, _works) in rows]
+            if url and url not in seen:
+                seen.add(url)
+                urls.append(url)
+        return urls
 
     def refresh(self, force: bool = False) -> None:
         """Refresh the pool if the interval has elapsed (or force=True).
