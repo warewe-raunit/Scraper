@@ -81,7 +81,8 @@ class GoodProxiesProvider:
         self.count = int(os.getenv("GOODPROXIES_COUNT") or "200")
         self.max_ping = (os.getenv("GOODPROXIES_MAX_PING") or "").strip()
         self.min_works = (os.getenv("GOODPROXIES_MIN_WORKS") or "").strip()
-        self.country = (os.getenv("GOODPROXIES_COUNTRY") or "").strip()
+        self.max_time = (os.getenv("GOODPROXIES_MAX_TIME") or "").strip()
+        self.country = (os.getenv("GOODPROXIES_COUNTRY") or "us").strip()
         self.cooldown_seconds = float(os.getenv("GOODPROXIES_COOLDOWN_SECONDS") or "120")
         self.sort_by_latency = _env_bool("GOODPROXIES_SORT_BY_LATENCY", True)
         self.refresh_seconds = max(
@@ -107,7 +108,9 @@ class GoodProxiesProvider:
             params["ping"] = self.max_ping
         if self.min_works:
             params["works"] = self.min_works
-        if self.country:
+        if self.max_time:
+            params["time"] = self.max_time
+        if self.country and self.country.lower() != "any":
             params["country"] = self.country
         return params
 

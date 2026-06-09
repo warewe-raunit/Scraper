@@ -362,12 +362,25 @@ async def _check_page_for_blocks(page: Page, log) -> tuple[bool, bool]:
     Returns:
         (is_blocked, is_proxy_issue) as a tuple of booleans.
     """
-    try:
-        title = await page.title()
-        content = await page.content()
-    except Exception as e:
-        log.warning("unauth_x.check_blocks.page_access_failed", error=str(e))
-        return True, True
+    max_check_attempts = 4
+    title = ""
+    content = ""
+    for attempt in range(1, max_check_attempts + 1):
+        try:
+            if page.is_closed():
+                return True, True
+            title = await page.title()
+            content = await page.content()
+            break
+        except Exception as e:
+            err_msg = str(e)
+            log.warning("unauth_x.check_blocks.page_access_failed", attempt=attempt, error=err_msg)
+            if attempt == max_check_attempts:
+                return True, True
+            if "destroyed" in err_msg.lower() or "navigation" in err_msg.lower():
+                await asyncio.sleep(0.5 * attempt)
+                continue
+            return True, True
 
     # Cloudflare/challenge checks (Proxy reputation issue)
     if "Just a moment..." in title or "Attention Required!" in title or "Verifying your request" in title:
