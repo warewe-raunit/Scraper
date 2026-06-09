@@ -60,10 +60,27 @@ class YouTubeScraperService:
         When the global GoodProxies provider is enabled, proxies come from the
         rotating good-proxies.ru pool; otherwise we use the per-account pool
         built from .env (original behavior).
+
+        Since YouTube InnerTube requests are HTTPS, public HTTP/HTTPS proxies from
+        free/public lists almost always fail to establish CONNECT tunnels or are blocked.
+        We prefer SOCKS proxies from the pool if any are available.
         """
         provider = get_proxy_provider()
         if provider.is_enabled():
+            # Filter the global provider's pool for SOCKS proxies
+            socks_candidates = [p for p in provider.pool.items if p.startswith(("socks5://", "socks4://", "socks5h://"))]
+            if socks_candidates:
+                p = provider.pool.get_next(candidates=socks_candidates)
+                if p:
+                    return p
             p = provider.get_next()
+            if p:
+                return p
+
+        # If fallback to per-account pool, also prefer SOCKS if present
+        socks_candidates = [p for p in self.proxy_pool.items if p.startswith(("socks5://", "socks4://", "socks5h://"))]
+        if socks_candidates:
+            p = self.proxy_pool.get_next(candidates=socks_candidates)
             if p:
                 return p
         return self.proxy_pool.get_next()
@@ -95,6 +112,10 @@ class YouTubeScraperService:
             max_key_retries = 3
             for attempt in range(1, max_key_retries + 1):
                 proxy = self._get_next_proxy()
+                # On the final retry attempt, fall back to direct connection (no proxy)
+                # to prevent complete key extraction failure.
+                if attempt == max_key_retries and attempt > 1:
+                    proxy = None
                 try:
                     loop = asyncio.get_running_loop()
                     session = requests.Session()
@@ -508,6 +529,12 @@ class YouTubeScraperService:
             key = await self._get_innertube_key()
             url = f"https://www.youtube.com/youtubei/v1/{endpoint}?key={key}"
             proxy = self._get_next_proxy()
+
+            # Last resort fallback: if previous attempts failed and we are on the final retry,
+            # try running direct (no proxy) to ensure the service stays up.
+            if attempt == max_retries and last_exception is not None:
+                logger.warn("youtube_innertube_direct_fallback", endpoint=endpoint, attempt=attempt)
+                proxy = None
             
             logger.info("executing_innertube_post", endpoint=endpoint, attempt=attempt, proxy=proxy[:30] + "..." if proxy else None)
             
