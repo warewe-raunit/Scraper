@@ -359,6 +359,92 @@ PARSE_TIMELINE_SCRIPT = """() => {
 }"""
 
 
+async def _is_cloudflare_active(page: Page) -> bool:
+    """Check if Cloudflare challenge page is currently active."""
+    for attempt in range(3):
+        try:
+            title = await page.title()
+            content = await page.content()
+            # Log for debugging
+            logger.info("unauth_x.cf_check", attempt=attempt+1, title=title, content_len=len(content), has_cf_js="challenges.cloudflare.com" in content)
+            if any(term in title for term in ["Just a moment...", "Verifying your request", "Attention Required!"]):
+                return True
+            if "challenges.cloudflare.com" in content:
+                return True
+            return False
+        except Exception as e:
+            err_msg = str(e)
+            logger.info("unauth_x.cf_check.error", attempt=attempt+1, error=err_msg)
+            # If the context is destroyed or page is navigating, wait and retry
+            if "destroyed" in err_msg.lower() or "navigation" in err_msg.lower():
+                await asyncio.sleep(1.0)
+                continue
+            return False
+    return False
+
+
+async def _solve_cloudflare_challenge(page: Page, log, timeout_seconds: int = 20) -> bool:
+    """Detect and attempt to solve Cloudflare Turnstile challenges."""
+    # Wait up to 4 seconds to see if Cloudflare activates (handles slow loading/redirects)
+    cloudflare_detected = False
+    for _ in range(5):
+        if page.is_closed():
+            return False
+        if await _is_cloudflare_active(page):
+            cloudflare_detected = True
+            break
+        await asyncio.sleep(0.8)
+
+    if not cloudflare_detected:
+        return True
+
+    log.info("unauth_x.solve_cf.detected_challenge")
+    
+    start_time = asyncio.get_running_loop().time()
+    while (asyncio.get_running_loop().time() - start_time) < timeout_seconds:
+        if page.is_closed():
+            return False
+
+        if not await _is_cloudflare_active(page):
+            log.info("unauth_x.solve_cf.solved_or_bypassed")
+            return True
+
+        try:
+            iframe = page.frame_locator('iframe[src*="challenges.cloudflare.com"]')
+            for selector in ['#challenge-stage', 'input[type="checkbox"]', '.ctp-checkbox-label', 'span.mark']:
+                loc = iframe.locator(selector)
+                if await loc.count() > 0:
+                    log.info("unauth_x.solve_cf.clicking_checkbox", selector=selector)
+                    await loc.click(timeout=3000, force=True)
+                    await asyncio.sleep(2.0)
+                    break
+        except Exception as e:
+            log.debug("unauth_x.solve_cf.click_attempt_error", error=str(e))
+
+        await asyncio.sleep(1.5)
+
+    if not await _is_cloudflare_active(page):
+        return True
+
+    log.warning("unauth_x.solve_cf.failed_to_solve")
+    return False
+
+
+async def _handle_page_navigation_and_blocks(
+    page: Page,
+    log,
+    label: str,
+    proxy_url: Optional[str],
+) -> tuple[bool, bool]:
+    """Handle Cloudflare challenge solving and general block checking on page navigation."""
+    cf_solved = await _solve_cloudflare_challenge(page, log)
+    if not cf_solved:
+        log.warning(f"unauth_x.{label}.cloudflare_block_failed_to_solve")
+        return True, True
+    
+    return await _check_page_for_blocks(page, log)
+
+
 async def _check_page_for_blocks(page: Page, log) -> tuple[bool, bool]:
     """Check if the page returned a rate limit, Cloudflare challenge, or empty content.
     Returns:
@@ -499,7 +585,9 @@ async def scrape_profile(
             await page.goto(target_url, wait_until="domcontentloaded", timeout=45000)
             await _delay(f"unauth_x_{clean_username}", 2.0, 4.0)
             
-            is_blocked, is_proxy_issue = await _check_page_for_blocks(page, log)
+            is_blocked, is_proxy_issue = await _handle_page_navigation_and_blocks(
+                page, log, "main_profile", proxy_url
+            )
             if is_blocked:
                 if is_proxy_issue and proxy_url is not None:
                     log.warning("unauth_x.proxy_blocked_early_abort", instance=base_url)
@@ -536,7 +624,9 @@ async def scrape_profile(
                     await page.goto(paginated_url, wait_until="domcontentloaded", timeout=45000)
                     await _delay(f"unauth_x_{clean_username}", 1.5, 3.0)
                     
-                    is_blocked, is_proxy_issue = await _check_page_for_blocks(page, log)
+                    is_blocked, is_proxy_issue = await _handle_page_navigation_and_blocks(
+                        page, log, "paginate_profile", proxy_url
+                    )
                     if is_blocked:
                         log.warning("unauth_x.paginate.blocked", is_proxy_issue=is_proxy_issue)
                         break
@@ -698,7 +788,9 @@ async def scrape_search(
             await page.goto(target_url, wait_until="domcontentloaded", timeout=45000)
             await _delay("unauth_x_search", 2.0, 4.0)
             
-            is_blocked, is_proxy_issue = await _check_page_for_blocks(page, log)
+            is_blocked, is_proxy_issue = await _handle_page_navigation_and_blocks(
+                page, log, "main_search", proxy_url
+            )
             if is_blocked:
                 if is_proxy_issue and proxy_url is not None:
                     log.warning("unauth_x.search.proxy_blocked_early_abort", instance=base_url)
@@ -731,7 +823,9 @@ async def scrape_search(
                     await page.goto(paginated_url, wait_until="domcontentloaded", timeout=45000)
                     await _delay("unauth_x_search", 1.5, 3.0)
                     
-                    is_blocked, is_proxy_issue = await _check_page_for_blocks(page, log)
+                    is_blocked, is_proxy_issue = await _handle_page_navigation_and_blocks(
+                        page, log, "paginate_search", proxy_url
+                    )
                     if is_blocked:
                         log.warning("unauth_x.search.paginate.blocked", is_proxy_issue=is_proxy_issue)
                         break

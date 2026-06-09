@@ -408,7 +408,7 @@ def _normalize_geo_payload(provider: str, raw: dict) -> dict:
     }
 
 
-async def _resolve_proxy_geo(proxy_url: Optional[str], timeout: float = 8.0) -> Optional[dict]:
+async def _resolve_proxy_geo(proxy_url: Optional[str], timeout: float = 2.5) -> Optional[dict]:
     """Look up IP-geo for the proxy's exit. Returns None on any failure.
 
     Chains across ip-api.com → ipinfo.io → ipapi.co so a single provider's
@@ -445,7 +445,8 @@ async def _resolve_proxy_geo(proxy_url: Optional[str], timeout: float = 8.0) -> 
     except Exception as exc:
         last_error = f"client: {exc!r}"
     logger.warning("proxy_geo_lookup_failed", error=last_error or "no provider succeeded")
-    # Do NOT cache failure — let the next launch retry; rate limits reset.
+    # Cache failure to prevent repeated slow timeouts on subsequent launches
+    _PROXY_GEO_CACHE[proxy_url] = {}
     return None
 
 

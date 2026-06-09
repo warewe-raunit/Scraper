@@ -36,14 +36,28 @@ class RedditScraperService:
         url: str,
         params: Optional[Dict[str, Any]] = None,
         requested_account_id: Optional[str] = None,
-        max_retries: int = 3
+        max_retries: int = 8
     ) -> Dict[str, Any]:
         """
         Execute a GET request with structured failover, cooldowns, and re-login retries.
+
+        Robust bounded retry: attempts span at least one rotating-proxy pool
+        refill (~60s), with a short backoff between tries so a transient block
+        gets a fresh account/IP rather than re-burning the same one. The cap
+        (``max_retries``) keeps a genuinely-down target from hanging forever.
+        On exhaustion this raises RuntimeError; the public scrape_* methods
+        translate that into a structured empty result so the caller always
+        receives output.
         """
         current_account_id = requested_account_id
-        
+        backoff_base = 2.0
+        backoff_cap = 12.0
+
         for attempt in range(1, max_retries + 1):
+            if attempt > 1:
+                delay = min(backoff_cap, backoff_base * (2 ** (attempt - 2)))
+                await asyncio.sleep(delay)
+
             # 1. Resolve next healthy account ID
             try:
                 account_id = await self.registry.get_next_healthy_account(current_account_id)
@@ -180,7 +194,11 @@ class RedditScraperService:
                 current_account_id = None
                 continue
         
-        raise RuntimeError(f"Failed to fetch data from Reddit API after {max_retries} attempts.")
+        raise RuntimeError(
+            f"Failed to fetch data from Reddit API after {max_retries} attempts "
+            f"spanning proxy-pool refreshes (url={url}). All attempts were rate-"
+            f"limited, blocked, or failed to connect."
+        )
 
     def _published_at(self, created_utc: Any) -> Optional[str]:
         if created_utc is None:

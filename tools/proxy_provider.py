@@ -81,7 +81,18 @@ class GoodProxiesProvider:
         self.count = int(os.getenv("GOODPROXIES_COUNT") or "200")
         self.max_ping = (os.getenv("GOODPROXIES_MAX_PING") or "").strip()
         self.min_works = (os.getenv("GOODPROXIES_MIN_WORKS") or "").strip()
-        self.country = (os.getenv("GOODPROXIES_COUNTRY") or "").strip()
+        # US-only by default. Empty env no longer means "worldwide"; it means US.
+        # Set GOODPROXIES_COUNTRY explicitly (e.g. "us,ca") to override, or
+        # GOODPROXIES_COUNTRY=any to deliberately allow all countries.
+        _country = (os.getenv("GOODPROXIES_COUNTRY") or "us").strip()
+        self.country = "" if _country.lower() == "any" else _country
+        # Client-side geo guard: drop any proxy whose returned country is not in
+        # this allow-set, as a safety net in case the upstream geo filter leaks.
+        self.allowed_countries = (
+            {c.strip().upper() for c in self.country.split(",") if c.strip()}
+            if self.country
+            else set()
+        )
         self.cooldown_seconds = float(os.getenv("GOODPROXIES_COOLDOWN_SECONDS") or "120")
         self.sort_by_latency = _env_bool("GOODPROXIES_SORT_BY_LATENCY", True)
         self.refresh_seconds = max(
@@ -101,7 +112,8 @@ class GoodProxiesProvider:
             "type": self.types,
             "count": str(self.count),
             "get": "json",
-            "fields": "ip,type,ping,works",
+            # `country` is now requested so we can verify geo client-side.
+            "fields": "ip,type,ping,works,country",
         }
         if self.max_ping:
             params["ping"] = self.max_ping
@@ -109,6 +121,7 @@ class GoodProxiesProvider:
             params["works"] = self.min_works
         if self.country:
             params["country"] = self.country
+            params["cm"] = "include"  # return ONLY these countries (explicit)
         return params
 
     @staticmethod
@@ -147,10 +160,18 @@ class GoodProxiesProvider:
         min_works = self._as_float(self.min_works, 0.0) if self.min_works else 0.0
         rows = []  # (url, ping, works)
         seen = set()
+        dropped_geo = 0
         for entry in data or []:
             url = self._to_proxy_url(entry)
             if not url or url in seen:
                 continue
+            # Client-side geo safety net: drop any proxy whose returned country
+            # isn't in the allow-set. Guards against upstream geo leaks.
+            if self.allowed_countries:
+                country = str(entry.get("country") or "").strip().upper()
+                if country and country not in self.allowed_countries:
+                    dropped_geo += 1
+                    continue
             works = self._as_float(entry.get("works"), 0.0)
             if min_works and works < min_works:
                 continue  # client-side reliability ("speed") guard
@@ -162,6 +183,13 @@ class GoodProxiesProvider:
             rows.append((url, ping, works))
         if self.sort_by_latency:
             rows.sort(key=lambda r: r[1])  # lowest latency first
+        if dropped_geo:
+            logger.info(
+                "goodproxies_geo_filtered",
+                dropped=dropped_geo,
+                kept=len(rows),
+                allowed=sorted(self.allowed_countries),
+            )
         return [u for (u, _ping, _works) in rows]
 
     def refresh(self, force: bool = False) -> None:
