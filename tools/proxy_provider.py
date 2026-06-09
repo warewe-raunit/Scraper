@@ -100,6 +100,23 @@ class GoodProxiesProvider:
             self.MIN_REFRESH_SECONDS,
             float(os.getenv("GOODPROXIES_REFRESH_SECONDS") or "60"),
         )
+        # --- Liveness pre-check -------------------------------------------
+        # Free/cheap proxy lists are mostly dead-on-arrival. Before admitting a
+        # batch to the pool we concurrently probe each proxy against a fast,
+        # tiny endpoint and keep only the ones that actually return 200. This
+        # turns "200 proxies, ~90% dead" into a small pool of confirmed-live
+        # proxies and eliminates the retry storm seen in the logs.
+        self.healthcheck_enabled = _env_bool("GOODPROXIES_HEALTHCHECK", True)
+        self.healthcheck_url = (
+            os.getenv("GOODPROXIES_HEALTHCHECK_URL")
+            or "https://www.google.com/generate_204"
+        ).strip()
+        self.healthcheck_timeout = float(
+            os.getenv("GOODPROXIES_HEALTHCHECK_TIMEOUT") or "6"
+        )
+        self.healthcheck_workers = int(
+            os.getenv("GOODPROXIES_HEALTHCHECK_WORKERS") or "50"
+        )
 
     def is_enabled(self) -> bool:
         """True only when explicitly enabled AND a key is configured."""
@@ -186,6 +203,18 @@ class GoodProxiesProvider:
             rows.append((url, ping, works))
         if self.sort_by_latency:
             rows.sort(key=lambda r: r[1])  # lowest latency first
+        urls = [u for (u, _ping, _works) in rows]
+        if self.healthcheck_enabled and urls:
+            live = self._filter_live(urls)
+            logger.info(
+                "goodproxies_healthcheck",
+                received=len(urls), live=len(live), dropped=len(urls) - len(live),
+            )
+            # If every proxy fails the probe (e.g. healthcheck endpoint itself
+            # is unreachable), don't nuke the pool — fall back to the unfiltered
+            # list so we degrade gracefully instead of going dark.
+            live_set = set(live)
+            rows = [r for r in rows if r[0] in live_set] if live else rows
         if dropped_geo:
             logger.info(
                 "goodproxies_geo_filtered",
@@ -194,6 +223,37 @@ class GoodProxiesProvider:
                 allowed=sorted(self.allowed_countries),
             )
         return [u for (u, _ping, _works) in rows]
+
+    def _probe_one(self, proxy_url: str) -> bool:
+        """Return True if the proxy can fetch the healthcheck URL with 2xx/3xx.
+
+        Uses a short timeout so a dead proxy is rejected fast. Any exception
+        (timeout, refused, tunnel failure, TLS error, the curl_cffi fingerprint
+        unpack bug) counts as 'dead' for admission purposes.
+        """
+        try:
+            resp = cffi_requests.get(
+                self.healthcheck_url,
+                proxies={"http": proxy_url, "https": proxy_url},
+                timeout=self.healthcheck_timeout,
+                # No impersonate here: we want a cheap liveness probe, and
+                # impersonate can trigger the curl_cffi unpack bug on some proxies.
+            )
+            return 200 <= resp.status_code < 400
+        except Exception:
+            return False
+
+    def _filter_live(self, urls: List[str]) -> List[str]:
+        """Concurrently probe proxies; return only those that respond."""
+        from concurrent.futures import ThreadPoolExecutor
+        workers = max(1, min(self.healthcheck_workers, len(urls)))
+        live: List[str] = []
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            results = ex.map(lambda u: (u, self._probe_one(u)), urls)
+            for url, ok in results:
+                if ok:
+                    live.append(url)
+        return live
 
     def refresh(self, force: bool = False) -> None:
         """Refresh the pool if the interval has elapsed (or force=True).
