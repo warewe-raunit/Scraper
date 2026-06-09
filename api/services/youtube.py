@@ -112,10 +112,6 @@ class YouTubeScraperService:
             max_key_retries = 3
             for attempt in range(1, max_key_retries + 1):
                 proxy = self._get_next_proxy()
-                # On the final retry attempt, fall back to direct connection (no proxy)
-                # to prevent complete key extraction failure.
-                if attempt == max_key_retries and attempt > 1:
-                    proxy = None
                 try:
                     loop = asyncio.get_running_loop()
                     session = requests.Session()
@@ -529,12 +525,6 @@ class YouTubeScraperService:
             key = await self._get_innertube_key()
             url = f"https://www.youtube.com/youtubei/v1/{endpoint}?key={key}"
             proxy = self._get_next_proxy()
-
-            # Last resort fallback: if previous attempts failed and we are on the final retry,
-            # try running direct (no proxy) to ensure the service stays up.
-            if attempt == max_retries and last_exception is not None:
-                logger.warn("youtube_innertube_direct_fallback", endpoint=endpoint, attempt=attempt)
-                proxy = None
             
             logger.info("executing_innertube_post", endpoint=endpoint, attempt=attempt, proxy=proxy[:30] + "..." if proxy else None)
             

@@ -254,8 +254,6 @@ async def _attempt_direct_scrape(
 # List of public Nitter / X-proxy instances.
 # Twiiit.com can also be used, but direct instances are more predictable for scraping.
 DEFAULT_NITTER_INSTANCES = [
-    "https://xcancel.com",
-    "https://nitter.privacydev.net",
     "https://nitter.poast.org",
     "https://nuku.trabun.org",
     "https://nitter.tiekoetter.com",
