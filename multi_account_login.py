@@ -70,11 +70,12 @@ def parse_accounts_from_env() -> list[dict]:
                     )
                     continue
                 
+                proxy_url = parts[3].strip() if len(parts) == 4 and parts[3].strip() else None
                 accounts.append({
                     "account_id": account_id.strip(),
                     "username": username.strip(),
                     "password": password.strip(),
-                    "proxy_url": None
+                    "proxy_url": proxy_url
                 })
             except Exception as e:
                 logger.error("error_parsing_account", key=key, error=str(e))

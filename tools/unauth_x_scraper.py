@@ -501,7 +501,7 @@ async def scrape_profile(
             
             is_blocked, is_proxy_issue = await _check_page_for_blocks(page, log)
             if is_blocked:
-                if is_proxy_issue:
+                if is_proxy_issue and proxy_url is not None:
                     log.warning("unauth_x.proxy_blocked_early_abort", instance=base_url)
                     return {
                         "success": False,
@@ -584,7 +584,7 @@ async def scrape_profile(
                 "TimeoutError",
                 "net::ERR_"
             ])
-            if is_proxy_error:
+            if is_proxy_error and proxy_url is not None:
                 log.warning("unauth_x.proxy_connection_failed_early_abort", instance=base_url)
                 return {
                     "success": False,
@@ -700,7 +700,7 @@ async def scrape_search(
             
             is_blocked, is_proxy_issue = await _check_page_for_blocks(page, log)
             if is_blocked:
-                if is_proxy_issue:
+                if is_proxy_issue and proxy_url is not None:
                     log.warning("unauth_x.search.proxy_blocked_early_abort", instance=base_url)
                     return {
                         "success": False,
@@ -778,7 +778,7 @@ async def scrape_search(
                 "TimeoutError",
                 "net::ERR_"
             ])
-            if is_proxy_error:
+            if is_proxy_error and proxy_url is not None:
                 log.warning("unauth_x.search.proxy_connection_failed_early_abort", instance=base_url)
                 return {
                     "success": False,
