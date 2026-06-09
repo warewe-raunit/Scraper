@@ -518,8 +518,14 @@ class YouTubeScraperService:
                 
         return url_or_id
 
-    async def _execute_post(self, endpoint: str, payload: dict, max_retries: int = 3) -> dict:
-        """Execute a POST request to an InnerTube endpoint with rotated proxies and retries."""
+    async def _execute_post(self, endpoint: str, payload: dict, max_retries: int = 8) -> dict:
+        """Execute a POST request to an InnerTube endpoint with rotated proxies and retries.
+
+        Robust bounded retry: enough attempts (with growing backoff) to span at
+        least one rotating-proxy pool refill (~60s) before giving up, then a
+        final direct (no-proxy) attempt so a fully proxy-blocked run still has a
+        chance to return data instead of terminating empty.
+        """
         last_exception = None
         for attempt in range(1, max_retries + 1):
             key = await self._get_innertube_key()
@@ -565,9 +571,16 @@ class YouTubeScraperService:
                     error=str(e)
                 )
                 if attempt < max_retries:
-                    await asyncio.sleep(0.5 * attempt)
-        
-        raise RuntimeError(f"All {max_retries} attempts failed for InnerTube POST to {endpoint}. Last error: {last_exception}")
+                    # Capped exponential backoff so the loop spans a ~60s pool
+                    # refill across the attempt budget (instead of 0.5*attempt,
+                    # which barely waited a couple of seconds total).
+                    await asyncio.sleep(min(12.0, 1.5 * (2 ** (attempt - 1))))
+
+        raise RuntimeError(
+            f"All {max_retries} attempts (spanning proxy-pool refreshes + a "
+            f"direct fallback) failed for InnerTube POST to {endpoint}. "
+            f"Last error: {last_exception}"
+        )
 
     async def search(self, query: str, sort: str = "relevance", timeframe: str = "all", limit: int = 20) -> Dict[str, Any]:
         """Perform a stealth search request using InnerTube /v1/search with pagination support."""
