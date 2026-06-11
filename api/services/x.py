@@ -57,11 +57,21 @@ class XScraperService:
         headless: bool = True
     ) -> Dict[str, Any]:
         """Scrape a user profile and their tweets without authentication, with proxy rotation and retries."""
-        max_attempts = 1 if proxy_url else min(3, max(1, len(self.proxies)))
+        from tools.goodproxies import GoodProxiesProvider
+        gp = GoodProxiesProvider()
+        is_gp = gp.enabled and gp.api_key
+        
+        max_attempts = 1 if proxy_url else (3 if is_gp else min(3, max(1, len(self.proxies))))
         last_result = {"success": False, "profile": {}, "tweets": [], "error": "No proxies available."}
         
         for attempt in range(1, max_attempts + 1):
-            resolved_proxy = proxy_url or self._get_next_proxy()
+            resolved_proxy = proxy_url
+            if not resolved_proxy:
+                if is_gp:
+                    resolved_proxy = await gp.get_proxy()
+                if not resolved_proxy:
+                    resolved_proxy = self._get_next_proxy()
+                    
             if resolved_proxy:
                 logger.info(
                     "using_proxy_for_x_profile", 
@@ -87,8 +97,11 @@ class XScraperService:
                 
             last_result = result
             if resolved_proxy:
-                # Cool down proxy on failure to prevent repeated blocks
-                self._cool_down_proxy(resolved_proxy)
+                if is_gp:
+                    gp.mark_failed(resolved_proxy)
+                else:
+                    # Cool down proxy on failure to prevent repeated blocks
+                    self._cool_down_proxy(resolved_proxy)
                 
             logger.warn(
                 "x_profile_attempt_failed_rotating_proxy", 
@@ -107,11 +120,21 @@ class XScraperService:
         headless: bool = True
     ) -> Dict[str, Any]:
         """Scrape tweets matching a search query without authentication, with proxy rotation and retries."""
-        max_attempts = 1 if proxy_url else min(3, max(1, len(self.proxies)))
+        from tools.goodproxies import GoodProxiesProvider
+        gp = GoodProxiesProvider()
+        is_gp = gp.enabled and gp.api_key
+        
+        max_attempts = 1 if proxy_url else (3 if is_gp else min(3, max(1, len(self.proxies))))
         last_result = {"success": False, "tweets": [], "error": "No proxies available."}
         
         for attempt in range(1, max_attempts + 1):
-            resolved_proxy = proxy_url or self._get_next_proxy()
+            resolved_proxy = proxy_url
+            if not resolved_proxy:
+                if is_gp:
+                    resolved_proxy = await gp.get_proxy()
+                if not resolved_proxy:
+                    resolved_proxy = self._get_next_proxy()
+                    
             if resolved_proxy:
                 logger.info(
                     "using_proxy_for_x_search", 
@@ -135,8 +158,11 @@ class XScraperService:
                 
             last_result = result
             if resolved_proxy:
-                # Cool down proxy on failure to prevent repeated blocks
-                self._cool_down_proxy(resolved_proxy)
+                if is_gp:
+                    gp.mark_failed(resolved_proxy)
+                else:
+                    # Cool down proxy on failure to prevent repeated blocks
+                    self._cool_down_proxy(resolved_proxy)
                 
             logger.warn(
                 "x_search_attempt_failed_rotating_proxy", 

@@ -127,12 +127,12 @@ def get_session_cookies_and_token(session_file: Path) -> tuple[str, str]:
         
     return cookie_string, token_v2
 
-def create_stealth_client(account_id: Optional[str] = None) -> requests.Session:
+async def create_stealth_client(account_id: Optional[str] = None) -> requests.Session:
     """
     Build a requests.Session configured with:
       1. Extraction of token_v2 authentication.
       2. Generated hardware client-hints aligned with account profile.
-      3. Sticky proxy configuration.
+      3. Sticky or rotating proxy configuration.
     """
     global _rotation_index
     
@@ -165,14 +165,22 @@ def create_stealth_client(account_id: Optional[str] = None) -> requests.Session:
     if not token_v2:
         raise ValueError(f"Could not find token_v2 in cookies for account {selected_account}")
         
-    # 3. Resolve Proxy (Sticky Proxy)
-    # Parse accounts from .env to find proxy settings for this account
-    accounts_info = parse_accounts_from_env()
+    # 3. Resolve Proxy (Rotating Proxy or Sticky Proxy)
+    from tools.goodproxies import GoodProxiesProvider
+    gp = GoodProxiesProvider()
     proxy_url = None
-    for acc in accounts_info:
-        if acc["account_id"] == selected_account:
-            proxy_url = acc.get("proxy_url")
-            break
+    if gp.enabled and gp.api_key:
+        proxy_url = await gp.get_proxy()
+        if proxy_url:
+            logger.info("stealth_client.using_rotating_proxy", proxy=proxy_url[:30] + "...")
+            
+    if not proxy_url:
+        # Parse accounts from .env to find proxy settings for this account
+        accounts_info = parse_accounts_from_env()
+        for acc in accounts_info:
+            if acc["account_id"] == selected_account:
+                proxy_url = acc.get("proxy_url")
+                break
             
     # Clean proxy output for log security
     display_proxy = "Direct"
@@ -269,6 +277,17 @@ def get_x_scraper_service(db: Any = Depends(get_database_service)) -> XScraperSe
         from api.services.x import XScraperService
         _global_x_service = XScraperService(db=db)
     return _global_x_service
+
+
+_global_linkedin_service = None
+
+def get_linkedin_scraper_service(db: Any = Depends(get_database_service)) -> LinkedInScraperService:
+    """Dependency provider for LinkedInScraperService singleton."""
+    global _global_linkedin_service
+    if _global_linkedin_service is None:
+        from api.services.linkedin import LinkedInScraperService
+        _global_linkedin_service = LinkedInScraperService(db=db)
+    return _global_linkedin_service
 
 
 from fastapi import Security, HTTPException, status

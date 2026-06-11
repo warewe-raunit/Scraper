@@ -78,9 +78,18 @@ class YouTubeScraperService:
                 return self._api_key
 
             # Method 1: GET request extraction with retries
+            from tools.goodproxies import GoodProxiesProvider
+            gp = GoodProxiesProvider()
+            is_gp = gp.enabled and gp.api_key
+            
             max_key_retries = 3
             for attempt in range(1, max_key_retries + 1):
-                proxy = self._get_next_proxy()
+                proxy = None
+                if is_gp:
+                    proxy = await gp.get_proxy()
+                if not proxy:
+                    proxy = self._get_next_proxy()
+                    
                 try:
                     loop = asyncio.get_running_loop()
                     session = requests.Session()
@@ -105,11 +114,17 @@ class YouTubeScraperService:
                             return self._api_key
                     else:
                         if proxy:
-                            self._cool_down_proxy(proxy, duration_seconds=300)
+                            if is_gp:
+                                gp.mark_failed(proxy)
+                            else:
+                                self._cool_down_proxy(proxy, duration_seconds=300)
                         logger.warn("http_innertube_key_extraction_non_200", status=response.status_code, attempt=attempt)
                 except Exception as e:
                     if proxy:
-                        self._cool_down_proxy(proxy, duration_seconds=300)
+                        if is_gp:
+                            gp.mark_failed(proxy)
+                        else:
+                            self._cool_down_proxy(proxy, duration_seconds=300)
                     logger.warn("http_innertube_key_extraction_failed", attempt=attempt, error=str(e))
                     if attempt < max_key_retries:
                         await asyncio.sleep(0.5)
@@ -117,7 +132,11 @@ class YouTubeScraperService:
             # Method 2: Playwright fallback
             try:
                 logger.info("falling_back_to_playwright_for_key")
-                pw_proxy = self._get_next_proxy()
+                pw_proxy = None
+                if is_gp:
+                    pw_proxy = await gp.get_proxy()
+                if not pw_proxy:
+                    pw_proxy = self._get_next_proxy()
                 pw, browser, context, page = await launch_browser(
                     account_id="acc_01",
                     proxy_url=pw_proxy,
@@ -489,11 +508,20 @@ class YouTubeScraperService:
 
     async def _execute_post(self, endpoint: str, payload: dict, max_retries: int = 3) -> dict:
         """Execute a POST request to an InnerTube endpoint with rotated proxies and retries."""
+        from tools.goodproxies import GoodProxiesProvider
+        gp = GoodProxiesProvider()
+        is_gp = gp.enabled and gp.api_key
+        
         last_exception = None
         for attempt in range(1, max_retries + 1):
             key = await self._get_innertube_key()
             url = f"https://www.youtube.com/youtubei/v1/{endpoint}?key={key}"
-            proxy = self._get_next_proxy()
+            
+            proxy = None
+            if is_gp:
+                proxy = await gp.get_proxy()
+            if not proxy:
+                proxy = self._get_next_proxy()
             
             logger.info("executing_innertube_post", endpoint=endpoint, attempt=attempt, proxy=proxy[:30] + "..." if proxy else None)
             
@@ -524,7 +552,10 @@ class YouTubeScraperService:
                 last_exception = e
                 # Flag the proxy as bad and put it on cooldown for 5 minutes
                 if proxy:
-                    self._cool_down_proxy(proxy, duration_seconds=300)
+                    if is_gp:
+                        gp.mark_failed(proxy)
+                    else:
+                        self._cool_down_proxy(proxy, duration_seconds=300)
                     
                 logger.warn(
                     "innertube_post_attempt_failed",
@@ -961,6 +992,9 @@ class YouTubeScraperService:
         for local download.
         """
         import yt_dlp
+        from tools.goodproxies import GoodProxiesProvider
+        gp = GoodProxiesProvider()
+        is_gp = gp.enabled and gp.api_key
         
         video_id = self.extract_video_id(url_or_id)
         
@@ -969,7 +1003,11 @@ class YouTubeScraperService:
         except ValueError:
             height = 360
             
-        proxy = self._get_next_proxy()
+        proxy = None
+        if is_gp:
+            proxy = await gp.get_proxy()
+        if not proxy:
+            proxy = self._get_next_proxy()
         
         ydl_opts = {
             "quiet": True,
@@ -1019,7 +1057,10 @@ class YouTubeScraperService:
             }
         except Exception as e:
             if proxy:
-                self._cool_down_proxy(proxy, duration_seconds=300)
+                if is_gp:
+                    gp.mark_failed(proxy)
+                else:
+                    self._cool_down_proxy(proxy, duration_seconds=300)
             logger.error("youtube_direct_url_extraction_failed", video_id=video_id, error=str(e))
             raise RuntimeError(f"Failed to extract direct download URL: {e}")
 
@@ -1031,6 +1072,9 @@ class YouTubeScraperService:
         """
         import yt_dlp
         import uuid
+        from tools.goodproxies import GoodProxiesProvider
+        gp = GoodProxiesProvider()
+        is_gp = gp.enabled and gp.api_key
         
         video_id = self.extract_video_id(url_or_id)
         
@@ -1047,7 +1091,11 @@ class YouTubeScraperService:
         last_exception = None
         for attempt in range(1, max_retries + 1):
             # Rotate proxy
-            proxy = self._get_next_proxy()
+            proxy = None
+            if is_gp:
+                proxy = await gp.get_proxy()
+            if not proxy:
+                proxy = self._get_next_proxy()
             
             # To avoid name conflicts, append a short UUID
             unique_suffix = str(uuid.uuid4())[:8]
@@ -1101,7 +1149,10 @@ class YouTubeScraperService:
                 last_exception = e
                 # Flag the proxy as bad and put it on cooldown
                 if proxy:
-                    self._cool_down_proxy(proxy, duration_seconds=300)
+                    if is_gp:
+                        gp.mark_failed(proxy)
+                    else:
+                        self._cool_down_proxy(proxy, duration_seconds=300)
                 logger.warn("youtube_video_download_attempt_failed", video_id=video_id, resolution=resolution, attempt=attempt, error=str(e))
                 if attempt < max_retries:
                     await asyncio.sleep(1)

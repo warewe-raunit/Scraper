@@ -697,8 +697,9 @@ async def launch_browser(
     account_id: str,
     proxy_url: Optional[str] = None,
     headless: bool = False,
+    use_rotating_proxy: bool = True,
 ) -> tuple[Playwright, Any, BrowserContext, Page]:
-    logger.info("browser_manager.launch_browser.start", account_id=account_id, headless=headless, proxy_url=proxy_url)
+    logger.info("browser_manager.launch_browser.start", account_id=account_id, headless=headless, proxy_url=proxy_url, use_rotating_proxy=use_rotating_proxy)
     pw = await async_playwright().start()
 
     global _PLAYWRIGHT_CHROMIUM_VERSION
@@ -712,7 +713,20 @@ async def launch_browser(
 
     profile_mgr = BrowserProfileManager()
     profile = profile_mgr.generate(account_id)
-    await _align_profile_to_proxy_geo(profile, proxy_url)
+
+    # Resolve Proxy (support global rotating proxy override)
+    from tools.goodproxies import GoodProxiesProvider
+    gp = GoodProxiesProvider()
+    resolved_proxy = proxy_url
+    if resolved_proxy == "direct":
+        resolved_proxy = None
+    elif use_rotating_proxy and gp.enabled and gp.api_key:
+        gp_proxy = await gp.get_proxy()
+        if gp_proxy:
+            resolved_proxy = gp_proxy
+            logger.info("browser_manager.launch_browser.using_rotating_proxy", proxy=resolved_proxy[:30] + "...")
+
+    await _align_profile_to_proxy_geo(profile, resolved_proxy)
 
     if _PLAYWRIGHT_CHROMIUM_VERSION:
         profile["chrome_full_version"] = _PLAYWRIGHT_CHROMIUM_VERSION
@@ -736,7 +750,7 @@ async def launch_browser(
             f"--window-size={screen['width']},{screen['height']}",
         ],
     }
-    proxy_config = playwright_proxy_config(proxy_url)
+    proxy_config = playwright_proxy_config(resolved_proxy)
     if proxy_config:
         launch_args["proxy"] = proxy_config
 
@@ -907,10 +921,11 @@ async def close_browser(pw: Playwright, browser: Any) -> None:
 class LazyBrowser:
     """Browser that launches only on first tool call, stays open for the session."""
 
-    def __init__(self, account_id: str, proxy_url: Optional[str] = None, headless: bool = False):
+    def __init__(self, account_id: str, proxy_url: Optional[str] = None, headless: bool = False, use_rotating_proxy: bool = True):
         self.account_id = account_id
         self.proxy_url = proxy_url
         self.headless = headless
+        self.use_rotating_proxy = use_rotating_proxy
         self._pw: Optional[Playwright] = None
         self._browser: Optional[Any] = None
         self._context: Optional[BrowserContext] = None
@@ -949,7 +964,7 @@ class LazyBrowser:
 
             if self._page is None:
                 self._pw, self._browser, self._context, self._page = await launch_browser(
-                    self.account_id, self.proxy_url, self.headless
+                    self.account_id, self.proxy_url, self.headless, self.use_rotating_proxy
                 )
             return self._page
 

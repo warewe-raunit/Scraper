@@ -65,7 +65,7 @@ class RedditScraperService:
 
             # 2. Build stealth client for the selected account
             try:
-                session = create_stealth_client(account_id)
+                session = await create_stealth_client(account_id)
             except Exception as e:
                 logger.error("failed_to_initialize_client", account_id=account_id, error=str(e))
                 # Put account in temporary cooldown and try another

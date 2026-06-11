@@ -105,7 +105,7 @@ async def login_account(account: dict, captcha_config: dict | None, headless: bo
     )
     
     # Instantiate browser context with the sticky proxy
-    lazy_browser = LazyBrowser(account_id=account_id, proxy_url=proxy_url, headless=headless)
+    lazy_browser = LazyBrowser(account_id=account_id, proxy_url=proxy_url, headless=headless, use_rotating_proxy=False)
     
     try:
         page = await lazy_browser.get_page()
