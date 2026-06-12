@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import re
+import asyncio
 from typing import Any, Dict, List, Optional
 import structlog
 from supabase import create_client, Client
@@ -131,7 +132,7 @@ class DatabaseService:
                 }
                 records.append(record)
                 
-            self.client.table("reddit_posts").upsert(records).execute()
+            await asyncio.to_thread(self.client.table("reddit_posts").upsert(records).execute)
             logger.info("saved_reddit_posts", count=len(records))
             return True
         except Exception as e:
@@ -167,7 +168,7 @@ class DatabaseService:
                 }
                 records.append(record)
                 
-            self.client.table("reddit_comments").upsert(records).execute()
+            await asyncio.to_thread(self.client.table("reddit_comments").upsert(records).execute)
             logger.info("saved_reddit_comments", count=len(records))
             return True
         except Exception as e:
@@ -201,7 +202,7 @@ class DatabaseService:
                 "profile_description": user.get("profile_description"),
                 "url": user.get("url")
             }
-            self.client.table("reddit_users").upsert(record).execute()
+            await asyncio.to_thread(self.client.table("reddit_users").upsert(record).execute)
             logger.info("saved_reddit_user", username=user.get("username"))
             return True
         except Exception as e:
@@ -248,7 +249,7 @@ class DatabaseService:
                 records.append(record)
                 
             if records:
-                self.client.table("x_tweets").upsert(records).execute()
+                await asyncio.to_thread(self.client.table("x_tweets").upsert(records).execute)
                 logger.info("saved_x_tweets", count=len(records))
             return True
         except Exception as e:
@@ -281,7 +282,7 @@ class DatabaseService:
                 "following_count": _parse_int(stats.get("following")),
                 "likes_count": _parse_int(stats.get("likes"))
             }
-            self.client.table("x_profiles").upsert(record).execute()
+            await asyncio.to_thread(self.client.table("x_profiles").upsert(record).execute)
             logger.info("saved_x_profile", username=username)
             return True
         except Exception as e:
@@ -325,7 +326,7 @@ class DatabaseService:
                 records.append(record)
                 
             if records:
-                self.client.table("youtube_videos").upsert(records).execute()
+                await asyncio.to_thread(self.client.table("youtube_videos").upsert(records).execute)
                 logger.info("saved_youtube_videos", count=len(records))
             return True
         except Exception as e:
@@ -360,7 +361,7 @@ class DatabaseService:
                 records.append(record)
                 
             if records:
-                self.client.table("youtube_comments").upsert(records).execute()
+                await asyncio.to_thread(self.client.table("youtube_comments").upsert(records).execute)
                 logger.info("saved_youtube_comments", count=len(records))
             return True
         except Exception as e:
@@ -388,7 +389,7 @@ class DatabaseService:
                 "subscribers": (str(channel.get("subscribers")) if channel.get("subscribers") is not None else None),
                 "url": channel.get("url") or f"https://www.youtube.com/channel/{channel_id}"
             }
-            self.client.table("youtube_channels").upsert(record).execute()
+            await asyncio.to_thread(self.client.table("youtube_channels").upsert(record).execute)
             logger.info("saved_youtube_channel", channel_id=channel_id)
             return True
         except Exception as e:
@@ -400,7 +401,7 @@ class DatabaseService:
     # configured, so callers never crash in local/no-DB mode. Use these instead
     # of re-scraping when the data already exists in the database.
 
-    def _query(
+    async def _query(
         self,
         table: str,
         *,
@@ -422,14 +423,14 @@ class DatabaseService:
                 q = q.order(order_by, desc=descending)
             start = max(0, int(offset))
             end = start + max(1, int(limit)) - 1
-            resp = q.range(start, end).execute()
+            resp = await asyncio.to_thread(q.range(start, end).execute)
             return resp.data or []
         except Exception as e:
             logger.error("db_query_failed", table=table, error=str(e))
             return []
 
-    def _query_one(self, table: str, filters: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        rows = self._query(table, filters=filters, limit=1)
+    async def _query_one(self, table: str, filters: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        rows = await self._query(table, filters=filters, limit=1)
         return rows[0] if rows else None
 
     # ----- Reddit -----
@@ -440,7 +441,7 @@ class DatabaseService:
         limit: int = 50,
         offset: int = 0,
     ) -> List[Dict[str, Any]]:
-        return self._query(
+        return await self._query(
             "reddit_posts",
             filters={"subreddit": subreddit, "username": username},
             limit=limit,
@@ -449,7 +450,7 @@ class DatabaseService:
         )
 
     async def get_reddit_post(self, post_id: str) -> Optional[Dict[str, Any]]:
-        return self._query_one("reddit_posts", {"id": post_id})
+        return await self._query_one("reddit_posts", {"id": post_id})
 
     async def get_reddit_comments(
         self,
@@ -459,7 +460,7 @@ class DatabaseService:
         limit: int = 50,
         offset: int = 0,
     ) -> List[Dict[str, Any]]:
-        return self._query(
+        return await self._query(
             "reddit_comments",
             filters={"post_id": post_id, "username": username, "subreddit": subreddit},
             limit=limit,
@@ -468,7 +469,7 @@ class DatabaseService:
         )
 
     async def get_reddit_user(self, username: str) -> Optional[Dict[str, Any]]:
-        return self._query_one("reddit_users", {"username": username})
+        return await self._query_one("reddit_users", {"username": username})
 
     # ----- X (Twitter) -----
     async def get_x_tweets(
@@ -477,7 +478,7 @@ class DatabaseService:
         limit: int = 50,
         offset: int = 0,
     ) -> List[Dict[str, Any]]:
-        return self._query(
+        return await self._query(
             "x_tweets",
             filters={"username": username},
             limit=limit,
@@ -486,7 +487,7 @@ class DatabaseService:
         )
 
     async def get_x_profile(self, username: str) -> Optional[Dict[str, Any]]:
-        return self._query_one("x_profiles", {"username": username})
+        return await self._query_one("x_profiles", {"username": username})
 
     # ----- YouTube -----
     async def get_youtube_videos(
@@ -495,7 +496,7 @@ class DatabaseService:
         limit: int = 50,
         offset: int = 0,
     ) -> List[Dict[str, Any]]:
-        return self._query(
+        return await self._query(
             "youtube_videos",
             filters={"channel_id": channel_id},
             limit=limit,
@@ -504,7 +505,7 @@ class DatabaseService:
         )
 
     async def get_youtube_video(self, video_id: str) -> Optional[Dict[str, Any]]:
-        return self._query_one("youtube_videos", {"id": video_id})
+        return await self._query_one("youtube_videos", {"id": video_id})
 
     async def get_youtube_comments(
         self,
@@ -512,7 +513,7 @@ class DatabaseService:
         limit: int = 50,
         offset: int = 0,
     ) -> List[Dict[str, Any]]:
-        return self._query(
+        return await self._query(
             "youtube_comments",
             filters={"video_id": video_id},
             limit=limit,
@@ -521,4 +522,4 @@ class DatabaseService:
         )
 
     async def get_youtube_channel(self, channel_id: str) -> Optional[Dict[str, Any]]:
-        return self._query_one("youtube_channels", {"id": channel_id})
+        return await self._query_one("youtube_channels", {"id": channel_id})

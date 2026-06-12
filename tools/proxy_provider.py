@@ -70,6 +70,9 @@ class GoodProxiesProvider:
             label="global_proxy",
             default_cooldown=self.cooldown_seconds,
         )
+        self._refresh_thread = None
+        if self.is_enabled():
+            self.refresh(force=True)
 
     # ----------------------------------------------------------------- config
     def _load_config(self) -> None:
@@ -256,7 +259,7 @@ class GoodProxiesProvider:
         return live
 
     def refresh(self, force: bool = False) -> None:
-        """Refresh the pool if the interval has elapsed (or force=True).
+        """Refresh the pool if the interval has elapsed (or force=True) in a background thread.
 
         Failures are non-fatal: we keep the last-good list and back off so a
         flaky API never empties the pool mid-scrape.
@@ -266,7 +269,23 @@ class GoodProxiesProvider:
         now = time.time()
         if not force and (now - self._last_fetch) < self.refresh_seconds:
             return
+
+        # Check if another refresh is already running in background
+        if getattr(self, "_refresh_thread", None) and self._refresh_thread.is_alive():
+            return
+
+        # Spawn daemon thread to refresh
+        self._refresh_thread = threading.Thread(
+            target=self._run_refresh_sync,
+            args=(force,),
+            daemon=True
+        )
+        self._refresh_thread.start()
+
+    def _run_refresh_sync(self, force: bool = False) -> None:
+        """Perform the actual synchronous fetch and update within lock."""
         with self._lock:
+            # Recheck condition inside lock
             now = time.time()
             if not force and (now - self._last_fetch) < self.refresh_seconds:
                 return

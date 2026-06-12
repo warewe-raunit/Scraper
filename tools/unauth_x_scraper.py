@@ -175,14 +175,14 @@ async def _attempt_direct_scrape(
     proxy_url: Optional[str],
     account_id: str,
     log
-) -> Optional[str]:
+) -> tuple[Optional[str], str]:
     """Attempt to fetch page content directly via curl_cffi using saved stealth session cookies.
-    Returns the HTML text if successful and not blocked, else None.
+    Returns a tuple of (HTML text or None, status/reason string).
     """
     cookie_str, user_agent = _get_stealth_session_info(account_id)
     if not cookie_str:
         log.info("unauth_x.direct_scrape.no_saved_session")
-        return None
+        return None, "NO_SESSION"
 
     # Time-limit the cached session. The cookies/clearance token the browser
     # obtained for this proxy+instance are short-lived; past the TTL, skip the
@@ -201,7 +201,7 @@ async def _attempt_direct_scrape(
                 age_seconds=round(age, 1),
                 ttl_seconds=ttl,
             )
-            return None
+            return None, "SESSION_EXPIRED"
         
     headers = {
         "User-Agent": user_agent,
@@ -227,37 +227,38 @@ async def _attempt_direct_scrape(
             )
         )
         
+        html = response.text or ""
+        
+        # Check if the page is a block/challenge page
+        is_challenge = ("Just a moment..." in html or 
+                        "Attention Required!" in html or 
+                        "Verifying your request" in html or
+                        "Making sure you're not a bot!" in html or
+                        "challenges.cloudflare.com" in html)
+                        
+        if is_challenge:
+            log.warning("unauth_x.direct_scrape.blocked_by_challenge")
+            return None, "CLOUDFLARE"
+            
         if response.status_code != 200:
             log.warning("unauth_x.direct_scrape.failed_status", status=response.status_code)
-            return None
-            
-        html = response.text
-        # Check if the page is a block/challenge page
-        is_blocked = ("Just a moment..." in html or 
-                      "Attention Required!" in html or 
-                      "Verifying your request" in html or
-                      "Making sure you're not a bot!" in html or
-                      "Rate limit exceeded" in html or
-                      "429 Too Many Requests" in html)
-                      
-        if is_blocked:
-            log.warning("unauth_x.direct_scrape.blocked_by_challenge")
-            return None
+            return None, f"HTTP_{response.status_code}"
             
         log.info("unauth_x.direct_scrape.success", size=len(html))
-        return html
+        return html, "SUCCESS"
         
     except Exception as e:
         log.warning("unauth_x.direct_scrape.error", error=str(e))
-        return None
+        return None, "CONNECTION_FAILED"
+
 
 # List of public Nitter / X-proxy instances.
 # Twiiit.com can also be used, but direct instances are more predictable for scraping.
 DEFAULT_NITTER_INSTANCES = [
-    "https://nitter.poast.org",
-    "https://nuku.trabun.org",
     "https://nitter.tiekoetter.com",
     "https://nitter.kareem.one",
+    "https://nitter.poast.org",
+    "https://nuku.trabun.org",
     "https://nitter.catsarch.com",
 ]
 
@@ -532,7 +533,7 @@ async def scrape_profile(
         target_url = urllib.parse.urljoin(base_url, next_relative_path)
         
         # 2. Try direct HTTP GET scrape first
-        direct_html = await _attempt_direct_scrape(target_url, proxy_url, account_id, log)
+        direct_html, direct_reason = await _attempt_direct_scrape(target_url, proxy_url, account_id, log)
         if direct_html:
             try:
                 parsed = _parse_html_timeline(direct_html)
@@ -555,7 +556,7 @@ async def scrape_profile(
                         paginated_url = urllib.parse.urljoin(current_url, next_link)
                         log.info("unauth_x.direct_scrape.paginate", url=paginated_url, current_count=len(all_tweets))
                         
-                        page_html = await _attempt_direct_scrape(paginated_url, proxy_url, account_id, log)
+                        page_html, page_reason = await _attempt_direct_scrape(paginated_url, proxy_url, account_id, log)
                         if not page_html:
                             break
                             
@@ -586,6 +587,10 @@ async def scrape_profile(
                     }
             except Exception as e:
                 log.warning("unauth_x.direct_scrape.parse_failed", error=str(e))
+        else:
+            if direct_reason not in ("CLOUDFLARE", "SESSION_EXPIRED", "NO_SESSION"):
+                log.info("unauth_x.direct_scrape.skip_browser_fallback", reason=direct_reason, instance=base_url)
+                continue
         
         # 3. Fallback to browser (Playwright)
         log.info("unauth_x.direct_scrape.fallback_to_browser", account_id=account_id)
@@ -739,7 +744,7 @@ async def scrape_search(
         target_url = urllib.parse.urljoin(base_url, next_relative_path)
         
         # 2. Try direct HTTP GET scrape first
-        direct_html = await _attempt_direct_scrape(target_url, proxy_url, account_id, log)
+        direct_html, direct_reason = await _attempt_direct_scrape(target_url, proxy_url, account_id, log)
         if direct_html:
             try:
                 parsed = _parse_html_timeline(direct_html)
@@ -759,7 +764,7 @@ async def scrape_search(
                         paginated_url = urllib.parse.urljoin(current_url, next_link)
                         log.info("unauth_x.search.direct_scrape.paginate", url=paginated_url, current_count=len(all_tweets))
                         
-                        page_html = await _attempt_direct_scrape(paginated_url, proxy_url, account_id, log)
+                        page_html, page_reason = await _attempt_direct_scrape(paginated_url, proxy_url, account_id, log)
                         if not page_html:
                             break
                             
@@ -789,6 +794,10 @@ async def scrape_search(
                     }
             except Exception as e:
                 log.warning("unauth_x.search.direct_scrape.parse_failed", error=str(e))
+        else:
+            if direct_reason not in ("CLOUDFLARE", "SESSION_EXPIRED", "NO_SESSION"):
+                log.info("unauth_x.search.direct_scrape.skip_browser_fallback", reason=direct_reason, instance=base_url)
+                continue
                 
         # 3. Fallback to browser (Playwright)
         log.info("unauth_x.search.direct_scrape.fallback_to_browser", account_id=account_id)
