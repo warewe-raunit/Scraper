@@ -32,10 +32,14 @@ class LinkedInScraperService:
         self.db = db
 
     def _parse_linkedin_accounts(self) -> List[Dict[str, Any]]:
-        """Parse LINKEDIN_ACCOUNT_<N> entries from the environment (accepts 3-part or 4-part strings)."""
+        """Parse LINKEDIN_ACCOUNT_<N> entries from the environment.
+
+        Format: account_id|username|password[|proxy_url]
+        Proxy via GOODPROXIES_* if 4th part omitted.
+        """
         accounts = []
         pattern = re.compile(r"^LINKEDIN_ACCOUNT_\d+$")
-        
+
         for key, value in os.environ.items():
             if pattern.match(key):
                 try:
@@ -46,19 +50,19 @@ class LinkedInScraperService:
                     username = parts[1]
                     password = parts[2]
                     proxy_url = parts[3] if len(parts) == 4 else None
-                    
+
                     if "your_username" in username or "your_password" in password:
                         continue
-                        
+
                     accounts.append({
                         "account_id": account_id.strip(),
                         "username": username.strip(),
                         "password": password.strip(),
-                        "proxy_url": proxy_url.strip() if proxy_url and proxy_url.strip() else None
+                        "proxy_url": proxy_url.strip() if proxy_url and proxy_url.strip() else None,
                     })
                 except Exception as e:
                     logger.error("error_parsing_linkedin_account_env", key=key, error=str(e))
-                    
+
         accounts.sort(key=lambda x: x["account_id"])
         return accounts
 
@@ -397,8 +401,23 @@ class LinkedInScraperService:
         except Exception:
             pass
 
+        # Clear any stale cooldown on the login proxy — earlier versions of this
+        # code cooled it down on 4xx LinkedIn responses (a working proxy), and
+        # that cooldown may still be ticking. The login proxy is our best chance
+        # at avoiding LinkedIn's IP-binding rejection.
+        if login_proxy and gp.enabled and gp.pool is not None:
+            try:
+                gp.pool.clear(login_proxy)
+                logger.info("voyager_get.cleared_login_proxy_cooldown",
+                            account_id=target_account_id, proxy=login_proxy[:30] + "...")
+            except Exception:
+                pass
+
         max_proxy_attempts = int(os.getenv("LINKEDIN_PROXY_MAX_ATTEMPTS", "40"))
         proxy_timeout = int(os.getenv("LINKEDIN_PROXY_TIMEOUT", "8"))
+        # Give the pinned login proxy a longer timeout — if it's slow but alive,
+        # we want to use it instead of rotating to random pool proxies.
+        login_proxy_timeout = int(os.getenv("LINKEDIN_LOGIN_PROXY_TIMEOUT", "15"))
         url = f"https://www.linkedin.com{api_path}"
 
         async def _attempt(proxy_url: Optional[str]) -> tuple[Optional[int], Optional[Any]]:
@@ -431,10 +450,14 @@ class LinkedInScraperService:
             if proxy_url:
                 session.proxies = {"http": proxy_url, "https": proxy_url}
 
+            # Login proxy gets a more patient timeout — it's the one most likely
+            # to be IP-class compatible with the session.
+            effective_timeout = login_proxy_timeout if proxy_url == login_proxy else proxy_timeout
+
             loop = asyncio.get_running_loop()
             resp = await loop.run_in_executor(
                 None,
-                lambda: session.get(url, headers=headers, impersonate="chrome120", timeout=proxy_timeout, allow_redirects=False),
+                lambda: session.get(url, headers=headers, impersonate="chrome120", timeout=effective_timeout, allow_redirects=False),
             )
             return resp.status_code, resp
 
@@ -553,10 +576,13 @@ class LinkedInScraperService:
                 text_head = (resp.text or "")[:500] if resp is not None else ""
             except Exception:
                 pass
-            logger.warning("voyager_fetch.failed", status=status, text_head=text_head)
-            if proxy_url and gp.enabled and gp.api_key:
-                gp.mark_failed(proxy_url)
-            # 401/403 also indicates auth death — surface as session_redirected
+            logger.warning("voyager_fetch.failed", status=status, text_head=text_head,
+                           url_path=api_path[:300])
+            # IMPORTANT: do NOT mark the proxy failed here. Any HTTP response
+            # (including 400/401/403/404/500) means the proxy tunnel reached
+            # LinkedIn perfectly — the rejection is server-side (bad query,
+            # dead session, stale API path). Cooling down a working proxy
+            # drains the pool of the few proxies that actually reach LinkedIn.
             session_dead = status in (401, 403)
             if return_signal:
                 return None, session_dead
@@ -888,17 +914,25 @@ class LinkedInScraperService:
                 "(key:%s,value:List(%s))" % (k, v) for k, v in filters
             )
 
-            parts = ["origin:JOB_SEARCH_PAGE_QUERY_EXPANSION", "keywords:" + keywords]
-            if location:
-                parts.append("locationFallback:" + location)
+            # Strip whitespace — LinkedIn rejects trailing spaces in keywords
+            # and locationFallback with a 400.
+            keywords_clean = (keywords or "").strip()
+            location_clean = (location or "").strip()
+
+            parts = ["origin:JOB_SEARCH_PAGE_QUERY_EXPANSION", "keywords:" + keywords_clean]
+            if location_clean:
+                parts.append("locationFallback:" + location_clean)
             if filter_str:
                 parts.append("selectedFilters:(" + filter_str + ")")
             parts.append("spellCorrectionEnabled:true")
             query_value = "(" + ",".join(parts) + ")"
 
+            # decorationId version is configurable via env so we can bump it
+            # without code changes when LinkedIn rotates it.
+            deco_version = os.getenv("LINKEDIN_VOYAGER_JOBS_DECO_VERSION", "190")
             api_path = (
                 "/voyager/api/voyagerJobsDashJobCards"
-                "?decorationId=com.linkedin.voyager.dash.deco.jobs.search.JobSearchCardsCollection-187"
+                f"?decorationId=com.linkedin.voyager.dash.deco.jobs.search.JobSearchCardsCollection-{deco_version}"
                 f"&count={count}"
                 "&q=jobSearch"
                 "&start=0"

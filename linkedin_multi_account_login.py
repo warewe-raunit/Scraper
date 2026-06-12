@@ -50,12 +50,12 @@ def parse_accounts_from_env() -> list[dict]:
                         expected="account_id|username|password[|proxy_url]"
                     )
                     continue
-                
+
                 account_id = parts[0]
                 username = parts[1]
                 password = parts[2]
                 proxy_url = parts[3] if len(parts) == 4 else None
-                
+
                 # Check for placeholders
                 if "your_username" in username or "your_password" in password:
                     logger.warning(
@@ -65,12 +65,12 @@ def parse_accounts_from_env() -> list[dict]:
                         msg="Skipping account due to placeholder values."
                     )
                     continue
-                
+
                 accounts.append({
                     "account_id": account_id.strip(),
                     "username": username.strip(),
                     "password": password.strip(),
-                    "proxy_url": proxy_url.strip() if proxy_url and proxy_url.strip() else None
+                    "proxy_url": proxy_url.strip() if proxy_url and proxy_url.strip() else None,
                 })
             except Exception as e:
                 logger.error("error_parsing_account", key=key, error=str(e))
@@ -79,110 +79,55 @@ def parse_accounts_from_env() -> list[dict]:
     accounts.sort(key=lambda x: x["account_id"])
     return accounts
 
-async def _resolve_sticky_proxy_for_login(account_id: str, static_proxy: str | None) -> str | None:
-    """Resolve a sticky proxy for the entire login flow.
+_PROXY_ERR_MARKERS = (
+    "ERR_EMPTY_RESPONSE", "ERR_TUNNEL", "ERR_PROXY", "ERR_TIMED_OUT",
+    "ERR_CONNECTION", "net::ERR_", "Page.goto: Timeout",
+)
 
-    Priority:
-      1. Static proxy from env (LINKEDIN_ACCOUNT_N has 4th part) — used as-is.
-      2. If LINKEDIN_LOGIN_USE_ROTATING=true and GoodProxies enabled — pick ONE
-         healthy proxy that can reach LinkedIn and stick to it for entire login.
-         (Login is multi-step; LinkedIn flags IP changes mid-flow.)
-      3. None → direct connection.
-    """
-    if static_proxy:
-        return static_proxy
-
-    if os.getenv("LINKEDIN_LOGIN_USE_ROTATING", "true").lower() not in ("true", "1", "yes", "on"):
-        return None
-
-    from tools.goodproxies import GoodProxiesProvider
-    from curl_cffi import requests as ccff_requests
-    gp = GoodProxiesProvider()
-    if not (gp.enabled and gp.api_key):
-        return None
-
-    # Vet proxies in parallel batches; pick the first that reaches LinkedIn.
-    # Concurrent check is much faster than sequential and burns less wall-clock
-    # before finding the rare ~3% healthy proxies.
-    import asyncio as _aio
-    max_vet = int(os.getenv("LINKEDIN_LOGIN_PROXY_VET_ATTEMPTS", "150"))
-    batch_size = int(os.getenv("LINKEDIN_LOGIN_PROXY_VET_BATCH", "15"))
-
-    async def _check(p: str) -> str | None:
-        loop = _aio.get_running_loop()
-        try:
-            r = await loop.run_in_executor(
-                None,
-                lambda: ccff_requests.get(
-                    "https://www.linkedin.com/robots.txt",
-                    proxies={"http": p, "https": p},
-                    impersonate="chrome120",
-                    timeout=6,
-                ),
-            )
-            if r.status_code == 200 and len(r.text) > 100:
-                return p
-        except Exception:
-            pass
-        gp.mark_failed(p)
-        return None
-
-    checked = 0
-    while checked < max_vet:
-        batch = []
-        for _ in range(batch_size):
-            p = await gp.get_proxy()
-            if p:
-                batch.append(p)
-        if not batch:
-            break
-        results = await _aio.gather(*[_check(p) for p in batch])
-        checked += len(batch)
-        for r in results:
-            if r:
-                logger.info("linkedin_login.sticky_proxy_vetted", account_id=account_id, proxy=r[:30] + "...", checked=checked)
-                return r
-
-    logger.warning("linkedin_login.no_working_proxy_vetted", account_id=account_id, attempts=checked)
-    return None
+# Login-side markers that also mean "swap proxy and retry": LinkedIn redirected
+# to a region-locked variant (zh-cn, 451), served a checkpoint challenge to a
+# suspect IP class, or silently dropped the auth call. None of these mean the
+# credentials are wrong — they mean the proxy needs swapping.
+_RETRYABLE_LOGIN_MARKERS = (
+    "Login not confirmed",
+    "/zh-cn/", "/checkpoint/pk/", "451 ",
+    "Username or password fields not found",
+)
 
 
-def _persist_login_proxy(account_id: str, proxy_url: str) -> None:
-    """Write the working login proxy into the session file so scraping can prefer it."""
+def _is_proxy_err(msg: str) -> bool:
+    return any(s in msg for s in _PROXY_ERR_MARKERS)
+
+
+def _is_retryable_login_err(msg: str) -> bool:
+    return any(s in msg for s in _RETRYABLE_LOGIN_MARKERS)
+
+
+def _mark_proxy_failed(proxy_url):
+    if not proxy_url:
+        return
     try:
-        import json as _json
-        from pathlib import Path as _Path
-        from tools.browser_manager import active_profile_session_id as _aps
-        sess_id = _aps(account_id)
-        sess_path = _Path(__file__).resolve().parent / "sessions" / f"{sess_id}.json"
-        if sess_path.exists():
-            d = _json.loads(sess_path.read_text(encoding="utf-8"))
-            d["_login_proxy"] = proxy_url
-            sess_path.write_text(_json.dumps(d, indent=2), encoding="utf-8")
-            logger.info("login.proxy_pinned_to_session", path=str(sess_path), proxy=proxy_url[:30] + "...")
-    except Exception as e:
-        logger.warning("login.proxy_pin_failed", error=str(e))
+        from tools.goodproxies import GoodProxiesProvider
+        GoodProxiesProvider().mark_failed(proxy_url)
+    except Exception:
+        pass
 
 
-async def _attempt_login(account_id, username, password, captcha_config, headless, proxy_url):
-    """Run one full login attempt with a specific sticky proxy.
+async def _login_once(account_id, username, password, proxy_url, captcha_config, headless, use_rotating):
+    """Single LazyBrowser launch + login attempt. Mirror of Reddit's login_account body.
 
-    Returns dict: {success: bool, proxy_navigation_failed: bool, error: str}.
-    proxy_navigation_failed=True means the proxy itself broke (ERR_EMPTY_RESPONSE etc.),
-    signalling the caller to swap proxies and retry.
+    On Playwright proxy errors, captures the actually-used goodproxy from the
+    browser context and feeds it back into the cooldown pool so the next
+    swap doesn't pick the same dead proxy.
     """
-    display_proxy = "Direct"
-    if proxy_url:
-        display_proxy = (f"***@{proxy_url.split('@')[-1]}" if "@" in proxy_url else proxy_url)
+    display_proxy = "Direct/Rotating" if use_rotating else (
+        f"***:***@{proxy_url.split('@')[-1]}" if proxy_url and "@" in proxy_url else (proxy_url or "Direct")
+    )
     logger.info("starting_account_login", account_id=account_id, username=username,
-                proxy=display_proxy, headless=headless)
+                proxy=display_proxy, headless=headless, use_rotating_proxy=use_rotating)
 
-    lazy_browser = LazyBrowser(account_id=account_id, proxy_url=proxy_url, headless=headless, use_rotating_proxy=False)
-    PROXY_ERRS = ("ERR_EMPTY_RESPONSE", "ERR_TUNNEL", "ERR_PROXY", "ERR_TIMED_OUT", "ERR_CONNECTION", "net::ERR_")
-
-    def _is_proxy_err(e: str) -> bool:
-        return any(s in e for s in PROXY_ERRS)
-
+    lazy_browser = LazyBrowser(account_id=account_id, proxy_url=proxy_url,
+                                headless=headless, use_rotating_proxy=use_rotating)
     try:
         try:
             page = await lazy_browser.get_page()
@@ -190,26 +135,65 @@ async def _attempt_login(account_id, username, password, captcha_config, headles
         except Exception as e:
             err = str(e)
             if _is_proxy_err(err):
-                return {"success": False, "proxy_navigation_failed": True, "error": err[:200]}
-            return {"success": False, "proxy_navigation_failed": False, "error": err[:200]}
+                _mark_proxy_failed(lazy_browser.last_used_proxy)
+                return "proxy_err", err[:200]
+            return "fatal", err[:200]
 
         if state.get("logged_in"):
             logger.info("account_already_logged_in", account_id=account_id, reason=state.get("reason"))
-            return {"success": True, "proxy_navigation_failed": False, "error": ""}
+            return "success", ""
+
+        # FAST PATH: saved-session identity cookies still recognize the user,
+        # so LinkedIn jumped straight to /checkpoint/ asking only for the email
+        # PIN — skip the full credentials submit, just solve the OTP.
+        try:
+            current_url = (page.url or "").lower()
+            on_checkpoint = ("/checkpoint/" in current_url
+                              or "verification" in current_url
+                              or "challenge" in current_url)
+        except Exception:
+            on_checkpoint = False
+
+        if on_checkpoint:
+            from tools.linkedin_login import _handle_email_verification_challenge
+            logger.info("session_validation_landed_on_checkpoint_fast_path",
+                        account_id=account_id, url=page.url)
+            try:
+                solved = await _handle_email_verification_challenge(page, username, account_id)
+            except Exception as exc:
+                logger.warning("login.fast_path_otp_failed", error=str(exc)[:200])
+                solved = False
+            if solved:
+                state_after = await linkedin_login_state(page, expected_username=username, navigate=False)
+                if state_after.get("logged_in"):
+                    logger.info("login_completed_via_otp_fast_path", account_id=account_id)
+                    return "success", ""
+                logger.warning("login.fast_path_otp_did_not_unblock", account_id=account_id)
+            # Fall through to the full credentials flow if fast path failed.
 
         logger.info("session_missing_or_expired_starting_login_flow", account_id=account_id)
         result = await login(page=page, account_id=account_id, username=username,
-                             password=password, captcha_config=captcha_config)
-        success = bool(result.get("success", False))
-        err = (result.get("error") or "")
-        if success:
-            logger.info("login_completed_successfully", account_id=account_id, username=username)
-            return {"success": True, "proxy_navigation_failed": False, "error": ""}
+                              password=password, captcha_config=captcha_config)
+        if result.get("success"):
+            logger.info("login_completed_successfully", account_id=account_id)
+            return "success", ""
+
+        err = result.get("error") or ""
+        # OTP challenge was already handled on this proxy. Swapping wastes the
+        # verification window and burns another OTP, so treat as fatal.
+        if "[OTP_CHALLENGE_HANDLED]" in err:
+            logger.error("login_failed.otp_challenge", account_id=account_id, error=err[:300])
+            return "fatal", err[:300]
         if _is_proxy_err(err):
-            logger.warning("linkedin_login.proxy_navigation_failed", proxy=proxy_url, error=err[:140])
-            return {"success": False, "proxy_navigation_failed": True, "error": err[:200]}
+            _mark_proxy_failed(lazy_browser.last_used_proxy)
+            logger.warning("login.proxy_navigation_failed", error=err[:140])
+            return "proxy_err", err[:200]
+        if _is_retryable_login_err(err):
+            _mark_proxy_failed(lazy_browser.last_used_proxy)
+            logger.warning("login.region_or_challenge_block_swapping_proxy", error=err[:140])
+            return "proxy_err", err[:200]
         logger.error("login_failed", account_id=account_id, error=err[:200])
-        return {"success": False, "proxy_navigation_failed": False, "error": err[:200]}
+        return "fatal", err[:200]
     finally:
         try:
             await lazy_browser.close()
@@ -218,40 +202,37 @@ async def _attempt_login(account_id, username, password, captcha_config, headles
 
 
 async def login_account(account: dict, captcha_config: dict | None, headless: bool) -> bool:
+    """Reddit-style login flow with proxy retry.
+
+    Same single LazyBrowser pattern as Reddit (browser_manager handles
+    goodproxy selection via use_rotating_proxy=True). Mobile fingerprint/
+    headers via BROWSER_DEVICE_CATEGORY=mobile in .env.
+
+    Because goodproxies rotate randomly and ~95% are dead, this wraps the
+    Reddit-equivalent login in a retry loop: on net::ERR_* / timeout, close
+    the browser, reopen with a fresh goodproxy, try again. Up to
+    LINKEDIN_LOGIN_PROXY_SWAP_MAX attempts (default 8).
+    """
     account_id = account["account_id"]
     username = account["username"]
     password = account["password"]
     static_proxy = account["proxy_url"]
 
-    max_proxy_swaps = int(os.getenv("LINKEDIN_LOGIN_PROXY_SWAP_MAX", "6"))
+    use_rotating = static_proxy is None
+    max_swaps = int(os.getenv("LINKEDIN_LOGIN_PROXY_SWAP_MAX", "3"))
 
-    last_proxy = None
-    for swap in range(max_proxy_swaps):
-        proxy_url = await _resolve_sticky_proxy_for_login(account_id, static_proxy)
-        last_proxy = proxy_url
-        if proxy_url is None and static_proxy is None and swap == max_proxy_swaps - 1:
-            logger.warning("linkedin_login.falling_back_to_direct", account_id=account_id)
-
-        result = await _attempt_login(account_id, username, password, captcha_config, headless, proxy_url)
-        if result["success"]:
-            if proxy_url:
-                _persist_login_proxy(account_id, proxy_url)
+    for swap in range(max_swaps):
+        outcome, err = await _login_once(
+            account_id, username, password, static_proxy, captcha_config, headless, use_rotating
+        )
+        if outcome == "success":
             return True
+        if outcome == "fatal":
+            return False
+        # proxy_err → next iteration relaunches with a fresh goodproxy
+        logger.info("login.swapping_proxy", account_id=account_id, attempt=swap + 1, max=max_swaps)
 
-        if result["proxy_navigation_failed"] and proxy_url:
-            # The vetted proxy did not work inside Chromium. Mark dead, swap.
-            try:
-                from tools.goodproxies import GoodProxiesProvider
-                GoodProxiesProvider().mark_failed(proxy_url)
-            except Exception:
-                pass
-            logger.info("linkedin_login.swapping_proxy", account_id=account_id, attempt=swap + 1, max=max_proxy_swaps)
-            continue
-
-        # Non-proxy failure — login truly failed (bad creds, captcha unsolvable, etc.)
-        return False
-
-    logger.error("linkedin_login.all_proxy_swaps_exhausted", account_id=account_id, last_proxy=last_proxy)
+    logger.error("login.all_proxy_swaps_exhausted", account_id=account_id)
     return False
 
 async def main():
