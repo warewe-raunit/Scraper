@@ -99,7 +99,7 @@ async def log_requests(request: Request, call_next):
         )
 
 # 5. Register Routes and Routers
-from api.routes import subreddits, posts, comments, users, youtube, x
+from api.routes import subreddits, posts, comments, users, youtube, x, linkedin
 from api.dependencies import verify_api_key
 
 app.include_router(subreddits.router, prefix="/api/v1", dependencies=[Depends(verify_api_key)])
@@ -108,6 +108,22 @@ app.include_router(comments.router, prefix="/api/v1", dependencies=[Depends(veri
 app.include_router(users.router, prefix="/api/v1", dependencies=[Depends(verify_api_key)])
 app.include_router(youtube.router, prefix="/api/v1", dependencies=[Depends(verify_api_key)])
 app.include_router(x.router, prefix="/api/v1", dependencies=[Depends(verify_api_key)])
+app.include_router(linkedin.router, prefix="/api/v1", dependencies=[Depends(verify_api_key)])
+
+@app.on_event("startup")
+async def _warmup_linkedin_pool():
+    """Trigger background relogin for any LinkedIn accounts that start DEAD.
+
+    Doesn't block startup — the AccountPool dispatches asyncio tasks.
+    """
+    try:
+        from api.services.linkedin_account_pool import LinkedInAccountPool
+        pool = await LinkedInAccountPool.instance()
+        await pool.warmup()
+        logger.info("linkedin_pool_warmup_dispatched", **pool.snapshot()["counters"])
+    except Exception as e:
+        logger.warning("linkedin_pool_warmup_failed", error=str(e))
+
 
 @app.get("/", include_in_schema=False)
 def index_redirect():

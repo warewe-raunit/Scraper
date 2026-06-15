@@ -694,12 +694,73 @@ def active_profile_session_id(account_id: str) -> str:
 _PLAYWRIGHT_CHROMIUM_VERSION: Optional[str] = None
 
 
+async def _vet_rotating_proxy(gp: Any) -> Optional[str]:
+    """Pick the first goodproxy that can complete an HTTPS request to a
+    LinkedIn-class target. Tests proxies in parallel batches. Bad proxies get
+    pushed back into the cooldown pool so the next call doesn't redraw them.
+
+    Tunables (env):
+        BROWSER_PROXY_VET_TARGET   — URL to test against (default linkedin robots)
+        BROWSER_PROXY_VET_MAX      — how many proxies to try total (default 60)
+        BROWSER_PROXY_VET_BATCH    — parallel checks per round (default 12)
+        BROWSER_PROXY_VET_TIMEOUT  — per-proxy timeout seconds (default 5)
+    """
+    try:
+        from curl_cffi import requests as ccff_requests
+    except Exception:
+        return None
+
+    target = os.getenv("BROWSER_PROXY_VET_TARGET", "https://www.linkedin.com/robots.txt").strip()
+    max_total = int(os.getenv("BROWSER_PROXY_VET_MAX", "60"))
+    batch_size = int(os.getenv("BROWSER_PROXY_VET_BATCH", "12"))
+    timeout = int(os.getenv("BROWSER_PROXY_VET_TIMEOUT", "5"))
+
+    async def _check(p: str) -> Optional[str]:
+        loop = asyncio.get_running_loop()
+        try:
+            r = await loop.run_in_executor(
+                None,
+                lambda: ccff_requests.get(
+                    target,
+                    proxies={"http": p, "https": p},
+                    impersonate="chrome120",
+                    timeout=timeout,
+                ),
+            )
+            if 200 <= r.status_code < 400 and len(r.text or "") > 50:
+                return p
+        except Exception:
+            pass
+        try:
+            gp.mark_failed(p)
+        except Exception:
+            pass
+        return None
+
+    checked = 0
+    while checked < max_total:
+        batch = []
+        for _ in range(batch_size):
+            p = await gp.get_proxy()
+            if p:
+                batch.append(p)
+        if not batch:
+            return None
+        results = await asyncio.gather(*[_check(p) for p in batch])
+        checked += len(batch)
+        for r in results:
+            if r:
+                return r
+    return None
+
+
 async def launch_browser(
     account_id: str,
     proxy_url: Optional[str] = None,
     headless: bool = False,
+    use_rotating_proxy: bool = True,
 ) -> tuple[Playwright, Any, BrowserContext, Page]:
-    logger.info("browser_manager.launch_browser.start", account_id=account_id, headless=headless, proxy_url=proxy_url)
+    logger.info("browser_manager.launch_browser.start", account_id=account_id, headless=headless, proxy_url=proxy_url, use_rotating_proxy=use_rotating_proxy)
     pw = await async_playwright().start()
 
     global _PLAYWRIGHT_CHROMIUM_VERSION
@@ -713,7 +774,29 @@ async def launch_browser(
 
     profile_mgr = BrowserProfileManager()
     profile = profile_mgr.generate(account_id)
-    await _align_profile_to_proxy_geo(profile, proxy_url)
+
+    # Resolve Proxy (support global rotating proxy override).
+    #
+    # For rotating proxies, vet candidates concurrently with curl_cffi against
+    # a cheap HTTPS endpoint before handing off to Chromium. Public goodproxies
+    # have ~3% hit rate and Chromium's proxy stack is stricter than curl_cffi,
+    # so picking one blind triggers ERR_CONNECTION_RESET / ERR_TUNNEL on most
+    # launches. Pre-vetting keeps the same Reddit-style "rotating pool" flow
+    # but avoids the lottery.
+    from tools.goodproxies import GoodProxiesProvider
+    gp = GoodProxiesProvider()
+    resolved_proxy = proxy_url
+    if resolved_proxy == "direct":
+        resolved_proxy = None
+    elif use_rotating_proxy and gp.enabled and gp.api_key:
+        resolved_proxy = await _vet_rotating_proxy(gp)
+        if resolved_proxy:
+            logger.info("browser_manager.launch_browser.using_rotating_proxy", proxy=resolved_proxy[:30] + "...")
+        else:
+            logger.warning("browser_manager.launch_browser.no_working_proxy")
+            resolved_proxy = None
+
+    await _align_profile_to_proxy_geo(profile, resolved_proxy)
 
     if _PLAYWRIGHT_CHROMIUM_VERSION:
         profile["chrome_full_version"] = _PLAYWRIGHT_CHROMIUM_VERSION
@@ -737,7 +820,7 @@ async def launch_browser(
             f"--window-size={screen['width']},{screen['height']}",
         ],
     }
-    proxy_config = playwright_proxy_config(proxy_url)
+    proxy_config = playwright_proxy_config(resolved_proxy)
     if proxy_config:
         launch_args["proxy"] = proxy_config
 
@@ -883,6 +966,12 @@ async def launch_browser(
     )
 
     logger.info("browser_manager.launch_browser.complete", account_id=account_id, session_id=session_id)
+    # Stash resolved proxy on the context so callers can detect which goodproxy
+    # was actually used (needed to mark_failed on navigation errors).
+    try:
+        setattr(context, "_resolved_proxy", resolved_proxy)
+    except Exception:
+        pass
     return pw, browser, context, page
 
 
@@ -908,10 +997,12 @@ async def close_browser(pw: Playwright, browser: Any) -> None:
 class LazyBrowser:
     """Browser that launches only on first tool call, stays open for the session."""
 
-    def __init__(self, account_id: str, proxy_url: Optional[str] = None, headless: bool = False):
+    def __init__(self, account_id: str, proxy_url: Optional[str] = None, headless: bool = False, use_rotating_proxy: bool = True):
         self.account_id = account_id
         self.proxy_url = proxy_url
         self.headless = headless
+        self.use_rotating_proxy = use_rotating_proxy
+        self.last_used_proxy: Optional[str] = None
         self._pw: Optional[Playwright] = None
         self._browser: Optional[Any] = None
         self._context: Optional[BrowserContext] = None
@@ -950,8 +1041,12 @@ class LazyBrowser:
 
             if self._page is None:
                 self._pw, self._browser, self._context, self._page = await launch_browser(
-                    self.account_id, self.proxy_url, self.headless
+                    self.account_id, self.proxy_url, self.headless, self.use_rotating_proxy
                 )
+                try:
+                    self.last_used_proxy = getattr(self._context, "_resolved_proxy", None)
+                except Exception:
+                    self.last_used_proxy = None
             return self._page
 
     async def get_context(self) -> BrowserContext:

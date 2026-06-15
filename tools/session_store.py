@@ -24,6 +24,19 @@ def session_exists(account_id: str) -> bool:
 
 def save_session(account_id: str, storage_state: dict) -> None:
     path = _session_path(account_id)
+    # Preserve underscore-prefixed metadata keys (e.g. _login_proxy,
+    # _login_proxies) pinned into the file by the login/scrape layers.
+    # Playwright's storage_state knows nothing about them, so a plain
+    # overwrite would silently drop them on every browser close.
+    try:
+        if path.exists():
+            with open(path) as f:
+                old = json.load(f)
+            for k, v in old.items():
+                if isinstance(k, str) and k.startswith("_") and k not in storage_state:
+                    storage_state[k] = v
+    except Exception:
+        pass
     with open(path, "w") as f:
         json.dump(storage_state, f)
 
