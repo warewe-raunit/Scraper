@@ -114,3 +114,4 @@ venv.bak/
 sessions/
 logs/
 *.jsonl
+linkedin_voyager_jobs_sample.json
