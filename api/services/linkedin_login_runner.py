@@ -44,6 +44,7 @@ _RETRYABLE_LOGIN_MARKERS = (
     "Login not confirmed",
     "/zh-cn/", "/checkpoint/pk/", "451 ",
     "Username or password fields not found",
+    "Password field not found",
 )
 
 
@@ -94,6 +95,12 @@ async def _login_once(account_id, username, password, proxy_url, captcha_config,
 
     lazy_browser = LazyBrowser(account_id=account_id, proxy_url=proxy_url,
                                 headless=headless, use_rotating_proxy=use_rotating)
+
+    def _used_proxy() -> Optional[str]:
+        # The proxy the session was actually established through — this is the
+        # IP class LinkedIn binds li_at to, so it MUST be pinned on success.
+        return lazy_browser.last_used_proxy if use_rotating else proxy_url
+
     try:
         try:
             page = await lazy_browser.get_page()
@@ -102,12 +109,12 @@ async def _login_once(account_id, username, password, proxy_url, captcha_config,
             err = str(e)
             if _is_proxy_err(err):
                 _mark_proxy_failed(lazy_browser.last_used_proxy)
-                return "proxy_err", err[:200]
-            return "fatal", err[:200]
+                return "proxy_err", err[:200], None
+            return "fatal", err[:200], None
 
         if state.get("logged_in"):
             logger.info("account_already_logged_in", account_id=account_id, reason=state.get("reason"))
-            return "success", ""
+            return "success", "", _used_proxy()
 
         # FAST PATH: saved-session identity cookies still recognize the user,
         # so LinkedIn jumped straight to /checkpoint/ asking only for the email
@@ -134,7 +141,7 @@ async def _login_once(account_id, username, password, proxy_url, captcha_config,
                 state_after = await linkedin_login_state(page, expected_username=username, navigate=False)
                 if state_after.get("logged_in"):
                     logger.info("login_completed_via_otp_fast_path", account_id=account_id)
-                    return "success", ""
+                    return "success", "", _used_proxy()
                 logger.warning("login.fast_path_otp_did_not_unblock", account_id=account_id)
             # Fast path didn't work — fall through to the full credentials flow.
 
@@ -143,22 +150,22 @@ async def _login_once(account_id, username, password, proxy_url, captcha_config,
                                   password=password, captcha_config=captcha_config)
         if result.get("success"):
             logger.info("login_completed_successfully", account_id=account_id)
-            return "success", ""
+            return "success", "", _used_proxy()
 
         err = result.get("error") or ""
         if "[OTP_CHALLENGE_HANDLED]" in err:
             logger.error("login_failed.otp_challenge", account_id=account_id, error=err[:300])
-            return "fatal", err[:300]
+            return "fatal", err[:300], None
         if _is_proxy_err(err):
             _mark_proxy_failed(lazy_browser.last_used_proxy)
             logger.warning("login.proxy_navigation_failed", error=err[:140])
-            return "proxy_err", err[:200]
+            return "proxy_err", err[:200], None
         if _is_retryable_login_err(err):
             _mark_proxy_failed(lazy_browser.last_used_proxy)
             logger.warning("login.region_or_challenge_block_swapping_proxy", error=err[:140])
-            return "proxy_err", err[:200]
+            return "proxy_err", err[:200], None
         logger.error("login_failed", account_id=account_id, error=err[:200])
-        return "fatal", err[:200]
+        return "fatal", err[:200], None
     finally:
         try:
             await lazy_browser.close()
@@ -185,12 +192,19 @@ async def login_account_with_retries(
     )
 
     for swap in range(swaps):
-        outcome, err = await _login_once(
+        outcome, err, used_proxy = await _login_once(
             account_id, username, password, static_proxy, captcha_config, headless, use_rotating
         )
         if outcome == "success":
-            if static_proxy:
-                persist_login_proxy_into_session(account_id, static_proxy)
+            # Pin whatever proxy the login actually went through — for rotating
+            # goodproxies this is the vetted proxy LazyBrowser picked, which is
+            # the IP class li_at is now bound to. Without this pin, scraping has
+            # no anchor and every Voyager call is a bare-400 lottery.
+            pin = used_proxy or static_proxy
+            if pin:
+                persist_login_proxy_into_session(account_id, pin)
+            else:
+                logger.warning("login.no_proxy_to_pin", account_id=account_id)
             return True
         if outcome == "fatal":
             return False

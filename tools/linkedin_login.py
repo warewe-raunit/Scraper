@@ -6,10 +6,8 @@ from __future__ import annotations
 
 import asyncio
 import os
-import random
 import re
-import time
-from typing import Optional
+from typing import Any, Optional
 
 import structlog
 from playwright.async_api import Page
@@ -489,8 +487,11 @@ async def login(
                     break
             else:
                 user_el = await _find_login_field(page, "username", user_sels)
-                pass_el = await _find_login_field(page, "password", pass_sels) if user_el else None
-                if user_el and pass_el:
+                pass_el = await _find_login_field(page, "password", pass_sels)
+                # Full form (email+password) OR the "Welcome back" remembered-
+                # account page which shows ONLY a password field (the email is a
+                # pre-filled profile chip). Either is enough to proceed.
+                if pass_el and (user_el or True):
                     break
 
         if login_method == "google":
@@ -608,18 +609,25 @@ async def login(
             await _delay(account_id, 3.0, 5.0)
 
         else:
-            if not user_el or not pass_el:
-                raise RuntimeError("Username or password fields not found on LinkedIn login page.")
+            if not pass_el:
+                raise RuntimeError("Password field not found on LinkedIn login page.")
 
-            user_el = await _resolve_editable_element(page, user_el)
             pass_el = await _resolve_editable_element(page, pass_el)
 
-            await _ghost_move_and_click(page, user_el)
-            await _delay(account_id, 0.2, 0.6)
-            await user_el.fill("")
-            await _human_type(page, user_el, username, account_id)
+            # Full login form: type the email first. On the "Welcome back"
+            # remembered-account page there is no email field (the account is the
+            # pre-filled profile chip) — skip straight to the password. The session
+            # was loaded for THIS account, so the remembered identity is correct.
+            if user_el:
+                user_el = await _resolve_editable_element(page, user_el)
+                await _ghost_move_and_click(page, user_el)
+                await _delay(account_id, 0.2, 0.6)
+                await user_el.fill("")
+                await _human_type(page, user_el, username, account_id)
+                await _delay(account_id, 0.2, 0.7)
+            else:
+                log.info("linkedin.login.welcome_back_password_only", account_id=account_id)
 
-            await _delay(account_id, 0.2, 0.7)
             await _ghost_move_and_click(page, pass_el)
             await _delay(account_id, 0.2, 0.6)
             await pass_el.fill("")
@@ -647,6 +655,29 @@ async def login(
                     is_logged_in = await _is_logged_in(page, username)
             except Exception as exc:
                 log.warning("linkedin.login.otp_challenge_handler_failed", error=str(exc)[:200])
+
+        # Manual challenge fallback: some accounts get a CAPTCHA / "verify it's
+        # you" / device check instead of an email PIN — the auto-OTP can't solve
+        # those. When LINKEDIN_MANUAL_CHALLENGE_WAIT_SECONDS > 0 (headful use),
+        # pause on the checkpoint so a human can solve it in the visible browser,
+        # polling until login confirms or the window expires.
+        manual_wait = int(os.getenv("LINKEDIN_MANUAL_CHALLENGE_WAIT_SECONDS", "0"))
+        if not is_logged_in and manual_wait > 0 and "/checkpoint/" in (page.url or "").lower():
+            log.warning("linkedin.login.manual_challenge_wait", account_id=account_id,
+                        seconds=manual_wait,
+                        msg="Solve the verification in the browser window now.")
+            waited = 0
+            while waited < manual_wait:
+                await asyncio.sleep(5)
+                waited += 5
+                try:
+                    if await _is_logged_in(page, username):
+                        is_logged_in = True
+                        log.info("linkedin.login.manual_challenge_solved",
+                                 account_id=account_id, waited_s=waited)
+                        break
+                except Exception:
+                    pass
 
         if not is_logged_in:
             error_text = await _extract_login_error(page)

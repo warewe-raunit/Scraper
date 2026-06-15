@@ -27,9 +27,9 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional
 
 import structlog
 
@@ -55,6 +55,7 @@ class AccountState:
     status: str = ALIVE
     in_use: bool = False
     consecutive_302: int = 0
+    consecutive_proxy_exhaust: int = 0
     consecutive_relogin_failures: int = 0
     last_success_at: float = 0.0
     last_failure_at: float = 0.0
@@ -69,6 +70,7 @@ class AccountState:
             "status": self.status,
             "in_use": self.in_use,
             "consecutive_302": self.consecutive_302,
+            "consecutive_proxy_exhaust": self.consecutive_proxy_exhaust,
             "consecutive_relogin_failures": self.consecutive_relogin_failures,
             "last_success_at": self.last_success_at,
             "last_failure_at": self.last_failure_at,
@@ -107,6 +109,8 @@ class LinkedInAccountPool:
 
         # Tunables
         self.session_death_threshold = int(os.getenv("LINKEDIN_SESSION_DEATH_AFTER_302", "2"))
+        self.proxy_exhaust_relogin_threshold = int(
+            os.getenv("LINKEDIN_RELOGIN_AFTER_PROXY_EXHAUST", "2"))
         self.disable_after_failures = int(os.getenv("LINKEDIN_DISABLE_AFTER_RELOGIN_FAILURES", "3"))
         self.disable_backoff_seconds = int(os.getenv("LINKEDIN_DISABLE_BACKOFF_SECONDS", "900"))
         self.acquire_wait_seconds = float(os.getenv("LINKEDIN_ACQUIRE_WAIT_SECONDS", "20"))
@@ -141,12 +145,15 @@ class LinkedInAccountPool:
                 raise NoAccountAvailable("No LinkedIn accounts available within wait window.")
             await asyncio.sleep(0.25)
 
-    async def release(self, account_id: str, *, success: bool, session_redirected: bool) -> None:
+    async def release(self, account_id: str, *, success: bool, session_redirected: bool,
+                      proxies_exhausted: bool = False) -> None:
         """Return an account after a request.
 
         success: did the Voyager call return 200?
         session_redirected: did we get a 302 even after cookie merge?
             (signals that this account's session is dying/dead)
+        proxies_exhausted: did every proxy this account could reach fail/reject?
+            (signals its pinned proxy is dead — a relogin repins a fresh one)
         """
         relogin_needed = False
         async with self._lock:
@@ -161,6 +168,7 @@ class LinkedInAccountPool:
                 acc.total_successes += 1
                 acc.last_success_at = now
                 acc.consecutive_302 = 0
+                acc.consecutive_proxy_exhaust = 0
                 # Successful call → restore to ALIVE no matter what state
                 if acc.status not in (DISABLED, RELOGGING):
                     acc.status = ALIVE
@@ -176,6 +184,17 @@ class LinkedInAccountPool:
                 else:
                     if acc.status == ALIVE:
                         acc.status = DYING
+            elif proxies_exhausted:
+                # Session is probably fine — the account's pinned proxy just died.
+                # A relogin repins a fresh working _login_proxy. Mark DYING (still
+                # serves as a fallback) and schedule a repin after a couple of
+                # consecutive exhaustions so a one-off network blip doesn't relogin.
+                acc.consecutive_proxy_exhaust += 1
+                if acc.status == ALIVE:
+                    acc.status = DYING
+                if (acc.consecutive_proxy_exhaust >= self.proxy_exhaust_relogin_threshold
+                        and acc.status not in (RELOGGING, DISABLED)):
+                    relogin_needed = True
         if relogin_needed:
             self._schedule_relogin(account_id)
 
@@ -205,23 +224,27 @@ class LinkedInAccountPool:
     # --------------------------------------------------------- selection logic
 
     def _pick_next_alive_locked(self) -> Optional[AccountState]:
-        """Round-robin pick over ALIVE or DYING accounts not currently in use.
+        """Round-robin pick, preferring ALIVE over DYING accounts.
 
-        DYING still serves (one more chance after cookie merge) — only DEAD/
-        RELOGGING/DISABLED are excluded.
+        DYING still serves (one more chance after cookie merge / dead proxy) but
+        only as a fallback — a healthy ALIVE account is always tried first so a
+        request isn't slowed by an account we already know is degraded. Only
+        DEAD/RELOGGING/DISABLED are fully excluded.
         """
         ids = list(self._accounts.keys())
         if not ids:
             return None
         n = len(ids)
-        for i in range(n):
-            idx = (self._index + i) % n
-            acc = self._accounts[ids[idx]]
-            if acc.in_use:
-                continue
-            if acc.status in (ALIVE, DYING):
-                self._index = (idx + 1) % n
-                return acc
+        # Pass 1: ALIVE only. Pass 2: accept DYING as a fallback.
+        for statuses in ((ALIVE,), (ALIVE, DYING)):
+            for i in range(n):
+                idx = (self._index + i) % n
+                acc = self._accounts[ids[idx]]
+                if acc.in_use:
+                    continue
+                if acc.status in statuses:
+                    self._index = (idx + 1) % n
+                    return acc
         return None
 
     def _reactivate_disabled_locked(self) -> None:
@@ -232,13 +255,19 @@ class LinkedInAccountPool:
                 acc.disabled_until = 0.0
                 acc.consecutive_relogin_failures = 0
                 logger.info("account_pool.disabled_window_expired", account_id=acc.account_id)
-                # Re-queue relogin — but only if not already running
-                if acc.account_id not in self._relogin_tasks:
-                    asyncio.create_task(self._run_relogin_once(acc.account_id))
+                # Re-queue via _schedule_relogin so the LINKEDIN_AUTO_RELOGIN
+                # gate + dedup apply here too (was bypassing both).
+                self._schedule_relogin(acc.account_id)
 
     # ------------------------------------------------- background relogin
 
     def _schedule_relogin(self, account_id: str) -> None:
+        # Master switch for "saved sessions only" mode: when off, the pool never
+        # launches a browser to re-login — dead accounts just stay DEAD until a
+        # manual login. Default on (self-healing).
+        if os.getenv("LINKEDIN_AUTO_RELOGIN", "true").lower() not in ("1", "true", "yes", "on"):
+            logger.info("account_pool.relogin_skipped_disabled", account_id=account_id)
+            return
         if account_id in self._relogin_tasks and not self._relogin_tasks[account_id].done():
             return
         task = asyncio.create_task(self._run_relogin_once(account_id))
@@ -355,6 +384,7 @@ class LinkedInAccountPool:
         """Trigger reloginss for all accounts that start DEAD.
 
         Called at process startup; doesn't block — workers run in background.
+        No-op when auto-relogin is disabled (LINKEDIN_AUTO_RELOGIN=false).
         """
         for acc_id, acc in self._accounts.items():
             if acc.status == DEAD:

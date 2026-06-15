@@ -207,7 +207,7 @@ async def search_linkedin_jobs(
     job_type: Optional[List[JobType]] = Query(None, description="Filter by job types (full-time, contract, internship, etc.)"),
     experience_level: Optional[List[ExperienceLevel]] = Query(None, description="Filter by experience levels"),
     date_posted: Optional[DatePostedRange] = Query(None, description="Filter by when the job was posted"),
-    limit: int = Query(25, ge=1, le=100, description="Max job postings to retrieve"),
+    limit: int = Query(25, ge=1, le=1000, description="Max job postings to retrieve (paginated)"),
     format: ResponseFormat = Query(ResponseFormat.JSON, description="Output format"),
     account_id: Optional[str] = Query(None, description="Optional specific LinkedIn account ID to use"),
     scraper: LinkedInScraperService = Depends(get_linkedin_scraper_service)
@@ -262,12 +262,13 @@ async def force_relogin(account_id: str):
 async def search_linkedin_blended(
     q: str = Query(..., description="Search query string"),
     category: SearchCategory = Query(SearchCategory.ALL, description="Search category filter (people, jobs, companies, posts, groups)"),
+    limit: int = Query(25, ge=1, le=1000, description="Max results to retrieve (paginated; not used for category=all)"),
     format: ResponseFormat = Query(ResponseFormat.JSON, description="Output format"),
     account_id: Optional[str] = Query(None, description="Optional specific LinkedIn account ID to use"),
     scraper: LinkedInScraperService = Depends(get_linkedin_scraper_service)
 ):
     try:
-        result = await scraper.search_blended(query=q, category=category, account_id=account_id)
+        result = await scraper.search_blended(query=q, category=category, limit=limit, account_id=account_id)
         return format_response("search", q, result, format)
     except Exception as e:
         logger.error("linkedin_blended_search_failed", q=q, error=str(e))

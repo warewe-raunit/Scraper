@@ -27,6 +27,66 @@ if str(ROOT) not in sys.path:
 logger = structlog.get_logger(__name__)
 SESSIONS_DIR = ROOT / "sessions"
 
+# Per-account "recently worked" proxy cache: account_id -> {proxy_url: last_success_ts}.
+# LinkedIn binds li_at to an IP class; once a proxy returns 200 for an account it
+# is the strongest candidate for the next request — stronger than anything the
+# rotating pool can offer. In-memory (fast path); also persisted to the session
+# JSON as _known_good_proxies so restarts keep the knowledge.
+_RECENT_GOOD_PROXIES: Dict[str, Dict[str, float]] = {}
+_STICKY_PROXY_TTL = int(os.getenv("LINKEDIN_STICKY_PROXY_TTL", "300"))
+
+
+def _proxy_host(proxy_url: Optional[str]) -> Optional[str]:
+    """Extract the host/IP from a proxy URL like http://1.2.3.4:8080."""
+    if not proxy_url:
+        return None
+    m = re.search(r"://([^:/@]+)", proxy_url)
+    return m.group(1) if m else None
+
+
+def _subnet_distance(proxy_url: str, anchor_ip: Optional[str]) -> int:
+    """0 = same /24 as anchor, 1 = same /16, 2 = unrelated. Lower sorts first.
+
+    LinkedIn's IP binding is class-based — a proxy in the login proxy's subnet
+    is far more likely to be accepted than a random residential IP.
+    """
+    if not anchor_ip:
+        return 2
+    ip = _proxy_host(proxy_url)
+    if not ip:
+        return 2
+    a, b = ip.split("."), anchor_ip.split(".")
+    if len(a) != 4 or len(b) != 4:
+        return 2
+    if a[:3] == b[:3]:
+        return 0
+    if a[:2] == b[:2]:
+        return 1
+    return 2
+
+
+def _is_bare_400(status: Optional[int], resp: Any) -> bool:
+    """LinkedIn's IP-binding rejection: HTTP 400 with a bare {"status":400}
+    body (or empty body). A genuine bad-request 400 carries an error payload
+    with details/message. Bare 400 means "this IP isn't yours" — the request
+    itself is fine and will succeed from an accepted IP.
+    """
+    if status != 400 or resp is None:
+        return False
+    try:
+        body = (resp.text or "").strip()
+    except Exception:
+        return False
+    if not body:
+        return True
+    if len(body) > 200:
+        return False
+    try:
+        j = json.loads(body)
+    except Exception:
+        return False
+    return isinstance(j, dict) and set(j) <= {"status", "code", "message"} and not j.get("message")
+
 class LinkedInScraperService:
     def __init__(self, db: Optional[Any] = None):
         self.db = db
@@ -121,6 +181,34 @@ class LinkedInScraperService:
         if not cookie_parts:
             return None, None, state
         return "; ".join(cookie_parts), csrf, state
+
+    def _record_good_proxy(self, target_account_id: str, proxy_url: Optional[str],
+                           login_proxy: Optional[str]) -> None:
+        """Remember a proxy that just returned 200 for this account.
+
+        In-memory sticky cache (next request tries it right after the login
+        proxy) + persisted _known_good_proxies in the session JSON (survives
+        restarts, capped at 5, most recent first).
+        """
+        if not proxy_url:
+            return
+        _RECENT_GOOD_PROXIES.setdefault(target_account_id, {})[proxy_url] = time.time()
+        if proxy_url == login_proxy:
+            return
+        session_file = self._resolve_session_file(target_account_id)
+        if not session_file:
+            return
+        try:
+            state = json.loads(session_file.read_text(encoding="utf-8"))
+            goods = [p for p in state.get("_known_good_proxies", []) if p != proxy_url]
+            goods.insert(0, proxy_url)
+            state["_known_good_proxies"] = goods[:5]
+            session_file.write_text(json.dumps(state, indent=2), encoding="utf-8")
+            logger.info("voyager_fetch.known_good_proxy_saved",
+                        account_id=target_account_id, proxy=proxy_url[:30] + "...",
+                        total=len(state["_known_good_proxies"]))
+        except Exception as e:
+            logger.warning("voyager_fetch.known_good_save_failed", error=str(e)[:120])
 
     def _merge_set_cookies_into_session(self, target_account_id: str, resp: Any) -> int:
         """Parse Set-Cookie headers from a 302 response and merge them into the
@@ -310,51 +398,70 @@ class LinkedInScraperService:
 
         max_account_swaps = int(os.getenv("LINKEDIN_REQUEST_ACCOUNT_SWAPS", "5"))
         last_result: Optional[dict] = None
+        tried_accounts: set = set()
 
         for swap in range(max_account_swaps):
             try:
                 acc = await pool.acquire()
             except NoAccountAvailable:
                 logger.error("voyager_get.no_account_available")
-                return None
+                return last_result
+
+            # Pool round-robin can hand back an account we already failed on this
+            # request (e.g. only 1 ALIVE left). That means we've cycled through
+            # every available account — stop rather than spin on a repeat.
+            if acc.account_id in tried_accounts:
+                await pool.release(acc.account_id, success=False,
+                                   session_redirected=False, proxies_exhausted=False)
+                break
+            tried_accounts.add(acc.account_id)
 
             session_redirected = False
+            proxies_exhausted = False
             success = False
             try:
                 logger.info("voyager_get.account_acquired",
                             account_id=acc.account_id, swap=swap + 1, status=acc.status)
-                result, session_redirected = await self._voyager_get_for_account_with_signal(
-                    api_path, acc.account_id
-                )
+                result, session_redirected, proxies_exhausted = \
+                    await self._voyager_get_for_account_with_signal(api_path, acc.account_id)
                 if result is not None:
                     success = True
                     last_result = result
             finally:
                 await pool.release(acc.account_id,
                                     success=success,
-                                    session_redirected=session_redirected)
+                                    session_redirected=session_redirected,
+                                    proxies_exhausted=proxies_exhausted)
 
             if success:
                 return last_result
 
-            # Swap to next account if session redirect — otherwise the failure is
-            # something we won't fix by changing accounts (network/proxy issues).
-            if not session_redirected:
-                return None
+            # Swap to another account when THIS account can't serve right now —
+            # either its session is dying (302) or every proxy it could reach is
+            # dead/IP-rejected (exhausted). A different account has a different
+            # pinned proxy + fresh cookies, so it may well succeed. Only a hard
+            # non-swappable failure (missing cookies, genuine bad query) stops us.
+            if not (session_redirected or proxies_exhausted):
+                return last_result
+
+            logger.info("voyager_get.swapping_account",
+                        from_account=acc.account_id, swap=swap + 1,
+                        session_redirected=session_redirected,
+                        proxies_exhausted=proxies_exhausted)
 
         logger.warning("voyager_get.exhausted_account_swaps",
-                       attempts=max_account_swaps)
+                       attempts=len(tried_accounts))
         return last_result
 
     async def _voyager_get_for_account_with_signal(
         self, api_path: str, target_account_id: str
-    ) -> tuple[Optional[dict], bool]:
-        """Run the request, return (json_or_none, session_redirected_flag)."""
+    ) -> tuple[Optional[dict], bool, bool]:
+        """Run the request, return (json_or_none, session_redirected, proxies_exhausted)."""
         try:
             return await self._voyager_get_for_account(api_path, target_account_id, return_signal=True)
         except Exception as e:
             logger.error("voyager_get_for_account.exception", error=str(e)[:200])
-            return None, False
+            return None, False, False
 
     async def _voyager_get_for_account(
         self,
@@ -374,7 +481,7 @@ class LinkedInScraperService:
         # Verify session file exists for this account
         if not self._resolve_session_file(target_account_id):
             if return_signal:
-                return None, False
+                return None, False, False
             return None
 
         # Resolve proxy (rotating proxy pool or static proxy from .env)
@@ -392,12 +499,16 @@ class LinkedInScraperService:
         # LinkedIn binds li_at to the login IP; using the same proxy here keeps the
         # IP class stable so the session validates.
         login_proxy = None
+        known_good_persisted: List[str] = []
         try:
             sf = self._resolve_session_file(target_account_id)
             if sf:
                 with open(sf, "r", encoding="utf-8") as f:
                     st = json.load(f)
                 login_proxy = st.get("_login_proxy")
+                kg = st.get("_known_good_proxies")
+                if isinstance(kg, list):
+                    known_good_persisted = [p for p in kg if isinstance(p, str)]
         except Exception:
             pass
 
@@ -413,7 +524,6 @@ class LinkedInScraperService:
             except Exception:
                 pass
 
-        max_proxy_attempts = int(os.getenv("LINKEDIN_PROXY_MAX_ATTEMPTS", "40"))
         proxy_timeout = int(os.getenv("LINKEDIN_PROXY_TIMEOUT", "8"))
         # Give the pinned login proxy a longer timeout — if it's slow but alive,
         # we want to use it instead of rotating to random pool proxies.
@@ -468,107 +578,266 @@ class LinkedInScraperService:
                     return p
             return static_proxy
 
-        async def _attempt_with_proxy_rotation(
+        # --- Smart rotation -------------------------------------------------
+        # Order of trust: pinned/login proxy → recently-good (in-memory) →
+        # persisted known-good → freshly vetted pool proxies, closest subnet
+        # first. Pool proxies are probed in PARALLEL batches against robots.txt
+        # before the real request — only ~5% of any goodproxies batch is alive,
+        # and probing 15 at once for 4s beats trying them serially for 8s each.
+        probe_timeout = int(os.getenv("LINKEDIN_PROXY_PROBE_TIMEOUT", "4"))
+        vet_batch_size = int(os.getenv("LINKEDIN_PROXY_VET_BATCH", "15"))
+        vet_max = int(os.getenv("LINKEDIN_PROXY_VET_MAX", "45"))
+        # Per-account budget. Kept short on purpose: for an IP-bound session,
+        # random pool proxies mostly bare-400 anyway, so grinding the pool is
+        # low-yield. Failing fast lets _voyager_get swap to another account whose
+        # pinned proxy is alive — a far better bet than the pool lottery.
+        fetch_budget = float(os.getenv("LINKEDIN_FETCH_BUDGET_SECONDS", "12"))
+        storm_threshold = int(os.getenv("LINKEDIN_BARE400_STORM_THRESHOLD", "3"))
+
+        async def _probe_ok(p: str) -> bool:
+            from curl_cffi import requests as cr
+            loop = asyncio.get_running_loop()
+            try:
+                r = await loop.run_in_executor(
+                    None,
+                    lambda: cr.get(
+                        "https://www.linkedin.com/robots.txt",
+                        proxies={"http": p, "https": p},
+                        impersonate="chrome120",
+                        timeout=probe_timeout,
+                    ),
+                )
+                return 200 <= r.status_code < 400
+            except Exception:
+                return False
+
+        async def _smart_rotation(
             preferred_proxy: Optional[str] = None,
-        ) -> tuple[Optional[int], Optional[Any], Optional[str]]:
-            """Try fetching across rotating proxies. Cools-down dead proxies.
+        ) -> tuple[Optional[int], Optional[Any], Optional[str], bool]:
+            """Returns (status, response, proxy_used, bare400_storm).
 
-            If preferred_proxy is given, try it FIRST — used to pin a known-good
-            proxy from a prior attempt (so we don't re-roll dice on retry).
-
-            Returns (status, response, last_proxy_used).
+            A bare {"status":400} response from a healthy proxy is LinkedIn's
+            IP-binding rejection — we rotate to the next candidate instead of
+            aborting. storm_threshold distinct rejections means the session no
+            longer accepts ANY reachable IP → caller should trigger relogin
+            (which repins a fresh _login_proxy).
             """
-            last_status: Optional[int] = None
-            last_resp: Optional[Any] = None
-            last_proxy: Optional[str] = None
-            for i in range(max_proxy_attempts):
-                if i == 0 and preferred_proxy:
-                    proxy_url = preferred_proxy
-                else:
-                    proxy_url = await _pick_proxy()
-                last_proxy = proxy_url
-                logger.info("voyager_fetch.attempt", attempt=i + 1, account_id=target_account_id,
-                            proxy=(proxy_url[:30] + "...") if proxy_url else None,
-                            pinned=(i == 0 and preferred_proxy is not None))
+            started = time.monotonic()
+            tried: set = set()
+            bare_400_seen = 0
+            last: tuple = (None, None, None)
+            login_ip = _proxy_host(login_proxy)
+            attempt_no = 0
+
+            async def _try(p: Optional[str]):
+                nonlocal bare_400_seen, last, attempt_no
+                attempt_no += 1
+                logger.info("voyager_fetch.attempt", attempt=attempt_no,
+                            account_id=target_account_id,
+                            proxy=(p[:30] + "...") if p else None,
+                            pinned=(p == preferred_proxy or p == login_proxy))
                 try:
-                    status, resp = await _attempt(proxy_url)
+                    status, resp = await _attempt(p)
                 except FileNotFoundError:
                     raise
                 except Exception as e:
-                    err = str(e)[:120]
-                    logger.warning("voyager_fetch.proxy_connection_failed", attempt=i + 1, proxy=proxy_url, error=err)
-                    # Only cool down on connection failures — NOT on server responses.
-                    # A proxy that returned 302 worked perfectly; cooling it down
-                    # drains the pool of working proxies.
-                    if proxy_url and gp.enabled and gp.api_key:
-                        gp.mark_failed(proxy_url)
-                    if not (gp.enabled and gp.api_key):
-                        return None, None, proxy_url
-                    continue
-                last_status, last_resp = status, resp
-                # Network round-trip succeeded → proxy is healthy.
-                # Explicitly clear any leftover cooldown so it stays in rotation.
-                if proxy_url and gp.enabled and gp.pool is not None:
+                    logger.warning("voyager_fetch.proxy_connection_failed",
+                                   attempt=attempt_no, proxy=p, error=str(e)[:120])
+                    # Only cool down on connection failures — NOT on server
+                    # responses. Never cool down the login proxy: it may be
+                    # briefly flaky and is irreplaceable without a relogin.
+                    if p and p != login_proxy and gp.enabled and gp.api_key:
+                        gp.mark_failed(p)
+                    _RECENT_GOOD_PROXIES.get(target_account_id, {}).pop(p, None)
+                    return None
+                if status is None:
+                    # Missing cookies/csrf — no proxy will fix this.
+                    last = (None, None, p)
+                    return (None, None, p, False)
+                last = (status, resp, p)
+                # Network round-trip succeeded → proxy is healthy; keep it in rotation.
+                if p and gp.enabled and gp.pool is not None:
                     try:
-                        gp.pool.clear(proxy_url)
+                        gp.pool.clear(p)
                     except Exception:
                         pass
-                return status, resp, proxy_url
-            return last_status, last_resp, last_proxy
+                if _is_bare_400(status, resp):
+                    bare_400_seen += 1
+                    logger.warning("voyager_fetch.bare_400_ip_reject",
+                                   account_id=target_account_id, proxy=p,
+                                   rejections=bare_400_seen)
+                    if bare_400_seen >= storm_threshold:
+                        return (status, resp, p, True)
+                    return None  # rotate to next candidate
+                return (status, resp, p, False)
 
-        status, resp, proxy_url = await _attempt_with_proxy_rotation(preferred_proxy=login_proxy)
-        if status is None and resp is None:
-            logger.error("voyager_fetch.all_proxies_exhausted", account_id=target_account_id, attempts=max_proxy_attempts)
+            # Phase 1: trusted candidates — no probe needed, try directly.
+            now = time.time()
+            recent = _RECENT_GOOD_PROXIES.get(target_account_id, {})
+            direct: List[str] = []
+            for c in (preferred_proxy, login_proxy):
+                if c and c not in direct:
+                    direct.append(c)
+            for p, ts in sorted(recent.items(), key=lambda kv: -kv[1]):
+                if now - ts <= _STICKY_PROXY_TTL and p not in direct:
+                    direct.append(p)
+            for p in known_good_persisted:
+                if p not in direct:
+                    direct.append(p)
+
+            for p in direct:
+                if time.monotonic() - started > fetch_budget:
+                    break
+                if p in tried:
+                    continue
+                tried.add(p)
+                outcome = await _try(p)
+                if outcome is not None:
+                    return outcome
+
+            # No rotating pool configured → static proxy or direct connection.
+            if not (gp.enabled and gp.api_key):
+                fallback = static_proxy  # None → direct connection
+                if fallback not in tried:
+                    tried.add(fallback)
+                    outcome = await _try(fallback)
+                    if outcome is not None:
+                        return outcome
+                return last[0], last[1], last[2], bare_400_seen >= storm_threshold
+
+            # Phase 2: vet pool proxies in parallel batches, send the real
+            # request only through ones that just proved they reach LinkedIn.
+            probed = 0
+            while probed < vet_max and time.monotonic() - started < fetch_budget:
+                batch: List[str] = []
+                draws = 0
+                while len(batch) < vet_batch_size and draws < vet_batch_size * 3:
+                    draws += 1
+                    p = await _pick_proxy()
+                    if not p:
+                        break
+                    if p in tried or p in batch:
+                        continue
+                    batch.append(p)
+                if not batch:
+                    break
+                probed += len(batch)
+                results = await asyncio.gather(*[_probe_ok(p) for p in batch])
+                healthy = [p for p, ok in zip(batch, results) if ok]
+                for p, ok in zip(batch, results):
+                    if not ok:
+                        tried.add(p)
+                        gp.mark_failed(p)
+                # LinkedIn's IP binding is class-based — same-subnet proxies first.
+                healthy.sort(key=lambda p: _subnet_distance(p, login_ip))
+                logger.info("voyager_fetch.vet_batch", account_id=target_account_id,
+                            probed=len(batch), healthy=len(healthy), total_probed=probed)
+                for p in healthy:
+                    if p in tried:
+                        continue
+                    if time.monotonic() - started > fetch_budget:
+                        break
+                    tried.add(p)
+                    outcome = await _try(p)
+                    if outcome is not None:
+                        return outcome
+            # Exhausted. Any non-bare-400 server response would have returned
+            # above, so reaching here with bare-400s seen means EVERY proxy that
+            # reached LinkedIn was rejected — the session accepts none of our
+            # reachable IPs. Storm regardless of count: relogin is the only fix.
+            return last[0], last[1], last[2], bare_400_seen > 0
+
+        # Signal tuple helper: (result, session_redirected, proxies_exhausted).
+        # session_redirected → pool may mark account DEAD + relogin.
+        # proxies_exhausted  → pool swaps account now + repins proxy (session ok).
+        def _ret(data, *, redirected=False, exhausted=False):
             if return_signal:
-                return None, False
-            return None
+                return data, redirected, exhausted
+            return data
 
-        # Self-healing trigger: ANY 3xx from Voyager means edge cookies stale.
-        # LinkedIn's Cloudflare layer responds 302 → same URL with fresh Set-Cookie
-        # (bcookie, lidc, __cf_bm) asking the client to retry with refreshed edge state.
-        def _is_auth_redirect(s: Optional[int], r: Any) -> bool:
+        def _is_auth_redirect(s: Optional[int]) -> bool:
             return s in (301, 302, 303, 307, 308)
 
-        if _is_auth_redirect(status, resp):
+        status, resp, proxy_url, bare400_storm = await _smart_rotation(preferred_proxy=login_proxy)
+
+        if bare400_storm:
+            # Healthy proxies all rejected with bare 400 — the session is bound to
+            # an IP class we can no longer reach. Signal session death so the pool
+            # swaps accounts NOW and background relogin repins a reachable proxy.
+            logger.error("voyager_fetch.ip_binding_storm_triggering_relogin",
+                         account_id=target_account_id)
+            return _ret(None, redirected=True)
+        if status is None and resp is None:
+            # No proxy reached LinkedIn at all (pinned dead + pool unreachable).
+            # Session is probably fine — swap to an account with a live proxy.
+            logger.error("voyager_fetch.all_proxies_exhausted", account_id=target_account_id)
+            return _ret(None, exhausted=True)
+
+        # Self-heal on 302: LinkedIn/Cloudflare 302→same-URL ships fresh edge
+        # cookies (bcookie/lidc/__cf_bm) in Set-Cookie. Rapid-fire requests churn
+        # these constantly. Merge response cookies and retry on the SAME working
+        # proxy across several rounds; if that won't converge, fall back to a
+        # browser navigation (Playwright) which reliably re-mints edge cookies
+        # without losing li_at. Only after both fail do we declare the session dead.
+        heal_rounds = int(os.getenv("LINKEDIN_302_HEAL_ROUNDS", "3"))
+        # Browser edge-refresh is OFF by default: navigating to LinkedIn through
+        # the (datacenter-class) proxy headless gets bounced to remember-me-auto-
+        # login and the resulting storage_state loses li_at, so it never heals —
+        # it just burns ~8s. When HTTP cookie-merge can't converge, swapping to a
+        # healthy account (different pinned proxy + fresh cookies) is faster and
+        # more reliable. Background relogin re-mints this account's cookies anyway.
+        browser_refresh_enabled = os.getenv("LINKEDIN_302_BROWSER_REFRESH", "false").lower() in ("1", "true", "yes", "on")
+
+        if _is_auth_redirect(status):
+            working_proxy = proxy_url  # produced the 302 → it reaches LinkedIn
             logger.warning("voyager_fetch.auth_redirect_detected", status=status,
-                           location=(resp.headers.get("location") if resp is not None else None))
-            # FAST PATH: harvest Set-Cookie from the 302 response and merge.
-            # LinkedIn/Cloudflare's 302 → same-URL ships fresh bcookie/lidc/__cf_bm
-            # in Set-Cookie. Browser refresh is destructive (kills li_at on headless
-            # via datacenter IP) — merging response cookies is non-destructive.
-            try:
-                merged = self._merge_set_cookies_into_session(target_account_id, resp)
-            except Exception as e:
-                logger.warning("voyager_fetch.merge_failed", error=str(e))
-                merged = 0
+                           account_id=target_account_id, working_proxy=working_proxy)
 
-            # Pin the proxy that produced the 302 — it reached LinkedIn so it works.
-            working_proxy = proxy_url
-
-            if merged > 0:
-                logger.info("voyager_fetch.cookies_merged", count=merged, retry_proxy=working_proxy)
-                status, resp, proxy_url = await _attempt_with_proxy_rotation(preferred_proxy=working_proxy)
+            healed = False
+            for round_i in range(heal_rounds):
+                try:
+                    merged = self._merge_set_cookies_into_session(target_account_id, resp)
+                except Exception as e:
+                    logger.warning("voyager_fetch.merge_failed", error=str(e))
+                    merged = 0
+                if merged <= 0:
+                    break  # nothing new to merge → HTTP heal can't progress
+                logger.info("voyager_fetch.cookies_merged", round=round_i + 1,
+                            count=merged, retry_proxy=working_proxy)
+                status, resp, proxy_url, bare400_storm = await _smart_rotation(preferred_proxy=working_proxy)
+                if bare400_storm:
+                    logger.error("voyager_fetch.ip_binding_storm_triggering_relogin",
+                                 account_id=target_account_id)
+                    return _ret(None, redirected=True)
                 if status is None and resp is None:
-                    logger.error("voyager_fetch.retry_all_proxies_exhausted")
-                    if return_signal:
-                        return None, True
-                    return None
-            else:
-                # No new cookies in 302 → session already dead, do not waste a
-                # browser launch. Signal the pool to relogin this account.
-                logger.info("voyager_fetch.no_setcookies_session_dead",
-                            account_id=target_account_id)
-                if return_signal:
-                    return None, True
-                return None
+                    return _ret(None, exhausted=True)
+                if not _is_auth_redirect(status):
+                    healed = True
+                    break
 
-            # Second 302 after cookie merge → session is dead.
-            if _is_auth_redirect(status, resp):
+            # HTTP cookie-merge didn't converge → try a real browser navigation
+            # through the same working proxy to re-mint edge cookies.
+            if not healed and _is_auth_redirect(status) and browser_refresh_enabled:
+                logger.info("voyager_fetch.browser_edge_refresh_attempt",
+                            account_id=target_account_id, proxy=working_proxy)
+                try:
+                    refreshed = await self._refresh_edge_cookies(target_account_id, working_proxy)
+                except Exception as e:
+                    logger.warning("voyager_fetch.browser_refresh_exception", error=str(e)[:160])
+                    refreshed = False
+                if refreshed:
+                    status, resp, proxy_url, bare400_storm = await _smart_rotation(preferred_proxy=working_proxy)
+                    if bare400_storm:
+                        return _ret(None, redirected=True)
+                    if status is None and resp is None:
+                        return _ret(None, exhausted=True)
+                    if not _is_auth_redirect(status):
+                        healed = True
+
+            if not healed and _is_auth_redirect(status):
                 logger.error("voyager_fetch.still_redirecting_session_dead",
-                             location=(resp.headers.get("location") if resp is not None else None))
-                if return_signal:
-                    return None, True
-                return None
+                             account_id=target_account_id)
+                return _ret(None, redirected=True)
 
         if status != 200 or resp is None:
             text_head = ""
@@ -578,28 +847,25 @@ class LinkedInScraperService:
                 pass
             logger.warning("voyager_fetch.failed", status=status, text_head=text_head,
                            url_path=api_path[:300])
-            # IMPORTANT: do NOT mark the proxy failed here. Any HTTP response
-            # (including 400/401/403/404/500) means the proxy tunnel reached
-            # LinkedIn perfectly — the rejection is server-side (bad query,
-            # dead session, stale API path). Cooling down a working proxy
-            # drains the pool of the few proxies that actually reach LinkedIn.
+            # 401/403 = auth rejected → session dead (swap + relogin). A bare 400
+            # storm was already handled above. Any other 4xx/5xx is a server-side
+            # rejection of THIS query (bad params/path) — not fixable by swapping,
+            # so report failure without thrashing accounts.
             session_dead = status in (401, 403)
-            if return_signal:
-                return None, session_dead
-            return None
+            return _ret(None, redirected=session_dead)
 
-        logger.info("voyager_fetch.success", status=status, account_id=target_account_id)
+        logger.info("voyager_fetch.success", status=status, account_id=target_account_id,
+                    proxy=(proxy_url[:30] + "...") if proxy_url else None)
+        # This proxy just proved the session accepts its IP — remember it so the
+        # next request skips the lottery entirely.
+        self._record_good_proxy(target_account_id, proxy_url, login_proxy)
         try:
             data = resp.json()
         except Exception as e:
             logger.error("voyager_fetch.json_parse_failed", error=str(e))
-            if return_signal:
-                return None, False
-            return None
+            return _ret(None)
 
-        if return_signal:
-            return data, False
-        return data
+        return _ret(data)
 
     def extract_profile_id(self, profile_or_url: str) -> str:
         """Extract profile ID/username from a LinkedIn URL or return the raw profile ID."""
@@ -625,11 +891,156 @@ class LinkedInScraperService:
                 return match.group(1)
         return company_or_url
 
+    @staticmethod
+    def _apply_path_override(env_var: str, default_path: str, subs: Dict[str, str]) -> str:
+        """Return a captured GraphQL path from `env_var` (with {placeholders}
+        filled) if set, else the hardcoded REST `default_path`.
+
+        Every LinkedIn service uses this so any endpoint can be pointed at a
+        captured GraphQL queryId path (see capture_linkedin_content_query.py)
+        when LinkedIn deprecates/rotates the REST decoration — without code
+        changes. Placeholder values are URL-encoded by the caller as needed.
+        """
+        override = os.getenv(env_var, "").strip()
+        if not override:
+            return default_path
+        out = override
+        for key, val in subs.items():
+            out = out.replace("{" + key + "}", val)
+        logger.info("voyager.using_path_override", env_var=env_var)
+        return out
+
+    async def _paginate_voyager(
+        self,
+        build_path,            # (start: int, count: int) -> api_path str
+        parse_page,            # (data: dict) -> Optional[List[dict]]
+        *,
+        limit: int,
+        account_id: Optional[str],
+        page_size: int,
+        dedup_key,             # (item) -> hashable | None
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Walk Voyager result pages by advancing the `start` offset until `limit`
+        is reached, an empty page ends the set, or a safety ceiling trips.
+
+        Design: a whole walk is PINNED to ONE account, because LinkedIn returns
+        results relative to the session — mixing accounts across pages produces
+        gaps/overlaps (one rate-limited session can return a short page, leaving a
+        hole). The pinned account's pages are still fetched in PARALLEL waves of
+        LINKEDIN_PARALLEL_PAGES (same session, different offsets, concurrently), so
+        a big pull returns in roughly one page's time. If an account yields a
+        suspiciously short total (degraded/rate-limited), we release it and retry
+        the walk on another account, keeping the best result.
+
+        "Next page" is purely the API `start` offset — no browser. LinkedIn refuses
+        very deep offsets (~1000), bounded by LINKEDIN_PAGINATION_MAX/_MAX_PAGES.
+        Returns None only if NO page could be fetched at all.
+        """
+        hard_max = int(os.getenv("LINKEDIN_PAGINATION_MAX", "500"))
+        max_pages = int(os.getenv("LINKEDIN_PAGINATION_MAX_PAGES", "30"))
+        parallel = max(1, int(os.getenv("LINKEDIN_PARALLEL_PAGES", "3")))
+        account_tries = int(os.getenv("LINKEDIN_PAGINATION_ACCOUNT_TRIES", "3"))
+        target = max(1, min(int(limit), hard_max))
+        page_size = max(1, page_size)
+        # "Healthy enough" floor: a walk yielding fewer than this when more was
+        # asked for signals a degraded session → try another account.
+        healthy_floor = min(target, page_size)
+
+        async def _walk_on(acct: str) -> tuple[List[Dict[str, Any]], bool]:
+            out: List[Dict[str, Any]] = []
+            seen: set = set()
+            any_ok = False
+            next_idx = 0
+            stop = False
+            while not stop and next_idx < max_pages and len(out) < target:
+                # Only fan out as many pages as we still need — never over-fetch.
+                # ceil((target-have)/page_size), bounded by `parallel` and the
+                # page ceiling. Underfilled pages are corrected on the next loop.
+                remaining_pages = -(-(target - len(out)) // page_size)
+                wave_size = max(1, min(parallel, remaining_pages, max_pages - next_idx))
+                wave = []
+                for _ in range(wave_size):
+                    wave.append(next_idx * page_size)
+                    next_idx += 1
+                results = await asyncio.gather(*[
+                    self._voyager_get_for_account_with_signal(build_path(s, page_size), acct)
+                    for s in wave
+                ], return_exceptions=True)
+                for start, r in zip(wave, results):
+                    if isinstance(r, Exception) or r is None or r[0] is None:
+                        logger.info("voyager_paginate.page", start=start, page_items="fail",
+                                    added=0, total=len(out), target=target, account=acct)
+                        continue
+                    data = r[0]
+                    any_ok = True
+                    page = parse_page(data) or []
+                    added = 0
+                    for item in page:
+                        k = dedup_key(item)
+                        if k is not None and k in seen:
+                            continue
+                        if k is not None:
+                            seen.add(k)
+                        out.append(item)
+                        added += 1
+                        if len(out) >= target:
+                            break
+                    logger.info("voyager_paginate.page", start=start, page_items=len(page),
+                                added=added, total=len(out), target=target, account=acct)
+                    # Stop on a genuinely empty page, on no NEW items (a degraded
+                    # session looping on the same duplicate — avoids walking to
+                    # max_pages), or once the target is met.
+                    if len(page) == 0 or added == 0 or len(out) >= target:
+                        stop = True
+                        break
+            return out, any_ok
+
+        # Caller pinned a specific account → walk it directly, no pool.
+        if account_id is not None:
+            out, ok = await _walk_on(account_id)
+            return out[:target] if ok else None
+
+        # Pool: hold one account per walk; swap to another if it returns a short
+        # (degraded) total so a rate-limited session can't truncate the result.
+        from api.services.linkedin_account_pool import LinkedInAccountPool, NoAccountAvailable
+        pool = await LinkedInAccountPool.instance()
+        best: Optional[List[Dict[str, Any]]] = None
+        any_ok_overall = False
+        tried: set = set()
+        for _attempt in range(max(1, account_tries)):
+            try:
+                acc = await pool.acquire()
+            except NoAccountAvailable:
+                break
+            if acc.account_id in tried:
+                await pool.release(acc.account_id, success=False, session_redirected=False)
+                break
+            tried.add(acc.account_id)
+            out: List[Dict[str, Any]] = []
+            ok = False
+            try:
+                out, ok = await _walk_on(acc.account_id)
+            finally:
+                await pool.release(acc.account_id, success=bool(out),
+                                   session_redirected=False)
+            any_ok_overall = any_ok_overall or ok
+            if best is None or len(out) > len(best):
+                best = out
+            if len(best or []) >= healthy_floor:
+                break  # got a healthy-sized result — good
+        if best is None and not any_ok_overall:
+            return None
+        return (best or [])[:target]
+
     async def scrape_profile(self, public_id: str, account_id: Optional[str] = None) -> Dict[str, Any]:
         """Scrape professional profile details using Voyager API."""
         public_id = self.extract_profile_id(public_id)
-        api_path = f"/voyager/api/identity/dash/profiles?q=memberIdentity&memberIdentity={public_id}&decorationId=com.linkedin.voyager.dash.deco.identity.profile.FullProfile-36"
-        
+        api_path = self._apply_path_override(
+            "LINKEDIN_VOYAGER_PROFILE_PATH",
+            f"/voyager/api/identity/dash/profiles?q=memberIdentity&memberIdentity={public_id}&decorationId=com.linkedin.voyager.dash.deco.identity.profile.FullProfile-36",
+            {"public_id": quote(public_id, safe="")},
+        )
+
         data = await self._voyager_get(api_path, account_id=account_id)
         if not data:
             raise RuntimeError(f"Failed to scrape LinkedIn profile '{public_id}' using Voyager API.")
@@ -650,20 +1061,41 @@ class LinkedInScraperService:
             "data": raw_data
         }
 
+    @staticmethod
+    def _is_entity(item: dict, type_suffix: str, urn_kind: str) -> bool:
+        """Match a Voyager included object by readable $type suffix (REST) OR by
+        entityUrn kind (GraphQL/hashed-type fallback). entityUrns like
+        urn:li:fsd_profilePosition:... are stable across both transports, so this
+        keeps parsing working even if LinkedIn swaps decorations for queryIds.
+        """
+        t = str(item.get("$type", ""))
+        if t.endswith(type_suffix):
+            return True
+        urn = str(item.get("entityUrn", ""))
+        # Anchor the kind so fsd_profile doesn't match fsd_profilePosition etc.
+        return bool(re.search(r"urn:li:%s:" % re.escape(urn_kind), urn))
+
     def _parse_voyager_profile(self, data: dict) -> dict:
         """Parse a Voyager profile response into the standard profile structure."""
         included = data.get("included", [])
-        
-        # 1. Find profile object
+
+        # 1. Find profile object — exact dash type first, then field/urn fallback
+        #    so a GraphQL-shaped response (hashed type) still parses.
         profile = {}
         for item in included:
             if item.get("$type") == "com.linkedin.voyager.dash.identity.profile.Profile":
                 profile = item
                 break
-                
+        if not profile:
+            for item in included:
+                if (item.get("firstName") is not None and "lastName" in item
+                        and re.search(r"urn:li:fsd_profile:", str(item.get("entityUrn", "")))):
+                    profile = item
+                    break
+
         if not profile:
             return {}
-            
+
         first_name = profile.get("firstName", "")
         last_name = profile.get("lastName", "")
         name = f"{first_name} {last_name}".strip()
@@ -680,7 +1112,7 @@ class LinkedInScraperService:
                 
         # 2. Extract experience
         experience = []
-        positions = [item for item in included if item.get("$type") == "com.linkedin.voyager.dash.identity.profile.Position"]
+        positions = [item for item in included if self._is_entity(item, ".profile.Position", "fsd_profilePosition")]
         for pos in positions:
             title = pos.get("title", "")
             company = pos.get("companyName", "")
@@ -727,7 +1159,7 @@ class LinkedInScraperService:
             
         # 3. Extract education
         education = []
-        educations = [item for item in included if item.get("$type") == "com.linkedin.voyager.dash.identity.profile.Education"]
+        educations = [item for item in included if self._is_entity(item, ".profile.Education", "fsd_profileEducation")]
         for edu in educations:
             school = edu.get("schoolName", "")
             degree = edu.get("degreeName", "")
@@ -765,7 +1197,7 @@ class LinkedInScraperService:
             
         # 4. Extract skills
         skills = []
-        skills_list = [item for item in included if item.get("$type") == "com.linkedin.voyager.dash.identity.profile.Skill"]
+        skills_list = [item for item in included if self._is_entity(item, ".profile.Skill", "fsd_profileSkill")]
         for sk in skills_list:
             name_sk = sk.get("name", "")
             if name_sk:
@@ -784,8 +1216,12 @@ class LinkedInScraperService:
     async def scrape_company(self, company_name: str, account_id: Optional[str] = None) -> Dict[str, Any]:
         """Scrape company organization details using Voyager API."""
         company_name = self.extract_company_name(company_name)
-        api_path = f"/voyager/api/organization/dash/companies?q=universalName&universalName={company_name}"
-        
+        api_path = self._apply_path_override(
+            "LINKEDIN_VOYAGER_COMPANY_PATH",
+            f"/voyager/api/organization/dash/companies?q=universalName&universalName={company_name}",
+            {"company": quote(company_name, safe="")},
+        )
+
         data = await self._voyager_get(api_path, account_id=account_id)
         if not data:
             raise RuntimeError(f"Failed to scrape LinkedIn company '{company_name}' using Voyager API.")
@@ -807,7 +1243,13 @@ class LinkedInScraperService:
             if item.get("$type") == "com.linkedin.voyager.dash.organization.Company":
                 comp = item
                 break
-                
+        if not comp:
+            # Fallback: a company object by entityUrn + a name field (GraphQL shape).
+            for item in included:
+                if (item.get("name") and re.search(r"urn:li:fsd_company:", str(item.get("entityUrn", "")))):
+                    comp = item
+                    break
+
         if not comp:
             return {}
             
@@ -875,6 +1317,62 @@ class LinkedInScraperService:
             "locations": locations
         }
 
+    # Verified LinkedIn geo URN ids for common locations. Anything not here is
+    # resolved once via the typeahead API and cached; unresolvable locations are
+    # omitted from the query (jobs return unfiltered rather than 400ing).
+    _GEO_ID_CACHE: Dict[str, Optional[str]] = {}
+    _KNOWN_GEO_IDS = {
+        "india": "102713980",
+        "united states": "103644278",
+        "usa": "103644278",
+        "us": "103644278",
+        "united kingdom": "101165590",
+        "uk": "101165590",
+        "canada": "101174742",
+        "australia": "101452733",
+        "germany": "101282230",
+        "singapore": "102454443",
+        "worldwide": "92000000",
+        "remote": "92000000",
+    }
+
+    async def _resolve_geo_id(self, location: str, account_id: Optional[str]) -> Optional[str]:
+        """Map a human location string to LinkedIn's geo URN id.
+
+        The jobs endpoint only accepts locationUnion:(geoId:N) — free-text
+        location fields were removed from this API generation and 400 the
+        whole request.
+        """
+        key = location.strip().lower()
+        if not key:
+            return None
+        if key in self._GEO_ID_CACHE:
+            return self._GEO_ID_CACHE[key]
+        if key in self._KNOWN_GEO_IDS:
+            self._GEO_ID_CACHE[key] = self._KNOWN_GEO_IDS[key]
+            return self._GEO_ID_CACHE[key]
+
+        geo_id: Optional[str] = None
+        try:
+            path = (
+                "/voyager/api/graphql?variables=(keywords:" + quote(location, safe="")
+                + ",query:(typeaheadFilterQuery:(geoSearchTypes:List(MARKET_AREA,COUNTRY_REGION,ADMIN_DIVISION_1,CITY))),type:GEO)"
+                + "&queryId=voyagerSearchDashReusableTypeahead.57a4fa1dd92d3266ed968fdbab2d7bf5"
+            )
+            data = await self._voyager_get(path, account_id=account_id)
+            if data:
+                blob = json.dumps(data)
+                m = re.search(r"urn:li:(?:fsd_geo|geo):(\d+)", blob)
+                if m:
+                    geo_id = m.group(1)
+        except Exception as e:
+            logger.warning("voyager_geo_typeahead_failed", location=location, error=str(e)[:120])
+
+        if not geo_id:
+            logger.warning("voyager_geo_unresolved_omitting_location", location=location)
+        self._GEO_ID_CACHE[key] = geo_id
+        return geo_id
+
     async def _search_jobs_voyager(
         self,
         keywords: str,
@@ -886,19 +1384,22 @@ class LinkedInScraperService:
         limit: int = 25,
         account_id: Optional[str] = None
     ) -> Optional[List[Dict[str, Any]]]:
-        """Search jobs via the Voyager JSON API."""
-        count = min(max(int(limit), 1), 100)
+        """Search jobs via the Voyager JSON API, paginating to satisfy `limit`."""
+        page_size = int(os.getenv("LINKEDIN_JOBS_PAGE_SIZE", "100"))
 
-        # Captured-query override if set in env
+        # Captured-query override if set in env. build_path inserts the page's
+        # start/count so the paginator can advance through result pages.
         override = os.getenv("LINKEDIN_VOYAGER_JOBS_PATH", "").strip()
         if override:
-            api_path = (
-                override
-                .replace("{keywords}", quote(keywords, safe=""))
-                .replace("{location}", quote(location or "", safe=""))
-                .replace("{count}", str(count))
-                .replace("{start}", "0")
-            )
+            kw_enc = quote(keywords, safe="")
+            loc_enc = quote(location or "", safe="")
+
+            def build_path(start: int, count: int) -> str:
+                return (override
+                        .replace("{keywords}", kw_enc)
+                        .replace("{location}", loc_enc)
+                        .replace("{count}", str(count))
+                        .replace("{start}", str(start)))
             logger.info("voyager_using_override_path")
         else:
             filters = []
@@ -910,50 +1411,46 @@ class LinkedInScraperService:
                 filters.append(("experience", exp))
             if tpr:
                 filters.append(("timePostedRange", tpr))
-            filter_str = ",".join(
-                "(key:%s,value:List(%s))" % (k, v) for k, v in filters
-            )
+            # Map-style selectedFilters — the (key:X,value:List(Y)) pair format
+            # belongs to the retired search API generation and bare-400s the
+            # current voyagerJobsDashJobCards endpoint.
+            filter_str = ",".join("%s:List(%s)" % (k, v) for k, v in filters)
 
-            # Strip whitespace — LinkedIn rejects trailing spaces in keywords
-            # and locationFallback with a 400.
+            # Strip whitespace — LinkedIn rejects trailing spaces in keywords with a 400.
             keywords_clean = (keywords or "").strip()
             location_clean = (location or "").strip()
 
             parts = ["origin:JOB_SEARCH_PAGE_QUERY_EXPANSION", "keywords:" + keywords_clean]
             if location_clean:
-                parts.append("locationFallback:" + location_clean)
+                # Free-text location fields 400 this endpoint — must be a geo URN id.
+                geo_id = await self._resolve_geo_id(location_clean, account_id)
+                if geo_id:
+                    parts.append(f"locationUnion:(geoId:{geo_id})")
             if filter_str:
                 parts.append("selectedFilters:(" + filter_str + ")")
             parts.append("spellCorrectionEnabled:true")
             query_value = "(" + ",".join(parts) + ")"
+            encoded_q = quote(query_value, safe='():,->')
 
             # decorationId version is configurable via env so we can bump it
             # without code changes when LinkedIn rotates it.
             deco_version = os.getenv("LINKEDIN_VOYAGER_JOBS_DECO_VERSION", "190")
-            api_path = (
-                "/voyager/api/voyagerJobsDashJobCards"
-                f"?decorationId=com.linkedin.voyager.dash.deco.jobs.search.JobSearchCardsCollection-{deco_version}"
-                f"&count={count}"
-                "&q=jobSearch"
-                "&start=0"
-                f"&query={quote(query_value, safe='():,->')}"
-            )
 
-        data = await self._voyager_get(api_path, account_id=account_id)
-        if data is None:
-            return None
+            def build_path(start: int, count: int) -> str:
+                return (
+                    "/voyager/api/voyagerJobsDashJobCards"
+                    f"?decorationId=com.linkedin.voyager.dash.deco.jobs.search.JobSearchCardsCollection-{deco_version}"
+                    f"&count={count}"
+                    "&q=jobSearch"
+                    f"&start={start}"
+                    f"&query={encoded_q}"
+                )
 
-        jobs = self._parse_voyager_jobs(data)
-        if jobs is None:
-            # Shape mismatch: dump raw JSON
-            try:
-                dump = ROOT / "linkedin_voyager_jobs_sample.json"
-                dump.write_text(json.dumps(data, indent=2)[:200000], encoding="utf-8")
-                logger.warning("voyager_jobs_shape_unrecognized_dumped", path=str(dump))
-            except Exception as e:
-                logger.warning("voyager_jobs_dump_failed", error=str(e))
-            return None
-        return jobs
+        return await self._paginate_voyager(
+            build_path, self._parse_voyager_jobs,
+            limit=limit, account_id=account_id, page_size=page_size,
+            dedup_key=lambda j: j.get("url") or j.get("title"),
+        )
 
     def _parse_voyager_jobs(self, data: dict) -> Optional[List[Dict[str, Any]]]:
         """Parse a Voyager jobs response into the standard job dict shape."""
@@ -1030,16 +1527,12 @@ class LinkedInScraperService:
         if not available_ids:
             raise RuntimeError("No active LinkedIn sessions found. Please run the login runner first.")
 
-        target_account_id = account_id
-        if not target_account_id or target_account_id not in available_ids:
-            target_account_id = available_ids[0]
-
-        accounts_info = self._parse_linkedin_accounts()
-        proxy_url = None
-        for acc in accounts_info:
-            if acc["account_id"] == target_account_id:
-                proxy_url = acc.get("proxy_url")
-                break
+        # Only pin a concrete account if the caller explicitly named a valid one.
+        # Otherwise pass None so _voyager_get uses the multi-account POOL path,
+        # which round-robins ALIVE accounts and swaps on session-death / proxy
+        # exhaustion. Forcing available_ids[0] here was defeating that — a
+        # transient 302 on the first account 502'd the whole request.
+        target_account_id = account_id if (account_id and account_id in available_ids) else None
 
         keywords = keywords.strip()
         
@@ -1127,11 +1620,18 @@ class LinkedInScraperService:
         self,
         query: str,
         category: str = "all",
+        limit: int = 25,
         account_id: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Perform a blended or categorized universal search using Voyager API."""
+        """Perform a blended or categorized universal search using Voyager API.
+
+        Category-specific searches (people/companies/groups/posts/jobs) paginate
+        across `start` offsets to satisfy `limit`. Blended "all" stays a single
+        page — it's an intentionally shallow cross-type teaser.
+        """
         query = query.strip()
-        
+        search_page_size = int(os.getenv("LINKEDIN_SEARCH_PAGE_SIZE", "49"))
+
         category_map = {
             "all": None,
             "people": "PEOPLE",
@@ -1140,65 +1640,229 @@ class LinkedInScraperService:
             "posts": "CONTENT",
             "groups": "GROUPS"
         }
+        cat_key_map = {"PEOPLE": "people", "COMPANIES": "companies",
+                       "GROUPS": "groups", "CONTENT": "posts"}
         cat_str = category.value if hasattr(category, "value") else str(category)
         target_cat = category_map.get(cat_str.strip().lower())
-        
+
+        def _result(parsed: dict, note: Optional[str] = None) -> Dict[str, Any]:
+            out = {
+                "success": True,
+                "query": query,
+                "category": category,
+                "scraped_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "data": parsed,
+            }
+            if note:
+                out["note"] = note
+            return out
+
+        # JOBS via the blended clusters endpoint returns nothing useful — delegate
+        # to the dedicated jobs search (paginates), reshaped into the blended contract.
+        if target_cat == "JOBS":
+            jobs = await self._search_jobs_voyager(keywords=query, location=None,
+                                                   limit=limit, account_id=account_id)
+            job_items = [
+                {"title": j.get("title") or "", "url": j.get("url") or "",
+                 "snippet": " · ".join(p for p in (j.get("company"), j.get("location")) if p)}
+                for j in (jobs or [])
+            ]
+            return _result({"jobs": job_items})
+
         encoded_query = quote_plus(query)
-        
+        kw_enc = quote(query, safe="")
+        content_override = os.getenv("LINKEDIN_VOYAGER_CONTENT_PATH", "").strip()
+        search_override = os.getenv("LINKEDIN_VOYAGER_SEARCH_PATH", "").strip()
+
+        _CLUSTERS_BASE = (
+            "/voyager/api/search/dash/clusters"
+            "?decorationId=com.linkedin.voyager.dash.deco.search.SearchClusterCollection-165"
+            "&origin=GLOBAL_SEARCH_HEADER&q=all"
+        )
+
+        # ---- Posts / CONTENT (paginated when a captured GraphQL path exists) ----
+        if target_cat == "CONTENT":
+            if content_override:
+                def build_posts(start: int, count: int) -> str:
+                    return (content_override
+                            .replace("{keywords}", kw_enc)
+                            .replace("{count}", str(count))
+                            .replace("{start}", str(start)))
+                posts = await self._paginate_voyager(
+                    build_posts,
+                    lambda d: self._extract_posts_from_included(d.get("included", [])),
+                    limit=limit, account_id=account_id, page_size=search_page_size,
+                    dedup_key=lambda p: p.get("url") or (p.get("snippet") or "")[:80],
+                )
+                if posts is None:
+                    raise RuntimeError("Failed to fetch search results from Voyager API.")
+                return _result({"posts": posts})
+            # No captured path → clusters returns content-less stubs. Honest empty + note.
+            api_path = (_CLUSTERS_BASE +
+                        f"&query=(flagshipSearchIntent:SEARCH_SRP,queryParameters:(keywords:List({encoded_query}),resultType:List(CONTENT)),includeFiltersInResponse:false)"
+                        f"&count={search_page_size}&start=0")
+            data = await self._voyager_get(api_path, account_id=account_id)
+            if not data:
+                raise RuntimeError("Failed to fetch search results from Voyager API.")
+            posts = self._parse_search_results(data, target_cat="CONTENT").get("posts", [])
+            return _result({"posts": posts}, note=(
+                "LinkedIn no longer returns post bodies via the search clusters "
+                "endpoint; set LINKEDIN_VOYAGER_CONTENT_PATH to a captured GraphQL "
+                "content-search path to enable hydrated posts."))
+
+        # ---- People / Companies / Groups (paginated) ----
         if target_cat:
-            api_path = (
-                "/voyager/api/search/dash/clusters"
-                "?decorationId=com.linkedin.voyager.dash.deco.search.SearchClusterCollection-165"
-                "&origin=GLOBAL_SEARCH_HEADER"
-                "&q=all"
-                f"&query=(flagshipSearchIntent:SEARCH_SRP,queryParameters:(keywords:List({encoded_query}),resultType:List({target_cat})),includeFiltersInResponse:false)"
-                "&count=15"
-                "&start=0"
+            cat_key = cat_key_map.get(target_cat, "flat_results")
+            if search_override:
+                def build_search(start: int, count: int) -> str:
+                    return (search_override
+                            .replace("{keywords}", kw_enc)
+                            .replace("{resultType}", target_cat)
+                            .replace("{count}", str(count))
+                            .replace("{start}", str(start)))
+            else:
+                def build_search(start: int, count: int) -> str:
+                    return (_CLUSTERS_BASE +
+                            f"&query=(flagshipSearchIntent:SEARCH_SRP,queryParameters:(keywords:List({encoded_query}),resultType:List({target_cat})),includeFiltersInResponse:false)"
+                            f"&count={count}&start={start}")
+            items = await self._paginate_voyager(
+                build_search,
+                lambda d: self._parse_search_results(d, target_cat=target_cat).get(cat_key, []),
+                limit=limit, account_id=account_id, page_size=search_page_size,
+                dedup_key=lambda x: x.get("url"),
             )
-        else:
-            api_path = (
-                "/voyager/api/search/dash/clusters"
-                "?decorationId=com.linkedin.voyager.dash.deco.search.SearchClusterCollection-165"
-                "&origin=GLOBAL_SEARCH_HEADER"
-                "&q=all"
-                f"&query=(flagshipSearchIntent:SEARCH_SRP,queryParameters:(keywords:List({encoded_query})),includeFiltersInResponse:false)"
-                "&count=15"
-                "&start=0"
-            )
-            
+            if items is None:
+                raise RuntimeError("Failed to fetch search results from Voyager API.")
+            return _result({cat_key: items})
+
+        # ---- Blended "all": single-page teaser + single-page hydrated-post merge ----
+        api_path = self._apply_path_override(
+            "LINKEDIN_VOYAGER_SEARCH_ALL_PATH",
+            (_CLUSTERS_BASE +
+             f"&query=(flagshipSearchIntent:SEARCH_SRP,queryParameters:(keywords:List({encoded_query})),includeFiltersInResponse:false)"
+             f"&count={search_page_size}&start=0"),
+            {"keywords": encoded_query, "count": str(search_page_size), "start": "0"},
+        )
         data = await self._voyager_get(api_path, account_id=account_id)
         if not data:
             raise RuntimeError("Failed to fetch search results from Voyager API.")
-            
-        return {
-            "success": True,
-            "query": query,
-            "category": category,
-            "scraped_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "data": self._parse_search_results(data, target_cat=target_cat)
-        }
+        parsed = self._parse_search_results(data)
+        parsed = {k: v[:limit] for k, v in parsed.items()}
+        if content_override:
+            try:
+                cpath = (content_override.replace("{keywords}", kw_enc)
+                         .replace("{count}", str(search_page_size)).replace("{start}", "0"))
+                cdata = await self._voyager_get(cpath, account_id=account_id)
+                if cdata:
+                    hydrated = self._extract_posts_from_included(cdata.get("included", []))
+                    if hydrated:
+                        parsed["posts"] = hydrated[:limit]
+            except Exception as e:
+                logger.warning("voyager_blended_posts_merge_failed", error=str(e)[:120])
+        return _result(parsed)
+
+    def _extract_posts_from_included(self, included: List[dict]) -> List[Dict[str, Any]]:
+        """Pull post/update results out of `included` feed-update objects.
+
+        Content search hydrates posts as FeedUpdate/UpdateV2 objects (when a
+        working content queryId is used). Each carries commentary text + an
+        actor; the entityUrn maps to a /feed/update/ permalink. The clusters
+        endpoint returns only stubs, so this yields [] there — by design.
+        """
+        def _text(obj):
+            # LinkedIn text comes as {"text": "..."} sometimes nested twice.
+            seen = 0
+            while isinstance(obj, dict) and "text" in obj and seen < 4:
+                obj = obj["text"]
+                seen += 1
+            return obj if isinstance(obj, str) else ""
+
+        posts: List[Dict[str, Any]] = []
+        seen_urns = set()
+        for item in included:
+            t = str(item.get("$type", ""))
+            if not (("UpdateV2" in t or t.endswith(".Update") or "FeedUpdate" in t)):
+                continue
+            commentary = item.get("commentary")
+            body = ""
+            if isinstance(commentary, dict):
+                body = _text(commentary.get("text")) or _text(commentary)
+            if not body:
+                continue
+            urn = item.get("entityUrn") or item.get("updateMetadata", {}).get("urn") or ""
+            if urn and urn in seen_urns:
+                continue
+            actor = item.get("actor") or {}
+            author = _text(actor.get("name")) if isinstance(actor, dict) else ""
+            url = ""
+            # Prefer the clean inner activity/ugcPost/share urn for the permalink;
+            # the entityUrn often wraps it as fsd_update:(urn:li:activity:N,...).
+            m = (re.search(r"urn:li:activity:\d+", urn)
+                 or re.search(r"urn:li:(?:ugcPost|share):\d+", urn))
+            if m:
+                url = f"https://www.linkedin.com/feed/update/{m.group(0)}/"
+            if urn:
+                seen_urns.add(urn)
+            posts.append({
+                "title": author or "(post)",
+                "url": url,
+                "snippet": body.strip()[:500],
+            })
+        return posts
+
+    @staticmethod
+    def _find_cluster_elements(node: Any, _depth: int = 0) -> List[dict]:
+        """Locate the search-cluster `elements` array regardless of envelope
+        depth. REST puts it at data.elements; GraphQL nests it under the query
+        name (data.<queryName>.elements). Returns the first `elements` list whose
+        entries look like clusters (have an `items` array)."""
+        if _depth > 6 or node is None:
+            return []
+        if isinstance(node, dict):
+            els = node.get("elements")
+            if isinstance(els, list) and any(isinstance(e, dict) and "items" in e for e in els):
+                return els
+            for v in node.values():
+                found = LinkedInScraperService._find_cluster_elements(v, _depth + 1)
+                if found:
+                    return found
+        elif isinstance(node, list):
+            for v in node:
+                found = LinkedInScraperService._find_cluster_elements(v, _depth + 1)
+                if found:
+                    return found
+        return []
 
     def _parse_search_results(self, data: dict, target_cat: Optional[str] = None) -> Dict[str, List[Dict[str, Any]]]:
         """Parse blended search results into grouped categories."""
         included = data.get("included", [])
         urn_map = {item["entityUrn"]: item for item in included if "entityUrn" in item}
-        
+
         results = {
             "people": [],
             "companies": [],
             "jobs": [],
+            "posts": [],
             "groups": [],
             "flat_results": []
         }
-        
-        elements = data.get("data", {}).get("elements", [])
+
+        # Posts come from hydrated feed-update objects in `included`, not from the
+        # entityResult cluster items the loop below handles.
+        results["posts"] = self._extract_posts_from_included(included)
+
+        # The cluster `elements` array sits at data.data.elements in REST but is
+        # nested deeper under the GraphQL queryId (e.g. data.data.<queryName>.
+        # elements). Find it wherever it is so a captured SEARCH_PATH parses too.
+        elements = self._find_cluster_elements(data.get("data", {}))
         for cluster in elements:
             cluster_title = cluster.get("title", {}).get("text", "").lower() if isinstance(cluster.get("title"), dict) else str(cluster.get("title") or "").lower()
             items = cluster.get("items", [])
             
             for item in items:
-                union = item.get("itemUnion", {})
-                ref = union.get("*entityResult")
+                # REST nests the ref under itemUnion; GraphQL under item.
+                union = item.get("itemUnion") or item.get("item") or {}
+                ref = union.get("*entityResult") if isinstance(union, dict) else None
                 if not ref or ref not in urn_map:
                     continue
                     
