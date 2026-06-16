@@ -94,37 +94,12 @@ class LinkedInScraperService:
     def _parse_linkedin_accounts(self) -> List[Dict[str, Any]]:
         """Parse LINKEDIN_ACCOUNT_<N> entries from the environment.
 
-        Format: account_id|username|password[|proxy_url]
-        Proxy via GOODPROXIES_* if 4th part omitted.
+        Format: account_id|username|password[|proxy_url]. Proxy via GOODPROXIES_*
+        when the 4th part is omitted. Delegates to the shared parser so the
+        service, the pool, and the CLI runner can't drift.
         """
-        accounts = []
-        pattern = re.compile(r"^LINKEDIN_ACCOUNT_\d+$")
-
-        for key, value in os.environ.items():
-            if pattern.match(key):
-                try:
-                    parts = value.split("|")
-                    if len(parts) < 3 or len(parts) > 4:
-                        continue
-                    account_id = parts[0]
-                    username = parts[1]
-                    password = parts[2]
-                    proxy_url = parts[3] if len(parts) == 4 else None
-
-                    if "your_username" in username or "your_password" in password:
-                        continue
-
-                    accounts.append({
-                        "account_id": account_id.strip(),
-                        "username": username.strip(),
-                        "password": password.strip(),
-                        "proxy_url": proxy_url.strip() if proxy_url and proxy_url.strip() else None,
-                    })
-                except Exception as e:
-                    logger.error("error_parsing_linkedin_account_env", key=key, error=str(e))
-
-        accounts.sort(key=lambda x: x["account_id"])
-        return accounts
+        from api.services.linkedin_env import parse_linkedin_accounts_env
+        return parse_linkedin_accounts_env()
 
     def _get_available_sessions(self) -> List[str]:
         """Get all LinkedIn account IDs with a saved session file."""
@@ -897,7 +872,7 @@ class LinkedInScraperService:
         filled) if set, else the hardcoded REST `default_path`.
 
         Every LinkedIn service uses this so any endpoint can be pointed at a
-        captured GraphQL queryId path (see capture_linkedin_content_query.py)
+        captured GraphQL queryId path (see capture_linkedin_queries.py)
         when LinkedIn deprecates/rotates the REST decoration — without code
         changes. Placeholder values are URL-encoded by the caller as needed.
         """
@@ -946,10 +921,18 @@ class LinkedInScraperService:
         # asked for signals a degraded session → try another account.
         healthy_floor = min(target, page_size)
 
-        async def _walk_on(acct: str) -> tuple[List[Dict[str, Any]], bool]:
+        async def _walk_on(acct: str) -> tuple[List[Dict[str, Any]], bool, bool, bool]:
+            """Returns (items, any_page_ok, session_redirected, proxies_exhausted).
+
+            The last two carry the per-page health signals up to the pool so a
+            session that died (or whose proxies are exhausted) mid-walk gets
+            demoted/relogged — same self-healing the single-shot path gets.
+            """
             out: List[Dict[str, Any]] = []
             seen: set = set()
             any_ok = False
+            redirected = False
+            exhausted = False
             next_idx = 0
             stop = False
             while not stop and next_idx < max_pages and len(out) < target:
@@ -967,11 +950,17 @@ class LinkedInScraperService:
                     for s in wave
                 ], return_exceptions=True)
                 for start, r in zip(wave, results):
-                    if isinstance(r, Exception) or r is None or r[0] is None:
+                    if isinstance(r, Exception) or r is None:
                         logger.info("voyager_paginate.page", start=start, page_items="fail",
                                     added=0, total=len(out), target=target, account=acct)
                         continue
-                    data = r[0]
+                    data, page_redirected, page_exhausted = r
+                    redirected = redirected or page_redirected
+                    exhausted = exhausted or page_exhausted
+                    if data is None:
+                        logger.info("voyager_paginate.page", start=start, page_items="fail",
+                                    added=0, total=len(out), target=target, account=acct)
+                        continue
                     any_ok = True
                     page = parse_page(data) or []
                     added = 0
@@ -993,11 +982,11 @@ class LinkedInScraperService:
                     if len(page) == 0 or added == 0 or len(out) >= target:
                         stop = True
                         break
-            return out, any_ok
+            return out, any_ok, redirected, exhausted
 
         # Caller pinned a specific account → walk it directly, no pool.
         if account_id is not None:
-            out, ok = await _walk_on(account_id)
+            out, ok, _redirected, _exhausted = await _walk_on(account_id)
             return out[:target] if ok else None
 
         # Pool: hold one account per walk; swap to another if it returns a short
@@ -1018,11 +1007,18 @@ class LinkedInScraperService:
             tried.add(acc.account_id)
             out: List[Dict[str, Any]] = []
             ok = False
+            redirected = False
+            exhausted = False
             try:
-                out, ok = await _walk_on(acc.account_id)
+                out, ok, redirected, exhausted = await _walk_on(acc.account_id)
             finally:
+                # Feed the walk's health signals to the pool so a dead/degraded
+                # session is demoted + relogged, exactly like the single-shot
+                # path. (When out is non-empty, release() treats it as success
+                # and the signals are ignored — only an empty walk demotes.)
                 await pool.release(acc.account_id, success=bool(out),
-                                   session_redirected=False)
+                                   session_redirected=redirected,
+                                   proxies_exhausted=exhausted)
             any_ok_overall = any_ok_overall or ok
             if best is None or len(out) > len(best):
                 best = out
@@ -1631,6 +1627,14 @@ class LinkedInScraperService:
         """
         query = query.strip()
         search_page_size = int(os.getenv("LINKEDIN_SEARCH_PAGE_SIZE", "49"))
+
+        # Validate the caller-supplied account exactly like search_jobs: an
+        # unknown id must fall back to the multi-account POOL path, not pin the
+        # whole walk to a nonexistent account (which yields an empty result).
+        available_ids = self._get_available_sessions()
+        if not available_ids:
+            raise RuntimeError("No active LinkedIn sessions found. Please run the login runner first.")
+        account_id = account_id if (account_id and account_id in available_ids) else None
 
         category_map = {
             "all": None,

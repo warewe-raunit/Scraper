@@ -25,7 +25,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -328,37 +327,20 @@ class LinkedInAccountPool:
     # ----------------------------------------------------- env account loader
 
     def _load_accounts_from_env(self) -> None:
-        pattern = re.compile(r"^LINKEDIN_ACCOUNT_\d+$")
+        from api.services.linkedin_env import parse_linkedin_accounts_env
         loaded = 0
-        for key, value in os.environ.items():
-            if not pattern.match(key):
+        for acc in parse_linkedin_accounts_env():
+            account_id = acc["account_id"]
+            if account_id in self._accounts:
                 continue
-            try:
-                parts = value.split("|")
-                if len(parts) < 3 or len(parts) > 4:
-                    continue
-                account_id = parts[0].strip()
-                username = parts[1].strip()
-                password = parts[2].strip()
-                static_proxy = parts[3].strip() if len(parts) == 4 and parts[3].strip() else None
-
-                if "your_username" in username or "your_password" in password:
-                    continue
-
-                if account_id in self._accounts:
-                    continue
-
-                initial_status = self._infer_initial_status(account_id)
-                self._accounts[account_id] = AccountState(
-                    account_id=account_id,
-                    username=username,
-                    password=password,
-                    static_proxy=static_proxy,
-                    status=initial_status,
-                )
-                loaded += 1
-            except Exception as e:
-                logger.error("account_pool.parse_env_failed", key=key, error=str(e))
+            self._accounts[account_id] = AccountState(
+                account_id=account_id,
+                username=acc["username"],
+                password=acc["password"],
+                static_proxy=acc["proxy_url"],
+                status=self._infer_initial_status(account_id),
+            )
+            loaded += 1
 
         # Sort accounts for deterministic ordering
         self._accounts = dict(sorted(self._accounts.items()))
@@ -381,7 +363,7 @@ class LinkedInAccountPool:
         return DEAD
 
     async def warmup(self) -> None:
-        """Trigger reloginss for all accounts that start DEAD.
+        """Trigger relogins for all accounts that start DEAD.
 
         Called at process startup; doesn't block — workers run in background.
         No-op when auto-relogin is disabled (LINKEDIN_AUTO_RELOGIN=false).

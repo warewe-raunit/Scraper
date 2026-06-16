@@ -8,7 +8,7 @@ Mobile fingerprint comes from BROWSER_DEVICE_CATEGORY=mobile in .env.
 Wraps the Reddit-equivalent login in a proxy-swap loop because goodproxies
 rotate randomly and most are dead — on net::ERR_* / timeout, close the
 browser and relaunch with a fresh goodproxy. Up to
-LINKEDIN_LOGIN_PROXY_SWAP_MAX attempts (default 8).
+LINKEDIN_LOGIN_PROXY_SWAP_MAX attempts (default 3).
 """
 
 from __future__ import annotations
