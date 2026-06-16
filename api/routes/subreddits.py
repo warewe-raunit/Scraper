@@ -19,16 +19,23 @@ router = APIRouter(prefix="/subreddit", tags=["Subreddits"])
     summary="Scrape subreddit posts",
     description="Retrieve a listing of posts from a specific subreddit community, with support for sorting, limits, and pagination."
 )
+@router.get(
+    "/r/{subreddit}/posts",
+    include_in_schema=False
+)
 async def get_subreddit_posts(
     subreddit: str,
-    sort: str = Query("hot", regex="^(hot|new|top|rising)$", description="Sort criteria for listings"),
-    time: str = Query("all", regex="^(hour|day|week|month|year|all)$", description="Timeframe filter (only active when sort='top')"),
+    sort: str = Query("hot", pattern="^(hot|new|top|rising)$", description="Sort criteria for listings"),
+    time: str = Query("all", pattern="^(hour|day|week|month|year|all)$", description="Timeframe filter (only active when sort='top')"),
     limit: int = Query(25, ge=1, le=100, description="Max number of posts to return"),
     after: Optional[str] = Query(None, description="Pagination token (after) for the next page"),
     account_id: Optional[str] = Query(None, description="Specify a specific account ID to use. If omitted, rotates available sessions."),
     format: Literal["json", "csv"] = Query("json", description="Output format"),
     scraper: RedditScraperService = Depends(get_reddit_scraper_service)
 ):
+    subreddit = subreddit.strip("/")
+    if subreddit.lower().startswith("r/"):
+        subreddit = subreddit[2:]
     try:
         results = await scraper.scrape_subreddit(subreddit, sort, time, limit, after, account_id=account_id)
         return csv_response(results, "reddit_subreddit_posts") if format == "csv" else results

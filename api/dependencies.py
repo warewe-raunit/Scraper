@@ -11,9 +11,17 @@ import re
 import sys
 import json
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, TYPE_CHECKING
 import structlog
 from curl_cffi import requests
+
+if TYPE_CHECKING:
+    # Imported only for return-type annotations; the runtime imports happen
+    # lazily inside the provider functions to avoid import cycles.
+    from api.services.reddit import RedditScraperService
+    from api.services.youtube import YouTubeScraperService
+    from api.services.x import XScraperService
+    from api.services.linkedin import LinkedInScraperService
 
 # Fix path to import core/tools modules correctly
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,6 +42,11 @@ SESSIONS_DIR = ROOT / "sessions"
 
 # Round-robin counter for rotating account sessions
 _rotation_index = 0
+
+# Per-account stealth profile cache. BrowserProfileManager.generate() is fully
+# deterministic for a given account_id, so caching avoids regenerating the
+# fingerprint on every single request.
+_profile_cache: Dict[str, dict] = {}
 
 def parse_accounts_from_env() -> List[Dict[str, Any]]:
     """Parse all account entries starting with REDDIT_ACCOUNT_ from .env."""
@@ -187,9 +200,11 @@ async def create_stealth_client(account_id: Optional[str] = None) -> requests.Se
         else:
             display_proxy = proxy_url
 
-    # 4. Generate Stealth Profile & Headers
-    profile_mgr = BrowserProfileManager()
-    profile = profile_mgr.generate(selected_account)
+    # 4. Generate Stealth Profile & Headers (cached per account — deterministic)
+    profile = _profile_cache.get(selected_account)
+    if profile is None:
+        profile = BrowserProfileManager().generate(selected_account)
+        _profile_cache[selected_account] = profile
     dynamic_headers = _profile_http_headers(profile)
     
     headers = {
@@ -295,25 +310,41 @@ API_KEY_NAME = "X-API-Key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 api_key_query = APIKeyQuery(name="api_key", auto_error=False)
 
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
 async def verify_api_key(
     header_key: Optional[str] = Security(api_key_header),
     query_key: Optional[str] = Security(api_key_query)
 ) -> str:
     """
-    Validate the incoming request against the configured API_KEY in environment variables.
-    Supports authorization via X-API-Key header or api_key query parameter.
+    Validate the incoming request against the configured API_KEY env var.
+    Supports authorization via the X-API-Key header or api_key query parameter.
+
+    Fail-closed: there is no hardcoded fallback key. If API_KEY is unset, every
+    request is rejected (503) unless auth is *explicitly* disabled via
+    API_AUTH_DISABLED=true — so a misconfigured production deploy never ships
+    with a known, source-visible key.
     """
-    configured_key = os.getenv("API_KEY", "stealth_secret_key_123")
-    
-    # If the key is empty, authentication is disabled/bypassed
-    if not configured_key:
+    if os.getenv("API_AUTH_DISABLED", "false").strip().lower() in _TRUTHY:
         return ""
-        
+
+    configured_key = (os.getenv("API_KEY") or "").strip()
+    if not configured_key:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "API authentication is not configured. Set the API_KEY "
+                "environment variable, or set API_AUTH_DISABLED=true to run "
+                "without authentication (development only)."
+            ),
+        )
+
     if header_key == configured_key:
         return header_key
     if query_key == configured_key:
         return query_key
-        
+
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Invalid or missing API Key. Please provide it in the 'X-API-Key' header or 'api_key' query parameter."

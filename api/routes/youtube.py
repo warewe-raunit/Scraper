@@ -54,10 +54,10 @@ def format_export_response(data: dict, export_type: str, requested_format: str, 
 )
 async def search_youtube(
     q: str = Query(..., description="The search query keyword"),
-    sort: str = Query("relevance", regex="^(relevance|date|views|rating)$", description="Criteria to sort search results"),
-    time: str = Query("all", regex="^(hour|day|week|month|year|all)$", description="Timeframe filter for search results"),
+    sort: str = Query("relevance", pattern="^(relevance|date|views|rating)$", description="Criteria to sort search results"),
+    time: str = Query("all", pattern="^(hour|day|week|month|year|all)$", description="Timeframe filter for search results"),
     limit: int = Query(20, ge=1, le=500, description="Max number of search results to return"),
-    format: str = Query("json", regex="^(json|csv|excel|html)$", description="Output format for search results"),
+    format: str = Query("json", pattern="^(json|csv|excel|html)$", description="Output format for search results"),
     scraper: YouTubeScraperService = Depends(get_youtube_scraper_service)
 ):
     try:
@@ -82,7 +82,7 @@ async def get_video_details(
     video_id: Optional[str] = Query(None, description="11-character YouTube video ID"),
     limit: int = Query(20, ge=0, le=500, description="Max number of comments to return"),
     include_raw: bool = Query(False, description="Whether to include raw InnerTube API payloads for debugging or offline download"),
-    format: str = Query("json", regex="^(json|csv|excel|html|raw)$", description="Output format for details"),
+    format: str = Query("json", pattern="^(json|csv|excel|html|raw)$", description="Output format for details"),
     scraper: YouTubeScraperService = Depends(get_youtube_scraper_service)
 ):
     if not url and not video_id:
@@ -112,8 +112,8 @@ async def get_video_details(
 )
 async def get_channel_videos(
     channel_id: str,
-    type: str = Query("videos", regex="^(videos|live)$", description="Select either 'videos' or 'live' streams"),
-    format: str = Query("json", regex="^(json|csv|excel|html)$", description="Output format for video list"),
+    type: str = Query("videos", pattern="^(videos|live)$", description="Select either 'videos' or 'live' streams"),
+    format: str = Query("json", pattern="^(json|csv|excel|html)$", description="Output format for video list"),
     scraper: YouTubeScraperService = Depends(get_youtube_scraper_service)
 ):
     try:
@@ -135,7 +135,7 @@ async def get_channel_videos(
 )
 async def get_playlist(
     playlist_id: str,
-    format: str = Query("json", regex="^(json|csv|excel|html)$", description="Output format for video list"),
+    format: str = Query("json", pattern="^(json|csv|excel|html)$", description="Output format for video list"),
     scraper: YouTubeScraperService = Depends(get_youtube_scraper_service)
 ):
     try:
@@ -189,9 +189,9 @@ async def download_youtube_video(
     background_tasks: BackgroundTasks,
     url: Optional[str] = Query(None, description="Full YouTube video URL"),
     video_id: Optional[str] = Query(None, description="11-character YouTube video ID"),
-    resolution: str = Query("360p", regex="^(144p|240p|360p|480p|720p|1080p|1440p|2160p)$", description="Target video resolution"),
+    resolution: str = Query("360p", pattern="^(144p|240p|360p|480p|720p|1080p|1440p|2160p)$", description="Target video resolution"),
     stream_from_server: bool = Query(False, description="Legacy file mode. If True, the backend downloads a temporary MP4 before returning it."),
-    format: str = Query("stream", regex="^(stream|json|html|redirect|file)$", description="Response format: 'stream' (default) downloads in Swagger without saving a backend file, 'json' returns URL metadata, 'html' shows a page, 'redirect' redirects the browser, 'file' downloads a temporary backend file first."),
+    format: str = Query("stream", pattern="^(stream|json|html|redirect|file)$", description="Response format: 'stream' (default) downloads in Swagger without saving a backend file, 'json' returns URL metadata, 'html' shows a page, 'redirect' redirects the browser, 'file' downloads a temporary backend file first."),
     scraper: YouTubeScraperService = Depends(get_youtube_scraper_service)
 ):
     if not url and not video_id:

@@ -8,13 +8,9 @@ from __future__ import annotations
 import os
 import re
 import sys
-import time
-import json
-import csv
-import io
 import asyncio
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Union
+from typing import Optional, Dict, Any, List
 from urllib.parse import urlparse, parse_qs
 import structlog
 from curl_cffi import requests
@@ -24,74 +20,24 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from api.dependencies import parse_accounts_from_env
-from tools.proxy_provider import get_proxy_provider
-from tools.browser_manager import launch_browser, close_browser
-from tools.rotation import CooldownPool
+from tools.browser_manager import launch_browser
+from api.services.proxy_base import ProxyRotatingService
+from api import config
 
 logger = structlog.get_logger(__name__)
 
-class YouTubeScraperService:
+class YouTubeScraperService(ProxyRotatingService):
+    # InnerTube calls are HTTPS; the per-account .env fallback pool isn't
+    # healthchecked, so prefer SOCKS there (it tunnels HTTPS without relying on
+    # HTTP-proxy CONNECT support). The global GoodProxies pool is already
+    # HTTPS-probed, so when it's enabled it's used as-is.
+    prefer_socks = True
+
     def __init__(self, db: Optional[Any] = None):
-        self.db = db
+        super().__init__(db, pool_label="youtube_proxy")
         self._api_key: Optional[str] = None
         self._api_key_lock = asyncio.Lock()
-
-        # Proxy rotation + cooldown is delegated to the shared CooldownPool so
-        # the X and YouTube services use one identical implementation.
-        accounts = parse_accounts_from_env()
-        raw_proxies = [acc["proxy_url"] for acc in accounts if acc.get("proxy_url")]
-        self.proxy_pool = CooldownPool(raw_proxies, label="youtube_proxy", default_cooldown=300)
-
         logger.info("youtube_scraper_service_initialized", proxy_count=len(self.proxy_pool))
-
-    @property
-    def proxies(self) -> List[str]:
-        return self.proxy_pool.items
-
-    @proxies.setter
-    def proxies(self, val: List[str]):
-        # Preserves existing cooldowns for surviving proxies (handled by the pool).
-        self.proxy_pool.set_items(val)
-
-    def _get_next_proxy(self) -> Optional[str]:
-        """Next healthy proxy (round-robin), or shortest-cooldown fallback.
-
-        When the global GoodProxies provider is enabled, proxies come from the
-        rotating good-proxies.ru pool; otherwise we use the per-account pool
-        built from .env (original behavior).
-
-        InnerTube calls are HTTPS, which needs a working CONNECT tunnel. The
-        global pool is pre-verified with an HTTPS liveness probe
-        (GOODPROXIES_HEALTHCHECK_URL, default https://…/generate_204), so every
-        proxy in it has ALREADY proven it can tunnel HTTPS — we just take the
-        next one. (Older code preferred SOCKS here because raw HTTP lists often
-        can't CONNECT; the healthcheck makes that filter unnecessary, and it was
-        starving YouTube once socks5 was dropped from the pool.) The unverified
-        per-account .env fallback keeps the SOCKS preference, since those proxies
-        aren't probed for HTTPS-CONNECT support.
-        """
-        provider = get_proxy_provider()
-        if provider.is_enabled():
-            p = provider.get_next()
-            if p:
-                return p
-
-        # Per-account .env pool isn't healthchecked → prefer SOCKS, which tunnel
-        # HTTPS without relying on HTTP-proxy CONNECT support.
-        socks_candidates = [p for p in self.proxy_pool.items if p.startswith(("socks5://", "socks4://", "socks5h://"))]
-        if socks_candidates:
-            p = self.proxy_pool.get_next(candidates=socks_candidates)
-            if p:
-                return p
-        return self.proxy_pool.get_next()
-
-    def _cool_down_proxy(self, proxy: str, duration_seconds: int = 300):
-        """Put a proxy on cooldown (e.g. on connection errors or 503 response code)."""
-        provider = get_proxy_provider()
-        if provider.is_enabled():
-            provider.cool_down(proxy, duration_seconds)
-        self.proxy_pool.cool_down(proxy, duration_seconds)
 
     async def _get_innertube_key(self, max_retries: int = 2) -> str:
         """
@@ -120,13 +66,13 @@ class YouTubeScraperService:
                         session.proxies = {"http": proxy, "https": proxy}
                     
                     headers = {
-                        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                        "user-agent": config.YOUTUBE_DEFAULT_USER_AGENT,
                         "accept-language": "en-US,en;q=0.9",
                     }
-                    
+
                     response = await loop.run_in_executor(
                         None,
-                        lambda: session.get("https://www.youtube.com/", headers=headers, impersonate="chrome120", timeout=10)
+                        lambda: session.get("https://www.youtube.com/", headers=headers, impersonate=config.HTTP_IMPERSONATE, timeout=config.YOUTUBE_KEY_REQUEST_TIMEOUT)
                     )
                     
                     if response.status_code == 200:
@@ -137,11 +83,11 @@ class YouTubeScraperService:
                             return self._api_key
                     else:
                         if proxy:
-                            self._cool_down_proxy(proxy, duration_seconds=300)
+                            self._cool_down_proxy(proxy, duration_seconds=config.YOUTUBE_PROXY_COOLDOWN_SECONDS)
                         logger.warn("http_innertube_key_extraction_non_200", status=response.status_code, attempt=attempt)
                 except Exception as e:
                     if proxy:
-                        self._cool_down_proxy(proxy, duration_seconds=300)
+                        self._cool_down_proxy(proxy, duration_seconds=config.YOUTUBE_PROXY_COOLDOWN_SECONDS)
                     logger.warn("http_innertube_key_extraction_failed", attempt=attempt, error=str(e))
                     if attempt < max_key_retries:
                         await asyncio.sleep(0.5)
@@ -175,9 +121,9 @@ class YouTubeScraperService:
             except Exception as e:
                 logger.warn("playwright_innertube_key_extraction_failed", error=str(e))
 
-            # Method 3: Hardcoded fallback
-            fallback_key = "AIzaSyAO_JVG4aDXa7KM4V0F4lQcMBa6W4Wl8wg"
-            logger.warn("using_hardcoded_fallback_innertube_key", key=fallback_key[:10] + "...")
+            # Method 3: Last-resort public key (overridable via env).
+            fallback_key = config.YOUTUBE_FALLBACK_INNERTUBE_KEY
+            logger.warn("using_fallback_innertube_key", key=fallback_key[:10] + "...")
             self._api_key = fallback_key
             return fallback_key
 
@@ -187,7 +133,7 @@ class YouTubeScraperService:
             return {
                 "client": {
                     "clientName": "ANDROID",
-                    "clientVersion": "19.01.35",
+                    "clientVersion": config.YOUTUBE_ANDROID_CLIENT_VERSION,
                     "hl": "en",
                     "gl": "US",
                     "platform": "MOBILE",
@@ -195,11 +141,11 @@ class YouTubeScraperService:
                 }
             }
         else:
-            ua = user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            ua = user_agent or config.YOUTUBE_DEFAULT_USER_AGENT
             return {
                 "client": {
                     "clientName": "WEB",
-                    "clientVersion": "2.20240101.01.00",
+                    "clientVersion": config.YOUTUBE_WEB_CLIENT_VERSION,
                     "hl": "en",
                     "gl": "US",
                     "userAgent": ua,
@@ -519,7 +465,7 @@ class YouTubeScraperService:
                 
         return url_or_id
 
-    async def _execute_post(self, endpoint: str, payload: dict, max_retries: int = 8) -> dict:
+    async def _execute_post(self, endpoint: str, payload: dict, max_retries: int = config.YOUTUBE_MAX_RETRIES) -> dict:
         """Execute a POST request to an InnerTube endpoint with rotated proxies and retries.
 
         Robust bounded retry: enough attempts (with growing backoff) to span at
@@ -551,18 +497,18 @@ class YouTubeScraperService:
                 # Check status and response
                 response = await loop.run_in_executor(
                     None,
-                    lambda: session.post(url, json=payload, headers=headers, impersonate="chrome120", timeout=15)
+                    lambda: session.post(url, json=payload, headers=headers, impersonate=config.HTTP_IMPERSONATE, timeout=config.YOUTUBE_REQUEST_TIMEOUT)
                 )
-                
+
                 if response.status_code == 200:
                     return response.json()
-                
+
                 raise RuntimeError(f"InnerTube POST request failed with status {response.status_code}: {response.text[:200]}")
             except Exception as e:
                 last_exception = e
                 # Flag the proxy as bad and put it on cooldown for 5 minutes
                 if proxy:
-                    self._cool_down_proxy(proxy, duration_seconds=300)
+                    self._cool_down_proxy(proxy, duration_seconds=config.YOUTUBE_PROXY_COOLDOWN_SECONDS)
                     
                 logger.warn(
                     "innertube_post_attempt_failed",
@@ -668,36 +614,48 @@ class YouTubeScraperService:
     async def get_video_details(self, url_or_id: str, comments_limit: int = 20, include_raw: bool = False) -> Dict[str, Any]:
         """Retrieve video details, stream formats, and comments using player and next APIs."""
         video_id = self.extract_video_id(url_or_id)
-        
-        # 1. Fetch details via /youtubei/v1/player
-        # Use WEB client context to avoid Precondition Check/Attestation errors on Android client
+
+        # Fetch player (details/streams) and next (description/likes/comments
+        # token) concurrently — they are independent InnerTube calls, so running
+        # them in parallel roughly halves the base latency. Use WEB client
+        # context to avoid Precondition Check/Attestation errors on Android.
         player_payload = {
             "context": self._get_client_context("WEB"),
             "videoId": video_id
         }
-        player_data = await self._execute_post("player", player_payload)
-        
-        # Verify playability
-        playability = player_data.get("playabilityStatus", {})
-        playability_status = playability.get("status", "OK")
-        playability_reason = playability.get("reason", "unknown")
-        
-        if playability_status != "OK":
-            logger.warn("video_playability_warning", video_id=video_id, status=playability_status, reason=playability_reason)
-            
-        details = player_data.get("videoDetails", {}) or {}
-        streaming = player_data.get("streamingData", {}) or {}
-        
-        # 2. Fetch full description, likes, and comments token via /youtubei/v1/next
         next_payload = {
             "context": self._get_client_context("WEB"),
             "videoId": video_id
         }
-        next_data = {}
-        try:
-            next_data = await self._execute_post("next", next_payload)
-        except Exception as e:
-            logger.warn("next_endpoint_failed", video_id=video_id, error=str(e))
+        player_result, next_result = await asyncio.gather(
+            self._execute_post("player", player_payload),
+            self._execute_post("next", next_payload),
+            return_exceptions=True,
+        )
+
+        # player is required: propagate its failure exactly as the serial path did.
+        if isinstance(player_result, BaseException):
+            raise player_result
+        player_data = player_result
+
+        # next is best-effort: a failure degrades gracefully to empty (was a
+        # try/except around the serial call).
+        next_data: dict = {}
+        if isinstance(next_result, BaseException):
+            logger.warn("next_endpoint_failed", video_id=video_id, error=str(next_result))
+        else:
+            next_data = next_result
+
+        # Verify playability
+        playability = player_data.get("playabilityStatus", {})
+        playability_status = playability.get("status", "OK")
+        playability_reason = playability.get("reason", "unknown")
+
+        if playability_status != "OK":
+            logger.warn("video_playability_warning", video_id=video_id, status=playability_status, reason=playability_reason)
+
+        details = player_data.get("videoDetails", {}) or {}
+        streaming = player_data.get("streamingData", {}) or {}
             
         # Parse title with fallback to next_data
         title = details.get("title", "")
@@ -1064,7 +1022,7 @@ class YouTubeScraperService:
             }
         except Exception as e:
             if proxy:
-                self._cool_down_proxy(proxy, duration_seconds=300)
+                self._cool_down_proxy(proxy, duration_seconds=config.YOUTUBE_PROXY_COOLDOWN_SECONDS)
             logger.error("youtube_direct_url_extraction_failed", video_id=video_id, error=str(e))
             raise RuntimeError(f"Failed to extract direct download URL: {e}")
 
@@ -1137,7 +1095,7 @@ class YouTubeScraperService:
                             break
                             
                 if not actual_file or not os.path.exists(actual_file):
-                    raise FileNotFoundError(f"yt-dlp completed download but the expected file was not found on disk.")
+                    raise FileNotFoundError("yt-dlp completed download but the expected file was not found on disk.")
                     
                 logger.info("youtube_video_download_completed", video_id=video_id, file_path=actual_file, file_size=os.path.getsize(actual_file))
                 return actual_file
@@ -1146,7 +1104,7 @@ class YouTubeScraperService:
                 last_exception = e
                 # Flag the proxy as bad and put it on cooldown
                 if proxy:
-                    self._cool_down_proxy(proxy, duration_seconds=300)
+                    self._cool_down_proxy(proxy, duration_seconds=config.YOUTUBE_PROXY_COOLDOWN_SECONDS)
                 logger.warn("youtube_video_download_attempt_failed", video_id=video_id, resolution=resolution, attempt=attempt, error=str(e))
                 if attempt < max_retries:
                     await asyncio.sleep(1)

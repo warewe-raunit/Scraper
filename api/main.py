@@ -5,6 +5,7 @@ Configures structured logging, routes, error handling, and documentation.
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -71,14 +72,13 @@ async def lifespan(app: FastAPI):
     # Dispatched as a task so server startup isn't blocked by the probes; the
     # pool also self-heals on real-request signals while this runs. If
     # LINKEDIN_HEALTH_CHECK_INTERVAL > 0, the sweep repeats on that interval.
-    import os as _os
-    if _os.getenv("LINKEDIN_VALIDATE_ON_STARTUP", "true").lower() in ("1", "true", "yes", "on"):
+    if os.getenv("LINKEDIN_VALIDATE_ON_STARTUP", "true").lower() in ("1", "true", "yes", "on"):
         async def _account_health_sweep():
             try:
                 from api.services.linkedin import LinkedInScraperService
                 svc = LinkedInScraperService()
                 await svc.validate_all_accounts()
-                interval = int(_os.getenv("LINKEDIN_HEALTH_CHECK_INTERVAL", "0"))
+                interval = int(os.getenv("LINKEDIN_HEALTH_CHECK_INTERVAL", "0"))
                 while interval > 0:
                     await asyncio.sleep(interval)
                     await svc.validate_all_accounts()
@@ -86,6 +86,21 @@ async def lifespan(app: FastAPI):
                 logger.warning("linkedin_account_health_sweep_failed", error=str(e))
         asyncio.create_task(_account_health_sweep())
         logger.info("linkedin_account_health_sweep_dispatched")
+
+    # Warm the YouTube InnerTube API key in the background so the FIRST video
+    # request doesn't pay the (potentially Playwright-backed) key-extraction
+    # cost inline. Non-blocking; falls back to lazy extraction if it fails.
+    if os.getenv("YOUTUBE_WARMUP_ON_STARTUP", "true").lower() in ("1", "true", "yes", "on"):
+        async def _warm_youtube_key():
+            try:
+                from api.dependencies import get_youtube_scraper_service, get_database_service
+                svc = get_youtube_scraper_service(get_database_service())
+                await svc._get_innertube_key()
+                logger.info("youtube_innertube_key_warmed")
+            except Exception as e:
+                logger.warning("youtube_key_warmup_failed", error=str(e))
+        asyncio.create_task(_warm_youtube_key())
+        logger.info("youtube_key_warmup_dispatched")
 
     yield
 
@@ -112,10 +127,22 @@ app = FastAPI(
 )
 
 # 3. Add CORS Middleware
+# Origins are configurable via CORS_ALLOW_ORIGINS (comma-separated). The default
+# "*" stays permissive for ease of integration, but credentials are only allowed
+# when an explicit origin list is configured — the CORS spec forbids combining
+# allow_origins="*" with allow_credentials=True (browsers reject it outright).
+def _parse_cors_origins() -> list[str]:
+    raw = (os.getenv("CORS_ALLOW_ORIGINS") or "*").strip()
+    if not raw:
+        return []
+    return [o.strip() for o in raw.split(",") if o.strip()]
+
+_cors_origins = _parse_cors_origins()
+_cors_allow_all = "*" in _cors_origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=["*"] if _cors_allow_all else _cors_origins,
+    allow_credentials=not _cors_allow_all,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -203,7 +230,7 @@ if __name__ == "__main__":
         # It's the 3.8+ default, but pin it explicitly via the non-deprecated
         # API (ProactorEventLoop + set_event_loop) so we don't rely on the
         # default and don't touch the deprecated event-loop *policy* API.
-        config = uvicorn.Config("api.main:app", host="127.0.0.1", port=8000, reload=False, loop="asyncio")
+        config = uvicorn.Config("api.main:app", host="127.0.0.1", port=8000, reload=True, loop="asyncio")
         server = uvicorn.Server(config)
         loop = asyncio.ProactorEventLoop()
         try:

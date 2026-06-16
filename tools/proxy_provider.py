@@ -33,7 +33,7 @@ from __future__ import annotations
 import os
 import time
 import threading
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import structlog
 from curl_cffi import requests as cffi_requests
@@ -72,6 +72,17 @@ class GoodProxiesProvider:
         # Continuous-health daemon state
         self._stop_health = threading.Event()
         self._health_thread: Optional[threading.Thread] = None
+        # Per-proxy consecutive re-verify failure counter. A proxy is only
+        # evicted after `reverify_fail_threshold` CONSECUTIVE misses, so a single
+        # transient blip doesn't drain a small pool (this is what makes the pool
+        # persist instead of oscillating near-empty).
+        self._reverify_strikes: Dict[str, int] = {}
+        # Per-proxy grace counter: a freshly-admitted (already-healthchecked)
+        # proxy is immune from re-verify eviction for this many enrich cycles, so
+        # one flaky re-probe right after admission can't churn it straight back
+        # out. This is what lets the pool ACCUMULATE instead of oscillating near
+        # empty when probes are noisy.
+        self._grace: Dict[str, int] = {}
         if self.is_enabled():
             if self.continuous_health:
                 self.start_health_loop()
@@ -140,6 +151,26 @@ class GoodProxiesProvider:
         # Re-verify existing pool members each tick so a proxy that died since
         # admission is evicted before a request ever picks it.
         self.reverify_enabled = _env_bool("GOODPROXIES_REVERIFY", True)
+        # Tolerance: how many CONSECUTIVE failed re-probes before a proxy is
+        # evicted. >1 keeps flaky-but-usable proxies through transient blips so
+        # the pool persists instead of draining to empty on one bad probe wave.
+        self.reverify_fail_threshold = max(
+            1, int(os.getenv("GOODPROXIES_REVERIFY_FAILS") or "2")
+        )
+        # Grace cycles for a freshly-admitted proxy before it is eligible for
+        # re-verify eviction. >0 lets newly added proxies persist through a noisy
+        # probe wave right after admission (set to 0 to disable).
+        self.reverify_grace_cycles = max(
+            0, int(os.getenv("GOODPROXIES_REVERIFY_GRACE_CYCLES") or "1")
+        )
+        # Floor: only run the (expensive) top-up fetch+healthcheck when the live
+        # pool drops BELOW this. While at/above the floor the daemon just gently
+        # re-verifies what it holds — so a healthy pool PERSISTS instead of
+        # refetching every tick chasing an unreachable target_live. Capped to
+        # target_live (a floor above the ceiling makes no sense).
+        self.min_live = max(
+            1, min(int(os.getenv("GOODPROXIES_MIN_LIVE") or "8"), self.target_live)
+        )
 
     def is_enabled(self) -> bool:
         """True only when explicitly enabled AND a key is configured."""
@@ -267,17 +298,21 @@ class GoodProxiesProvider:
         except Exception:
             return False
 
+    def _probe_all(self, urls: List[str]) -> Dict[str, bool]:
+        """Concurrently probe every proxy; return {url: alive?} preserving order."""
+        from concurrent.futures import ThreadPoolExecutor
+        if not urls:
+            return {}
+        workers = max(1, min(self.healthcheck_workers, len(urls)))
+        results: Dict[str, bool] = {}
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for url, ok in ex.map(lambda u: (u, self._probe_one(u)), urls):
+                results[url] = ok
+        return results
+
     def _filter_live(self, urls: List[str]) -> List[str]:
         """Concurrently probe proxies; return only those that respond."""
-        from concurrent.futures import ThreadPoolExecutor
-        workers = max(1, min(self.healthcheck_workers, len(urls)))
-        live: List[str] = []
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            results = ex.map(lambda u: (u, self._probe_one(u)), urls)
-            for url, ok in results:
-                if ok:
-                    live.append(url)
-        return live
+        return [u for u, ok in self._probe_all(urls).items() if ok]
 
     # ------------------------------------------------- continuous health daemon
     def start_health_loop(self) -> None:
@@ -314,21 +349,49 @@ class GoodProxiesProvider:
             self._stop_health.wait(self.enrich_interval)
 
     def _enrich_once(self) -> None:
-        """One health pass: re-verify current pool, top up to target with fresh
-        live proxies. All proxies in the pool after this are confirmed live.
+        """One health pass that makes the pool PERSIST:
+
+        1. Re-verify current members *tolerantly* — a proxy is only evicted after
+           `reverify_fail_threshold` consecutive failed probes, so a single flaky
+           wave doesn't drain a small pool.
+        2. Only when the live count drops BELOW `min_live` do we run the
+           expensive top-up fetch+healthcheck (filling toward `target_live`).
+           While at/above the floor we keep what we hold and refetch nothing.
         """
-        # 1. Re-verify what we already hold; evict any that died since admission.
+        # 1. Tolerant re-verification (with grace for freshly-admitted proxies).
         current = self.pool.items
+        graced_count = 0
         if current and self.reverify_enabled:
-            live_now = self._filter_live(current)
+            # Proxies still inside their grace window are kept WITHOUT probing,
+            # so a flaky probe immediately after admission can't evict them.
+            to_probe = [p for p in current if self._grace.get(p, 0) <= 0]
+            probed = self._probe_all(to_probe) if to_probe else {}
+            live_now: List[str] = []
+            for p in current:
+                grace_left = self._grace.get(p, 0)
+                if grace_left > 0:
+                    self._grace[p] = grace_left - 1
+                    live_now.append(p)  # immune this cycle
+                    graced_count += 1
+                elif probed.get(p):
+                    self._reverify_strikes.pop(p, None)
+                    live_now.append(p)
+                else:
+                    strikes = self._reverify_strikes.get(p, 0) + 1
+                    if strikes < self.reverify_fail_threshold:
+                        self._reverify_strikes[p] = strikes
+                        live_now.append(p)  # within tolerance — keep it
+                    else:
+                        self._reverify_strikes.pop(p, None)  # confirmed dead — evict
         else:
             live_now = list(current)
         live_set = set(live_now)
 
-        # 2. Below target → fetch fresh candidates and healthcheck them.
+        # 2. Floor-gated top-up: refetch only when genuinely short of proxies.
+        do_topup = len(live_set) < self.min_live
         fresh_live: List[str] = []
-        need = self.target_live - len(live_set)
-        if need > 0:
+        if do_topup:
+            need = self.target_live - len(live_set)
             try:
                 raw = self._fetch_raw()
             except Exception as e:
@@ -336,15 +399,27 @@ class GoodProxiesProvider:
                 raw = []
             candidates = [p for p in raw if p not in live_set]
             if candidates:
-                fresh_live = self._filter_live(candidates)
+                fresh_live = self._filter_live(candidates)[: max(0, need)]
 
-        merged = live_now + [p for p in fresh_live if p not in live_set]
+        newly_added = [p for p in fresh_live if p not in live_set]
+        merged = live_now + newly_added
         # set_items preserves cooldowns of survivors and drops evicted ones.
         self.pool.set_items(merged)
+        # Grant freshly-admitted proxies their grace window so they persist
+        # through the next probe wave instead of churning straight back out.
+        for p in newly_added:
+            self._grace[p] = self.reverify_grace_cycles
+        # Forget strike/grace records for proxies no longer tracked.
+        merged_set = set(merged)
+        self._reverify_strikes = {
+            p: s for p, s in self._reverify_strikes.items() if p in merged_set
+        }
+        self._grace = {p: g for p, g in self._grace.items() if p in merged_set}
         self._last_fetch = time.time()
         logger.info("proxy_pool_enriched",
-                    live=len(merged), target=self.target_live,
-                    reverified=len(live_now), added=len(merged) - len(live_now))
+                    live=len(merged), target=self.target_live, min_live=self.min_live,
+                    reverified=len(live_now), added=len(newly_added),
+                    graced=graced_count, topped_up=do_topup)
 
     def refresh(self, force: bool = False) -> None:
         """Refresh the pool if the interval has elapsed (or force=True) in a background thread.

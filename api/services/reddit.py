@@ -11,7 +11,7 @@ import time
 import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Union
+from typing import Optional, Dict, Any, List
 from urllib.parse import urlparse
 import structlog
 from curl_cffi import requests
@@ -23,6 +23,7 @@ if str(ROOT) not in sys.path:
 
 from api.dependencies import create_stealth_client
 from api.services.registry import AccountRegistry
+from api import config
 
 logger = structlog.get_logger(__name__)
 
@@ -36,7 +37,7 @@ class RedditScraperService:
         url: str,
         params: Optional[Dict[str, Any]] = None,
         requested_account_id: Optional[str] = None,
-        max_retries: int = 8
+        max_retries: int = config.REDDIT_MAX_RETRIES
     ) -> Dict[str, Any]:
         """
         Execute a GET request with structured failover, cooldowns, and re-login retries.
@@ -50,8 +51,8 @@ class RedditScraperService:
         receives output.
         """
         current_account_id = requested_account_id
-        backoff_base = 2.0
-        backoff_cap = 12.0
+        backoff_base = config.REDDIT_BACKOFF_BASE
+        backoff_cap = config.REDDIT_BACKOFF_CAP
 
         for attempt in range(1, max_retries + 1):
             if attempt > 1:
@@ -83,7 +84,7 @@ class RedditScraperService:
             except Exception as e:
                 logger.error("failed_to_initialize_client", account_id=account_id, error=str(e))
                 # Put account in temporary cooldown and try another
-                self.registry.cool_down_account(account_id, duration_seconds=60)
+                self.registry.cool_down_account(account_id, duration_seconds=config.REDDIT_TRANSIENT_COOLDOWN_SECONDS)
                 current_account_id = None
                 continue
 
@@ -102,7 +103,7 @@ class RedditScraperService:
                 loop = asyncio.get_running_loop()
                 response = await loop.run_in_executor(
                     None,
-                    lambda: session.get(url, params=params, impersonate="chrome120", timeout=15)
+                    lambda: session.get(url, params=params, impersonate=config.HTTP_IMPERSONATE, timeout=config.REDDIT_REQUEST_TIMEOUT)
                 )
                 
                 log.info("reddit_api_response_received", status_code=response.status_code)
@@ -145,7 +146,7 @@ class RedditScraperService:
                 if response.status_code == 429:
                     log.warn("rate_limit_encountered", response_text=response.text[:200])
                     rl_reset = response.headers.get("x-ratelimit-reset")
-                    cooldown_seconds = 600 # Default to 10 minutes (600s) if reset header missing
+                    cooldown_seconds = config.REDDIT_BLOCK_COOLDOWN_SECONDS # if reset header missing
                     if rl_reset:
                         try:
                             cooldown_seconds = int(float(rl_reset))
@@ -159,7 +160,7 @@ class RedditScraperService:
                 if response.status_code == 403:
                     log.warn("access_forbidden_ip_flagged", response_text=response.text[:200])
                     rl_reset = response.headers.get("x-ratelimit-reset")
-                    cooldown_seconds = 600 # Default to 10 minutes if reset header missing
+                    cooldown_seconds = config.REDDIT_BLOCK_COOLDOWN_SECONDS # if reset header missing
                     if rl_reset:
                         try:
                             cooldown_seconds = int(float(rl_reset))
@@ -172,7 +173,7 @@ class RedditScraperService:
                 # Case E: Other Status Errors
                 log.error("unhandled_error_status", status_code=response.status_code, text=response.text[:200])
                 try_update_limits(response)
-                self.registry.cool_down_account(account_id, duration_seconds=60) # Cooldown briefly
+                self.registry.cool_down_account(account_id, duration_seconds=config.REDDIT_TRANSIENT_COOLDOWN_SECONDS) # Cooldown briefly
                 current_account_id = None
                 continue
 
@@ -185,12 +186,12 @@ class RedditScraperService:
                         _prov.cool_down(session.proxy_url)
                 except Exception:
                     pass
-                self.registry.cool_down_account(account_id, duration_seconds=180) # 3 min cooldown
+                self.registry.cool_down_account(account_id, duration_seconds=config.REDDIT_NETWORK_COOLDOWN_SECONDS)
                 current_account_id = None
                 continue
             except Exception as e:
                 log.error("unexpected_request_exception", error=str(e))
-                self.registry.cool_down_account(account_id, duration_seconds=60)
+                self.registry.cool_down_account(account_id, duration_seconds=config.REDDIT_TRANSIENT_COOLDOWN_SECONDS)
                 current_account_id = None
                 continue
         
@@ -328,6 +329,11 @@ class RedditScraperService:
         account_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """Scrape subreddit posts list."""
+        if subreddit:
+            subreddit = subreddit.strip("/")
+            if subreddit.lower().startswith("r/"):
+                subreddit = subreddit[2:]
+
         valid_sorts = {"hot", "new", "top", "rising"}
         if sort not in valid_sorts:
             sort = "hot"
@@ -431,6 +437,11 @@ class RedditScraperService:
         account_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """Search posts by keyword (globally or within a specific subreddit)."""
+        if subreddit:
+            subreddit = subreddit.strip("/")
+            if subreddit.lower().startswith("r/"):
+                subreddit = subreddit[2:]
+
         valid_sorts = {"relevance", "hot", "top", "new", "comments"}
         if sort not in valid_sorts:
             sort = "relevance"

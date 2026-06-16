@@ -22,8 +22,8 @@ router = APIRouter(prefix="/posts", tags=["Posts"])
 async def search_posts(
     q: str = Query(..., description="The search keyword or query string"),
     subreddit: Optional[str] = Query(None, description="Optional subreddit to restrict the search within"),
-    sort: str = Query("relevance", regex="^(relevance|hot|top|new|comments)$", description="Sort criteria for search results"),
-    time: str = Query("all", regex="^(hour|day|week|month|year|all)$", description="Timeframe filter for top/relevance results"),
+    sort: str = Query("relevance", pattern="^(relevance|hot|top|new|comments)$", description="Sort criteria for search results"),
+    time: str = Query("all", pattern="^(hour|day|week|month|year|all)$", description="Timeframe filter for top/relevance results"),
     limit: int = Query(25, ge=1, le=100, description="Max number of search results to return"),
     after: Optional[str] = Query(None, description="Pagination token (after) for the next page"),
     account_id: Optional[str] = Query(None, description="Specify a specific account ID to use. If omitted, rotates available sessions."),

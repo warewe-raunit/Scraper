@@ -59,7 +59,7 @@ def extract_post_id(url_or_id: str) -> str:
 )
 async def get_post_comments(
     url: str = Query(..., description="The full Reddit post URL or direct post ID"),
-    sort: str = Query("confidence", regex="^(confidence|top|new|controversial|old|random|qa)$", description="Comment sorting criteria"),
+    sort: str = Query("confidence", pattern="^(confidence|top|new|controversial|old|random|qa)$", description="Comment sorting criteria"),
     depth: Optional[int] = Query(None, ge=1, le=10, description="Max depth of comment replies tree to fetch"),
     limit: int = Query(100, ge=1, le=500, description="Max number of comments to return"),
     account_id: Optional[str] = Query(None, description="Specify a specific account ID to use. If omitted, rotates available sessions."),

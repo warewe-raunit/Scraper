@@ -5,9 +5,8 @@ api/services/x.py — Service layer for the unauthenticated X (Twitter) Scraper.
 from __future__ import annotations
 
 import sys
-import time
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 import structlog
 
 # Ensure workspace root is in path
@@ -16,32 +15,16 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tools.unauth_x_scraper import scrape_profile, scrape_search
-from tools.rotation import CooldownPool
 from tools.retry_policy import AttemptOutcome, RetryPolicy, robust_retry
-from api.dependencies import parse_accounts_from_env
 from tools.proxy_provider import get_proxy_provider
+from api.services.proxy_base import ProxyRotatingService
 
 logger = structlog.get_logger(__name__)
 
-class XScraperService:
+class XScraperService(ProxyRotatingService):
     def __init__(self, db: Optional[Any] = None):
-        self.db = db
-        # Proxy rotation + cooldown is delegated to the shared CooldownPool so
-        # the X and YouTube services use one identical implementation.
-        accounts = parse_accounts_from_env()
-        raw_proxies = [acc["proxy_url"] for acc in accounts if acc.get("proxy_url")]
-        self.proxy_pool = CooldownPool(raw_proxies, label="x_proxy", default_cooldown=300)
-
+        super().__init__(db, pool_label="x_proxy")
         logger.info("x_scraper_service_initialized", proxy_count=len(self.proxy_pool))
-
-    @property
-    def proxies(self) -> List[str]:
-        return self.proxy_pool.items
-
-    @proxies.setter
-    def proxies(self, val: List[str]):
-        # Preserves existing cooldowns for surviving proxies (handled by the pool).
-        self.proxy_pool.set_items(val)
 
     def _available_proxy_count(self) -> int:
         """How many proxies we can realistically try this call."""
@@ -50,20 +33,6 @@ class XScraperService:
             provider.refresh()
             return max(len(provider.pool), len(self.proxies), 3)
         return len(self.proxies)
-
-    def _get_next_proxy(self) -> Optional[str]:
-        """Next healthy proxy (round-robin), or shortest-cooldown fallback.
-
-        When the global GoodProxies provider is enabled, proxies come from the
-        rotating good-proxies.ru pool; otherwise we use the per-account pool
-        built from .env (original behavior).
-        """
-        provider = get_proxy_provider()
-        if provider.is_enabled():
-            p = provider.get_next()
-            if p:
-                return p
-        return self.proxy_pool.get_next()
 
     def _retry_policy(self, label: str, *, pinned: bool) -> RetryPolicy:
         """Build the bounded-retry policy for one scrape call.
@@ -78,13 +47,6 @@ class XScraperService:
             return RetryPolicy(max_attempts=1, time_budget_seconds=30.0, label=label)
         attempts = max(8, min(15, self._available_proxy_count()))
         return RetryPolicy(max_attempts=attempts, label=label)
-
-    def _cool_down_proxy(self, proxy: str, duration_seconds: int = 300):
-        """Put a proxy on cooldown (e.g. on connection errors or scrape failure)."""
-        provider = get_proxy_provider()
-        if provider.is_enabled():
-            provider.cool_down(proxy, duration_seconds)
-        self.proxy_pool.cool_down(proxy, duration_seconds)
 
     async def get_profile(
         self, 
