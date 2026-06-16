@@ -428,6 +428,55 @@ class LinkedInScraperService:
                        attempts=len(tried_accounts))
         return last_result
 
+    async def validate_account(self, account_id: str) -> bool:
+        """Cheap authenticated probe — True only if the account's session is
+        actually alive (a real Voyager call returns data, not a 302→login).
+
+        Used by the startup/periodic health sweep so the pool can mark a stale
+        session DEAD before any real request is routed to it. A missing session
+        file or any redirect/exhaustion verdict counts as unhealthy.
+        """
+        if not self._resolve_session_file(account_id):
+            return False
+        probe_path = os.getenv("LINKEDIN_VALIDATE_PROBE_PATH", "/voyager/api/me")
+        try:
+            result, _redirected, _exhausted = \
+                await self._voyager_get_for_account_with_signal(probe_path, account_id)
+        except Exception as e:
+            logger.warning("linkedin.validate_probe_error",
+                           account_id=account_id, error=str(e)[:160])
+            return False
+        return result is not None
+
+    async def validate_all_accounts(self) -> Dict[str, bool]:
+        """Probe every pool account in parallel and report each verdict to the
+        pool. Healthy → marked ALIVE (usable); unhealthy → marked DEAD + queued
+        for relogin. Returns {account_id: healthy}.
+        """
+        from api.services.linkedin_account_pool import LinkedInAccountPool
+        pool = await LinkedInAccountPool.instance()
+        ids = pool.account_ids()
+        if not ids:
+            return {}
+
+        async def _check(aid: str):
+            ok = await self.validate_account(aid)
+            await pool.report_account_health(aid, ok)
+            return aid, ok
+
+        results = await asyncio.gather(*[_check(a) for a in ids], return_exceptions=True)
+        verdict: Dict[str, bool] = {}
+        for r in results:
+            if isinstance(r, Exception):
+                continue
+            aid, ok = r
+            verdict[aid] = ok
+        logger.info("linkedin.account_validation_complete",
+                    healthy=sum(1 for v in verdict.values() if v),
+                    unhealthy=sum(1 for v in verdict.values() if not v),
+                    total=len(ids))
+        return verdict
+
     async def _voyager_get_for_account_with_signal(
         self, api_path: str, target_account_id: str
     ) -> tuple[Optional[dict], bool, bool]:
@@ -459,9 +508,11 @@ class LinkedInScraperService:
                 return None, False, False
             return None
 
-        # Resolve proxy (rotating proxy pool or static proxy from .env)
-        from tools.goodproxies import GoodProxiesProvider
-        gp = GoodProxiesProvider()
+        # Resolve proxy via the global provider — pre-filtered by geo and
+        # healthchecked at fetch time, so every proxy in the pool is already
+        # confirmed live and in the right country before we try it here.
+        from tools.proxy_provider import get_proxy_provider
+        gp = get_proxy_provider()
 
         static_proxy = None
         accounts_info = self._parse_linkedin_accounts()
@@ -491,7 +542,7 @@ class LinkedInScraperService:
         # code cooled it down on 4xx LinkedIn responses (a working proxy), and
         # that cooldown may still be ticking. The login proxy is our best chance
         # at avoiding LinkedIn's IP-binding rejection.
-        if login_proxy and gp.enabled and gp.pool is not None:
+        if login_proxy and gp.is_enabled() and gp.pool is not None:
             try:
                 gp.pool.clear(login_proxy)
                 logger.info("voyager_get.cleared_login_proxy_cooldown",
@@ -546,9 +597,9 @@ class LinkedInScraperService:
             )
             return resp.status_code, resp
 
-        async def _pick_proxy() -> Optional[str]:
-            if gp.enabled and gp.api_key:
-                p = await gp.get_proxy()
+        def _pick_proxy() -> Optional[str]:
+            if gp.is_enabled():
+                p = gp.get_next()
                 if p:
                     return p
             return static_proxy
@@ -621,8 +672,8 @@ class LinkedInScraperService:
                     # Only cool down on connection failures — NOT on server
                     # responses. Never cool down the login proxy: it may be
                     # briefly flaky and is irreplaceable without a relogin.
-                    if p and p != login_proxy and gp.enabled and gp.api_key:
-                        gp.mark_failed(p)
+                    if p and p != login_proxy and gp.is_enabled():
+                        gp.cool_down(p)
                     _RECENT_GOOD_PROXIES.get(target_account_id, {}).pop(p, None)
                     return None
                 if status is None:
@@ -631,7 +682,7 @@ class LinkedInScraperService:
                     return (None, None, p, False)
                 last = (status, resp, p)
                 # Network round-trip succeeded → proxy is healthy; keep it in rotation.
-                if p and gp.enabled and gp.pool is not None:
+                if p and gp.is_enabled() and gp.pool is not None:
                     try:
                         gp.pool.clear(p)
                     except Exception:
@@ -671,7 +722,7 @@ class LinkedInScraperService:
                     return outcome
 
             # No rotating pool configured → static proxy or direct connection.
-            if not (gp.enabled and gp.api_key):
+            if not gp.is_enabled():
                 fallback = static_proxy  # None → direct connection
                 if fallback not in tried:
                     tried.add(fallback)
@@ -688,7 +739,7 @@ class LinkedInScraperService:
                 draws = 0
                 while len(batch) < vet_batch_size and draws < vet_batch_size * 3:
                     draws += 1
-                    p = await _pick_proxy()
+                    p = _pick_proxy()
                     if not p:
                         break
                     if p in tried or p in batch:

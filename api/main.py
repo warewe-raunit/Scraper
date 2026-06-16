@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import sys
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI, Request, Response, status, Depends
 from fastapi.responses import JSONResponse
@@ -23,11 +24,10 @@ if str(ROOT) not in sys.path:
 load_dotenv(override=True)
 
 import asyncio
-if sys.platform == "win32":
-    try:
-        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-    except Exception:
-        pass
+# On Windows the Proactor event loop (required for Playwright subprocesses) has
+# been the default since Python 3.8, so we no longer set a policy explicitly —
+# asyncio.set_event_loop_policy / WindowsProactorEventLoopPolicy are deprecated
+# in Python 3.14+. The __main__ block below pins the Proactor loop directly.
 
 
 # 1. Configure logging — structlog stays the API, Loguru is the sink/renderer.
@@ -37,6 +37,65 @@ from tools.logging_config import configure_logging
 configure_logging()
 
 logger = structlog.get_logger("api_gateway")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup/shutdown hooks (modern replacement for @app.on_event)."""
+    # --- startup ---
+    # Start the continuous proxy-health daemon so the pool is already stocked
+    # with verified-live proxies before the first request. Non-blocking; the
+    # daemon runs in its own thread and self-heals.
+    try:
+        from tools.proxy_provider import get_proxy_provider
+        provider = get_proxy_provider()
+        if provider.is_enabled():
+            provider.start_health_loop()  # idempotent
+            logger.info("proxy_pool_warmup_dispatched", target_live=provider.target_live)
+    except Exception as e:
+        logger.warning("proxy_pool_warmup_failed", error=str(e))
+
+    # Trigger background relogin for any LinkedIn accounts that start DEAD.
+    # Doesn't block — the AccountPool dispatches asyncio tasks.
+    try:
+        from api.services.linkedin_account_pool import LinkedInAccountPool
+        pool = await LinkedInAccountPool.instance()
+        await pool.warmup()
+        logger.info("linkedin_pool_warmup_dispatched", **pool.snapshot()["counters"])
+    except Exception as e:
+        logger.warning("linkedin_pool_warmup_failed", error=str(e))
+
+    # Health-validate every LinkedIn account so only sessions that ACTUALLY work
+    # serve traffic — a saved session file (li_at present) can still be dead
+    # (302→login). Unhealthy ones are marked DEAD + relogged in the background.
+    # Dispatched as a task so server startup isn't blocked by the probes; the
+    # pool also self-heals on real-request signals while this runs. If
+    # LINKEDIN_HEALTH_CHECK_INTERVAL > 0, the sweep repeats on that interval.
+    import os as _os
+    if _os.getenv("LINKEDIN_VALIDATE_ON_STARTUP", "true").lower() in ("1", "true", "yes", "on"):
+        async def _account_health_sweep():
+            try:
+                from api.services.linkedin import LinkedInScraperService
+                svc = LinkedInScraperService()
+                await svc.validate_all_accounts()
+                interval = int(_os.getenv("LINKEDIN_HEALTH_CHECK_INTERVAL", "0"))
+                while interval > 0:
+                    await asyncio.sleep(interval)
+                    await svc.validate_all_accounts()
+            except Exception as e:
+                logger.warning("linkedin_account_health_sweep_failed", error=str(e))
+        asyncio.create_task(_account_health_sweep())
+        logger.info("linkedin_account_health_sweep_dispatched")
+
+    yield
+
+    # --- shutdown ---
+    try:
+        from tools.proxy_provider import get_proxy_provider
+        get_proxy_provider().stop_health_loop()
+    except Exception:
+        pass
+
 
 # 2. Instantiate FastAPI App
 app = FastAPI(
@@ -49,6 +108,7 @@ app = FastAPI(
     version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
+    lifespan=lifespan,
 )
 
 # 3. Add CORS Middleware
@@ -110,21 +170,6 @@ app.include_router(youtube.router, prefix="/api/v1", dependencies=[Depends(verif
 app.include_router(x.router, prefix="/api/v1", dependencies=[Depends(verify_api_key)])
 app.include_router(linkedin.router, prefix="/api/v1", dependencies=[Depends(verify_api_key)])
 
-@app.on_event("startup")
-async def _warmup_linkedin_pool():
-    """Trigger background relogin for any LinkedIn accounts that start DEAD.
-
-    Doesn't block startup — the AccountPool dispatches asyncio tasks.
-    """
-    try:
-        from api.services.linkedin_account_pool import LinkedInAccountPool
-        pool = await LinkedInAccountPool.instance()
-        await pool.warmup()
-        logger.info("linkedin_pool_warmup_dispatched", **pool.snapshot()["counters"])
-    except Exception as e:
-        logger.warning("linkedin_pool_warmup_failed", error=str(e))
-
-
 @app.get("/", include_in_schema=False)
 def index_redirect():
     """Redirect root access to API docs."""
@@ -154,10 +199,17 @@ if __name__ == "__main__":
     import uvicorn
     
     if sys.platform == "win32":
-        # Force Uvicorn to run on the Proactor event loop under Windows
-        # to support Playwright subprocesses.
+        # Playwright subprocesses require the Proactor event loop on Windows.
+        # It's the 3.8+ default, but pin it explicitly via the non-deprecated
+        # API (ProactorEventLoop + set_event_loop) so we don't rely on the
+        # default and don't touch the deprecated event-loop *policy* API.
         config = uvicorn.Config("api.main:app", host="127.0.0.1", port=8000, reload=False, loop="asyncio")
         server = uvicorn.Server(config)
-        asyncio.run(server.serve())
+        loop = asyncio.ProactorEventLoop()
+        try:
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(server.serve())
+        finally:
+            loop.close()
     else:
         uvicorn.run("api.main:app", host="127.0.0.1", port=8000, reload=True)

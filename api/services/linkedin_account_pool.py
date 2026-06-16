@@ -113,6 +113,16 @@ class LinkedInAccountPool:
         self.disable_after_failures = int(os.getenv("LINKEDIN_DISABLE_AFTER_RELOGIN_FAILURES", "3"))
         self.disable_backoff_seconds = int(os.getenv("LINKEDIN_DISABLE_BACKOFF_SECONDS", "900"))
         self.acquire_wait_seconds = float(os.getenv("LINKEDIN_ACQUIRE_WAIT_SECONDS", "20"))
+        # Background relogin runs HEADFUL by default so interactive challenges
+        # (CAPTCHA / "security verification") can be solved in a visible window.
+        # Set LINKEDIN_RELOGIN_HEADLESS=true for unattended/server runs (email-OTP
+        # accounts still self-solve via the Gmail token). Falls back to
+        # BROWSER_HEADLESS when LINKEDIN_RELOGIN_HEADLESS is unset.
+        _relogin_headless = os.getenv(
+            "LINKEDIN_RELOGIN_HEADLESS",
+            os.getenv("BROWSER_HEADLESS", "false"),
+        )
+        self.relogin_headless = _relogin_headless.lower() in ("1", "true", "yes", "on")
 
         self._load_accounts_from_env()
 
@@ -206,6 +216,37 @@ class LinkedInAccountPool:
             acc.status = DEAD
         self._schedule_relogin(account_id)
 
+    def account_ids(self) -> list:
+        """All known account ids (for health-validation sweeps)."""
+        return list(self._accounts.keys())
+
+    async def report_account_health(self, account_id: str, healthy: bool) -> None:
+        """Record the verdict of an out-of-band health probe.
+
+        healthy=True  → the session returned live data → mark ALIVE (usable).
+        healthy=False → the session is dead/redirecting → mark DEAD and queue a
+                        relogin (only fires if LINKEDIN_AUTO_RELOGIN is on).
+
+        Never stomps an account that's mid-request (in_use), currently
+        relogging, or disabled on backoff.
+        """
+        relogin_needed = False
+        async with self._lock:
+            acc = self._accounts.get(account_id)
+            if acc is None or acc.in_use or acc.status in (RELOGGING, DISABLED):
+                return
+            if healthy:
+                acc.status = ALIVE
+                acc.consecutive_302 = 0
+                acc.consecutive_proxy_exhaust = 0
+                acc.last_success_at = time.time()
+            else:
+                acc.status = DEAD
+                acc.last_failure_at = time.time()
+                relogin_needed = True
+        if relogin_needed:
+            self._schedule_relogin(account_id)
+
     def snapshot(self) -> dict:
         return {
             "accounts": [acc.snapshot() for acc in self._accounts.values()],
@@ -292,7 +333,7 @@ class LinkedInAccountPool:
                     username=username,
                     password=password,
                     static_proxy=static_proxy,
-                    headless=True,
+                    headless=self.relogin_headless,
                 )
             except Exception as e:
                 logger.error("account_pool.relogin_exception", account_id=account_id, error=str(e)[:200])

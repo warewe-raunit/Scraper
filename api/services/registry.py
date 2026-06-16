@@ -325,9 +325,16 @@ class AccountRegistry:
                     "api_key": captcha_api_key.strip()
                 }
 
-            # Run Playwright login flow asynchronously
+            # Run Playwright login flow asynchronously. Headful by default so
+            # interactive challenges (CAPTCHA / verification) can be solved in a
+            # visible window; set REDDIT_RELOGIN_HEADLESS=true for unattended
+            # server runs. Falls back to BROWSER_HEADLESS when unset.
+            relogin_headless = os.getenv(
+                "REDDIT_RELOGIN_HEADLESS",
+                os.getenv("BROWSER_HEADLESS", "false"),
+            ).lower() in ("1", "true", "yes", "on")
             try:
-                success = await login_account(target_acc, captcha_config, headless=True)
+                success = await login_account(target_acc, captcha_config, headless=relogin_headless)
                 if success:
                     state.status = "healthy"
                     self._pool.clear(account_id)  # lift any active cooldown timer

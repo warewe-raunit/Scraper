@@ -61,23 +61,24 @@ class YouTubeScraperService:
         rotating good-proxies.ru pool; otherwise we use the per-account pool
         built from .env (original behavior).
 
-        Since YouTube InnerTube requests are HTTPS, public HTTP/HTTPS proxies from
-        free/public lists almost always fail to establish CONNECT tunnels or are blocked.
-        We prefer SOCKS proxies from the pool if any are available.
+        InnerTube calls are HTTPS, which needs a working CONNECT tunnel. The
+        global pool is pre-verified with an HTTPS liveness probe
+        (GOODPROXIES_HEALTHCHECK_URL, default https://…/generate_204), so every
+        proxy in it has ALREADY proven it can tunnel HTTPS — we just take the
+        next one. (Older code preferred SOCKS here because raw HTTP lists often
+        can't CONNECT; the healthcheck makes that filter unnecessary, and it was
+        starving YouTube once socks5 was dropped from the pool.) The unverified
+        per-account .env fallback keeps the SOCKS preference, since those proxies
+        aren't probed for HTTPS-CONNECT support.
         """
         provider = get_proxy_provider()
         if provider.is_enabled():
-            # Filter the global provider's pool for SOCKS proxies
-            socks_candidates = [p for p in provider.pool.items if p.startswith(("socks5://", "socks4://", "socks5h://"))]
-            if socks_candidates:
-                p = provider.pool.get_next(candidates=socks_candidates)
-                if p:
-                    return p
             p = provider.get_next()
             if p:
                 return p
 
-        # If fallback to per-account pool, also prefer SOCKS if present
+        # Per-account .env pool isn't healthchecked → prefer SOCKS, which tunnel
+        # HTTPS without relying on HTTP-proxy CONNECT support.
         socks_candidates = [p for p in self.proxy_pool.items if p.startswith(("socks5://", "socks4://", "socks5h://"))]
         if socks_candidates:
             p = self.proxy_pool.get_next(candidates=socks_candidates)

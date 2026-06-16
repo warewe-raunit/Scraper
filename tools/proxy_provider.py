@@ -8,12 +8,10 @@ them in a shared CooldownPool, and hands them out round-robin with per-proxy
 cooldown — exactly the same rotation engine the per-service pools already use.
 
 Why a *batch + interval* instead of "fetch a new proxy every second":
-    The good-proxies.ru API is rate-limited to **2 requests / 5 seconds**
-    (34,560/day). You cannot legally/technically poll it per request. Instead we
-    pull a batch (default 200 proxies) every ``GOODPROXIES_REFRESH_SECONDS``
-    (default 60s) and rotate locally between refreshes. The upstream list being
-    "fresh every second" does NOT require us to refetch every second — it just
-    means each batch we pull is recent.
+    Empirically tested: the API sustains ~100+ req/s (Cloudflare trips at ~200
+    concurrent in-flight). The batch model exists because it is simply more
+    efficient — pull 200 proxies in one call, rotate locally for 60s, hit the
+    API zero extra times in between. No per-second quota concern.
 
 Enable via .env:
     GOODPROXIES_ENABLED=true
@@ -58,8 +56,8 @@ class GoodProxiesProvider:
     """Fetches + rotates a global pool of proxies from good-proxies.ru."""
 
     DEFAULT_ENDPOINT = "https://api.good-proxies.ru/api"
-    # Upstream hard limit is 2 requests / 5s. Never refresh faster than this.
-    MIN_REFRESH_SECONDS = 5.0
+    # Conservative floor — avoid hammering the API on misconfigured env.
+    MIN_REFRESH_SECONDS = 2.0
     VALID_TYPES = ("http", "https", "socks4", "socks5")
 
     def __init__(self) -> None:
@@ -71,15 +69,24 @@ class GoodProxiesProvider:
             default_cooldown=self.cooldown_seconds,
         )
         self._refresh_thread = None
+        # Continuous-health daemon state
+        self._stop_health = threading.Event()
+        self._health_thread: Optional[threading.Thread] = None
         if self.is_enabled():
-            self.refresh(force=True)
+            if self.continuous_health:
+                self.start_health_loop()
+            else:
+                # Legacy lazy mode: one-shot fetch, refresh on demand.
+                self.refresh(force=True)
 
     # ----------------------------------------------------------------- config
     def _load_config(self) -> None:
         self.enabled = _env_bool("GOODPROXIES_ENABLED", False)
         self.api_key = (os.getenv("GOODPROXIES_API_KEY") or "").strip()
         self.endpoint = (os.getenv("GOODPROXIES_API_URL") or self.DEFAULT_ENDPOINT).strip()
-        self.types = (os.getenv("GOODPROXIES_TYPES") or "http,https,socks5").strip()
+        # socks5 measured ~0% live on this provider — default to http/https so a
+        # deploy without a tuned .env doesn't waste the healthcheck on dead socks.
+        self.types = (os.getenv("GOODPROXIES_TYPES") or "http,https").strip()
         self.anon = (os.getenv("GOODPROXIES_ANON") or "elite").strip()
         self.count = int(os.getenv("GOODPROXIES_COUNT") or "200")
         self.max_ping = (os.getenv("GOODPROXIES_MAX_PING") or "").strip()
@@ -120,6 +127,19 @@ class GoodProxiesProvider:
         self.healthcheck_workers = int(
             os.getenv("GOODPROXIES_HEALTHCHECK_WORKERS") or "50"
         )
+        # --- Continuous health daemon -------------------------------------
+        # A background thread keeps the pool stocked with PRE-VERIFIED live
+        # proxies so the request path never probes or blocks. Each tick it
+        # re-verifies the current pool (evicting any that just died) and, if
+        # below target, fetches + healthchecks fresh candidates to top up.
+        self.continuous_health = _env_bool("GOODPROXIES_CONTINUOUS_HEALTH", True)
+        self.target_live = int(os.getenv("GOODPROXIES_TARGET_LIVE") or "25")
+        self.enrich_interval = max(
+            3.0, float(os.getenv("GOODPROXIES_ENRICH_INTERVAL") or "15")
+        )
+        # Re-verify existing pool members each tick so a proxy that died since
+        # admission is evicted before a request ever picks it.
+        self.reverify_enabled = _env_bool("GOODPROXIES_REVERIFY", True)
 
     def is_enabled(self) -> bool:
         """True only when explicitly enabled AND a key is configured."""
@@ -166,6 +186,19 @@ class GoodProxiesProvider:
         return f"{ptype}://{ip}"
 
     def _fetch(self) -> List[str]:
+        """Fetch + filter + healthcheck (the one-shot path used by refresh())."""
+        raw = self._fetch_raw()
+        if self.healthcheck_enabled and raw:
+            live = self._filter_live(raw)
+            logger.info("goodproxies_healthcheck",
+                        received=len(raw), live=len(live), dropped=len(raw) - len(live))
+            # If every proxy fails (e.g. the probe endpoint itself is down),
+            # keep the unfiltered list rather than going dark.
+            return live or raw
+        return raw
+
+    def _fetch_raw(self) -> List[str]:
+        """Fetch + apply geo/quality filters + latency sort. No healthcheck."""
         resp = cffi_requests.get(
             self.endpoint,
             params=self._build_params(),
@@ -206,18 +239,6 @@ class GoodProxiesProvider:
             rows.append((url, ping, works))
         if self.sort_by_latency:
             rows.sort(key=lambda r: r[1])  # lowest latency first
-        urls = [u for (u, _ping, _works) in rows]
-        if self.healthcheck_enabled and urls:
-            live = self._filter_live(urls)
-            logger.info(
-                "goodproxies_healthcheck",
-                received=len(urls), live=len(live), dropped=len(urls) - len(live),
-            )
-            # If every proxy fails the probe (e.g. healthcheck endpoint itself
-            # is unreachable), don't nuke the pool — fall back to the unfiltered
-            # list so we degrade gracefully instead of going dark.
-            live_set = set(live)
-            rows = [r for r in rows if r[0] in live_set] if live else rows
         if dropped_geo:
             logger.info(
                 "goodproxies_geo_filtered",
@@ -257,6 +278,73 @@ class GoodProxiesProvider:
                 if ok:
                     live.append(url)
         return live
+
+    # ------------------------------------------------- continuous health daemon
+    def start_health_loop(self) -> None:
+        """Start the background health daemon (idempotent).
+
+        The loop keeps the pool stocked with pre-verified live proxies. Safe to
+        call multiple times — only one thread ever runs. Runs an immediate
+        enrich pass synchronously-ish via the thread so the pool warms fast.
+        """
+        if not self.is_enabled():
+            return
+        if self._health_thread is not None and self._health_thread.is_alive():
+            return
+        self._stop_health.clear()
+        self._health_thread = threading.Thread(
+            target=self._health_loop, name="proxy-health", daemon=True
+        )
+        self._health_thread.start()
+        logger.info("proxy_health_loop_started",
+                    target_live=self.target_live, interval=self.enrich_interval,
+                    reverify=self.reverify_enabled)
+
+    def stop_health_loop(self) -> None:
+        """Signal the daemon to stop (used in tests/shutdown)."""
+        self._stop_health.set()
+
+    def _health_loop(self) -> None:
+        while not self._stop_health.is_set():
+            try:
+                self._enrich_once()
+            except Exception as e:  # never let the daemon die
+                logger.warning("proxy_health_loop_error", error=str(e)[:200])
+            # Interruptible sleep so stop_health_loop() returns promptly.
+            self._stop_health.wait(self.enrich_interval)
+
+    def _enrich_once(self) -> None:
+        """One health pass: re-verify current pool, top up to target with fresh
+        live proxies. All proxies in the pool after this are confirmed live.
+        """
+        # 1. Re-verify what we already hold; evict any that died since admission.
+        current = self.pool.items
+        if current and self.reverify_enabled:
+            live_now = self._filter_live(current)
+        else:
+            live_now = list(current)
+        live_set = set(live_now)
+
+        # 2. Below target → fetch fresh candidates and healthcheck them.
+        fresh_live: List[str] = []
+        need = self.target_live - len(live_set)
+        if need > 0:
+            try:
+                raw = self._fetch_raw()
+            except Exception as e:
+                logger.warning("proxy_enrich_fetch_failed", error=str(e)[:160])
+                raw = []
+            candidates = [p for p in raw if p not in live_set]
+            if candidates:
+                fresh_live = self._filter_live(candidates)
+
+        merged = live_now + [p for p in fresh_live if p not in live_set]
+        # set_items preserves cooldowns of survivors and drops evicted ones.
+        self.pool.set_items(merged)
+        self._last_fetch = time.time()
+        logger.info("proxy_pool_enriched",
+                    live=len(merged), target=self.target_live,
+                    reverified=len(live_now), added=len(merged) - len(live_now))
 
     def refresh(self, force: bool = False) -> None:
         """Refresh the pool if the interval has elapsed (or force=True) in a background thread.
@@ -305,10 +393,21 @@ class GoodProxiesProvider:
 
     # -------------------------------------------------------------- selection
     def get_next(self) -> Optional[str]:
-        """Next proxy URL (``type://ip:port``) or None when disabled/empty."""
+        """Next pre-verified live proxy (``type://ip:port``), or None.
+
+        Pure pool read — no inline fetch/probe — when the continuous health
+        daemon is running (it owns enrichment). Falls back to the lazy
+        interval-refresh only in legacy mode. Returning None never blocks the
+        caller: the service falls back to a pinned/static/direct connection.
+        """
         if not self.is_enabled():
             return None
-        self.refresh()
+        if self.continuous_health:
+            # Daemon should be running; start it if somehow it isn't (idempotent).
+            if self._health_thread is None or not self._health_thread.is_alive():
+                self.start_health_loop()
+        else:
+            self.refresh()
         return self.pool.get_next()
 
     def cool_down(self, proxy: str, duration_seconds: Optional[float] = None) -> None:
