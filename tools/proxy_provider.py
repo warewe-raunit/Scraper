@@ -33,6 +33,9 @@ from __future__ import annotations
 import os
 import time
 import threading
+import re
+import urllib.request
+import json
 from typing import Dict, List, Optional
 
 import structlog
@@ -80,9 +83,14 @@ class GoodProxiesProvider:
         # Per-proxy grace counter: a freshly-admitted (already-healthchecked)
         # proxy is immune from re-verify eviction for this many enrich cycles, so
         # one flaky re-probe right after admission can't churn it straight back
-        # out. This is what lets the pool ACCUMULATE instead of oscillating near
-        # empty when probes are noisy.
+        # Out (immune this cycle).
         self._grace: Dict[str, int] = {}
+        # Map of proxy URL -> country code for geo-consistent rotation
+        self.proxy_countries: Dict[str, str] = {}
+        # Per-country negative cache for on-demand fetches: country -> unix ts
+        # until which we won't re-attempt an on-demand fetch (so a country with
+        # zero available proxies upstream can't trigger a fetch storm).
+        self._country_fetch_cooldown: Dict[str, float] = {}
         if self.is_enabled():
             if self.continuous_health:
                 self.start_health_loop()
@@ -99,7 +107,7 @@ class GoodProxiesProvider:
         # deploy without a tuned .env doesn't waste the healthcheck on dead socks.
         self.types = (os.getenv("GOODPROXIES_TYPES") or "http,https").strip()
         self.anon = (os.getenv("GOODPROXIES_ANON") or "elite").strip()
-        self.count = int(os.getenv("GOODPROXIES_COUNT") or "200")
+        self.count = int(os.getenv("GOODPROXIES_COUNT") or "300")
         self.max_ping = (os.getenv("GOODPROXIES_MAX_PING") or "").strip()
         self.min_works = (os.getenv("GOODPROXIES_MIN_WORKS") or "").strip()
         self.max_time = (os.getenv("GOODPROXIES_MAX_TIME") or "").strip()
@@ -146,7 +154,7 @@ class GoodProxiesProvider:
         # re-verifies the current pool (evicting any that just died) and, if
         # below target, fetches + healthchecks fresh candidates to top up.
         self.continuous_health = _env_bool("GOODPROXIES_CONTINUOUS_HEALTH", True)
-        self.target_live = int(os.getenv("GOODPROXIES_TARGET_LIVE") or "25")
+        self.target_live = int(os.getenv("GOODPROXIES_TARGET_LIVE") or "40")
         self.enrich_interval = max(
             3.0, float(os.getenv("GOODPROXIES_ENRICH_INTERVAL") or "15")
         )
@@ -171,7 +179,23 @@ class GoodProxiesProvider:
         # refetching every tick chasing an unreachable target_live. Capped to
         # target_live (a floor above the ceiling makes no sense).
         self.min_live = max(
-            1, min(int(os.getenv("GOODPROXIES_MIN_LIVE") or "8"), self.target_live)
+            1, min(int(os.getenv("GOODPROXIES_MIN_LIVE") or "12"), self.target_live)
+        )
+        # --- On-demand per-country fetch ----------------------------------
+        # When a caller requests a country (e.g. JP) that has no proxy in the
+        # standing pool, fetch + healthcheck that country specifically at
+        # request time and merge the live ones in, instead of failing fast.
+        # This covers the "rare country intermittently has zero" gap without
+        # bloating the standing pool with every country.
+        self.on_demand_country = _env_bool("GOODPROXIES_ON_DEMAND_COUNTRY", True)
+        # How many candidates to request + probe for an on-demand country fetch.
+        self.on_demand_count = max(
+            1, int(os.getenv("GOODPROXIES_ON_DEMAND_COUNT") or "60")
+        )
+        # Negative-cache TTL: after an on-demand fetch (success or not), don't
+        # re-fetch the same country for this many seconds.
+        self.on_demand_cooldown = max(
+            5.0, float(os.getenv("GOODPROXIES_ON_DEMAND_COOLDOWN") or "45")
         )
 
     def is_enabled(self) -> bool:
@@ -179,12 +203,12 @@ class GoodProxiesProvider:
         return bool(self.enabled and self.api_key)
 
     # --------------------------------------------------------------- fetching
-    def _build_params(self) -> dict:
+    def _build_params(self, country_override: Optional[str] = None, count_override: Optional[int] = None) -> dict:
         params = {
             "key": self.api_key,
             "anon": self.anon,
             "type": self.types,
-            "count": str(self.count),
+            "count": str(count_override or self.count),
             "get": "json",
             # `country` is now requested so we can verify geo client-side.
             "fields": "ip,type,ping,works,country",
@@ -199,8 +223,11 @@ class GoodProxiesProvider:
             params["speed"] = self.speed
         if self.lang:
             params["lang"] = self.lang
-        if self.country and self.country.lower() != "any":
-            params["country"] = self.country
+        # An explicit override (on-demand single-country fetch) wins over the
+        # standing GOODPROXIES_COUNTRY filter.
+        country = country_override if country_override is not None else self.country
+        if country and country.lower() != "any":
+            params["country"] = country
             params["cm"] = "include"  # return ONLY these countries (explicit)
         return params
 
@@ -241,11 +268,21 @@ class GoodProxiesProvider:
             return live or raw
         return raw
 
-    def _fetch_raw(self) -> List[str]:
-        """Fetch + apply geo/quality filters + latency sort. No healthcheck."""
+    def _fetch_raw(
+        self,
+        country_override: Optional[str] = None,
+        count_override: Optional[int] = None,
+        bypass_geo_guard: bool = False,
+    ) -> List[str]:
+        """Fetch + apply geo/quality filters + latency sort. No healthcheck.
+
+        ``country_override`` requests a single specific country (on-demand path),
+        and ``bypass_geo_guard`` skips the standing ``allowed_countries`` drop so
+        that explicitly-requested country isn't filtered out by a US-only env.
+        """
         resp = cffi_requests.get(
             self.endpoint,
-            params=self._build_params(),
+            params=self._build_params(country_override, count_override),
             timeout=20,
             impersonate="chrome120",
         )
@@ -265,10 +302,13 @@ class GoodProxiesProvider:
             url = self._to_proxy_url(entry)
             if not url or url in seen:
                 continue
+            country = str(entry.get("country") or "").strip().upper()
+            if country:
+                self.proxy_countries[url] = country
             # Client-side geo safety net: drop any proxy whose returned country
-            # isn't in the allow-set. Guards against upstream geo leaks.
-            if self.allowed_countries:
-                country = str(entry.get("country") or "").strip().upper()
+            # isn't in the allow-set. Guards against upstream geo leaks. Skipped
+            # for an explicit on-demand single-country fetch (bypass_geo_guard).
+            if self.allowed_countries and not bypass_geo_guard:
                 if country and country not in self.allowed_countries:
                     dropped_geo += 1
                     continue
@@ -491,8 +531,11 @@ class GoodProxiesProvider:
             self._last_fetch = now
 
     # -------------------------------------------------------------- selection
-    def get_next(self) -> Optional[str]:
+    def get_next(self, country: Optional[str] = None, fallback_to_any: bool = True) -> Optional[str]:
         """Next pre-verified live proxy (``type://ip:port``), or None.
+
+        If a country code (e.g. 'US') is provided, it tries to select a proxy from
+        that country.
 
         Pure pool read — no inline fetch/probe — when the continuous health
         daemon is running (it owns enrichment). Falls back to the lazy
@@ -507,7 +550,60 @@ class GoodProxiesProvider:
                 self.start_health_loop()
         else:
             self.refresh()
+
+        if country:
+            country = country.strip().upper()
+            candidates = [p for p in self.pool.items if self.proxy_countries.get(p) == country]
+            if candidates:
+                return self.pool.get_next(candidates=candidates)
+            if not fallback_to_any:
+                return None
+
         return self.pool.get_next()
+
+    def ensure_country(self, country: str, want: int = 1) -> int:
+        """On-demand: make sure the pool holds at least one live proxy for
+        ``country``, fetching + healthchecking that country specifically if not.
+
+        Returns the number of newly-admitted live proxies. Blocking (network
+        fetch + healthcheck) — callers on an event loop should run it in an
+        executor. Bounded by a per-country negative cache so a country with no
+        upstream proxies can't trigger repeated slow fetches.
+        """
+        if not self.is_enabled() or not self.on_demand_country:
+            return 0
+        country = country.strip().upper()
+        if not country:
+            return 0
+        # Already covered? Nothing to do.
+        if any(self.proxy_countries.get(p) == country for p in self.pool.items):
+            return 0
+        now = time.time()
+        if now < self._country_fetch_cooldown.get(country, 0.0):
+            return 0
+        # Reserve the cooldown up front so concurrent callers don't all fetch.
+        self._country_fetch_cooldown[country] = now + self.on_demand_cooldown
+        try:
+            raw = self._fetch_raw(
+                country_override=country,
+                count_override=self.on_demand_count,
+                bypass_geo_guard=True,
+            )
+        except Exception as e:
+            logger.warning("ondemand_country_fetch_failed", country=country, error=str(e)[:160])
+            return 0
+        live = self._filter_live(raw[: self.on_demand_count]) if raw else []
+        added = 0
+        for p in live:
+            if p not in self.pool:
+                self.pool.add(p)
+                # Grant grace so the health daemon's next re-verify wave doesn't
+                # immediately churn the freshly-admitted proxy back out.
+                self._grace[p] = self.reverify_grace_cycles
+                added += 1
+        logger.info("ondemand_country_fetched",
+                    country=country, received=len(raw), live=len(live), added=added)
+        return added
 
     def cool_down(self, proxy: str, duration_seconds: Optional[float] = None) -> None:
         """Rest a misbehaving proxy so it is skipped for a while."""
@@ -527,3 +623,49 @@ def get_proxy_provider() -> GoodProxiesProvider:
             if _provider is None:
                 _provider = GoodProxiesProvider()
     return _provider
+
+
+def _proxy_host(proxy_url: Optional[str]) -> Optional[str]:
+    """Extract the host/IP from a proxy URL like http://1.2.3.4:8080."""
+    if not proxy_url:
+        return None
+    m = re.search(r"://([^:/@]+)", proxy_url)
+    return m.group(1) if m else None
+
+
+def resolve_proxy_country(proxy_url: Optional[str]) -> Optional[str]:
+    """Resolve the country code (e.g. 'US') for a proxy URL.
+
+    First attempts local cache from GoodProxiesProvider, falling back to a quick
+    external IP geo-lookup.
+    """
+    if not proxy_url:
+        return None
+    try:
+        gp = get_proxy_provider()
+        if gp.is_enabled() and proxy_url in gp.proxy_countries:
+            return gp.proxy_countries[proxy_url].strip().upper()
+    except Exception:
+        pass
+
+    host = _proxy_host(proxy_url)
+    if not host:
+        return None
+
+    if host.lower() in ("localhost", "127.0.0.1", "::1"):
+        return None
+
+    try:
+        url = f"http://ip-api.com/json/{host}?fields=countryCode"
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        )
+        with urllib.request.urlopen(req, timeout=2.0) as response:
+            data = json.loads(response.read().decode())
+            cc = data.get("countryCode")
+            if cc:
+                return cc.strip().upper()
+    except Exception as e:
+        logger.warning("proxy_geo_resolution_failed", host=host, error=str(e))
+    return None

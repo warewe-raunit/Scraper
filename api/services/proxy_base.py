@@ -14,6 +14,7 @@ HTTPS), while X does not. That is captured by the ``prefer_socks`` flag.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, List, Optional
 
 from api.config import PROXY_DEFAULT_COOLDOWN_SECONDS
@@ -53,7 +54,7 @@ class ProxyRotatingService:
         # Preserves existing cooldowns for surviving proxies (handled by the pool).
         self.proxy_pool.set_items(val)
 
-    def _get_next_proxy(self) -> Optional[str]:
+    def _get_next_proxy(self, country: Optional[str] = None) -> Optional[str]:
         """Next healthy proxy (round-robin), or shortest-cooldown fallback.
 
         When the global GoodProxies provider is enabled, proxies come from the
@@ -64,9 +65,28 @@ class ProxyRotatingService:
         """
         provider = get_proxy_provider()
         if provider.is_enabled():
-            p = provider.get_next()
+            p = provider.get_next(country=country, fallback_to_any=False)
             if p:
                 return p
+
+        # Fallback to local pool
+        if country:
+            country = country.strip().upper()
+            from tools.proxy_provider import resolve_proxy_country
+            candidates = []
+            for p in self.proxy_pool.items:
+                p_country = resolve_proxy_country(p)
+                if p_country == country:
+                    candidates.append(p)
+            if self.prefer_socks:
+                socks_candidates = [
+                    c for c in candidates if c.startswith(_SOCKS_PREFIXES)
+                ]
+                if socks_candidates:
+                    return self.proxy_pool.get_next(candidates=socks_candidates)
+            if candidates:
+                return self.proxy_pool.get_next(candidates=candidates)
+            return None
 
         if self.prefer_socks:
             socks_candidates = [
@@ -77,6 +97,28 @@ class ProxyRotatingService:
                 if p:
                     return p
         return self.proxy_pool.get_next()
+
+    async def _get_next_proxy_async(self, country: Optional[str] = None) -> Optional[str]:
+        """Like ``_get_next_proxy`` but, when a country is requested and the pool
+        has no proxy for it, triggers an on-demand fetch for that country before
+        retrying — without blocking the event loop.
+
+        The standing pool is checked first (fast path, no network). Only on a
+        miss do we fetch+healthcheck that country in a worker thread, then
+        re-select. Returns None if the country still has no live proxy (caller
+        fails fast rather than leaking the server IP).
+        """
+        proxy = self._get_next_proxy(country=country)
+        if proxy or not country:
+            return proxy
+
+        provider = get_proxy_provider()
+        if not provider.is_enabled():
+            return proxy  # None — local-pool-only mode, nothing to fetch
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, provider.ensure_country, country)
+        return self._get_next_proxy(country=country)
 
     def _cool_down_proxy(
         self, proxy: str, duration_seconds: int = PROXY_DEFAULT_COOLDOWN_SECONDS

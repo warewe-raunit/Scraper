@@ -9,6 +9,7 @@ from fastapi import APIRouter, Query, HTTPException, status, Depends
 import structlog
 
 from api.dependencies import get_x_scraper_service
+from api.search_locations import SearchLocation
 from api.services.x import XScraperService
 from api.routes import csv_response
 
@@ -61,6 +62,7 @@ async def get_x_profile(
 async def search_x_tweets(
     q: str = Query(..., description="The search query keyword or hashtag"),
     limit: int = Query(20, ge=1, le=100, description="Max number of tweets to return"),
+    location: Optional[SearchLocation] = Query(None, description="Country for proxy exit selection (renders as a dropdown of full country names). Note: only selects the proxy's exit country — it does NOT localize which tweets are returned (X keyword search is global)."),
     format: Literal["json", "csv"] = Query("json", description="Output format for results"),
     since: Optional[str] = Query(None, description="Filter tweets since date (YYYY-MM-DD)"),
     until: Optional[str] = Query(None, description="Filter tweets until date (YYYY-MM-DD)"),
@@ -111,7 +113,7 @@ async def search_x_tweets(
         parts.append("-filter:replies")
     if exclude_retweets is True:
         parts.append("-filter:nativeretweets")
-        
+
     compiled_query = " ".join(parts)
     
     try:
@@ -119,7 +121,8 @@ async def search_x_tweets(
             query=compiled_query,
             limit=limit,
             proxy_url=proxy,
-            headless=headless
+            headless=headless,
+            location=location.code if location else None
         )
         if not result.get("success"):
             raise HTTPException(

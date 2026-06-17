@@ -111,20 +111,43 @@ class XScraperService(ProxyRotatingService):
         )
 
     async def search(
-        self, 
-        query: str, 
-        limit: int = 20, 
-        proxy_url: Optional[str] = None, 
-        headless: bool = True
+        self,
+        query: str,
+        limit: int = 20,
+        proxy_url: Optional[str] = None,
+        headless: bool = True,
+        location: Optional[str] = None
     ) -> Dict[str, Any]:
         """Scrape tweets matching a search query without authentication.
 
         Same robust bounded-retry behavior as get_profile: rotates proxies
         across at least one pool refill and always returns a structured result
         instead of terminating with no output.
+
+        ``location`` routes the request through a proxy whose exit IP is in that
+        country. Note: this does NOT change which tweets come back — X/Nitter
+        keyword search is global and is not personalized by the requesting IP
+        (and Nitter's guest backend rejects the geocode/near operators). It only
+        controls the exit country. When a location is requested but no matching
+        proxy is available, the call fails fast rather than leaking the server IP
+        via a direct connection.
         """
         async def _attempt(n: int) -> AttemptOutcome:
-            resolved_proxy = proxy_url or self._get_next_proxy()
+            if proxy_url:
+                resolved_proxy = proxy_url
+            elif location:
+                # On-demand fetch a proxy for this country if the pool lacks one.
+                resolved_proxy = await self._get_next_proxy_async(country=location)
+            else:
+                resolved_proxy = self._get_next_proxy()
+            if location and not resolved_proxy:
+                return AttemptOutcome(
+                    success=False,
+                    result={"success": False, "tweets": [], "error": f"No proxies available for the selected location: {location}."},
+                    retryable=False,
+                    error=f"No proxies available for the selected location: {location}."
+                )
+
             if resolved_proxy:
                 logger.info(
                     "using_proxy_for_x_search",

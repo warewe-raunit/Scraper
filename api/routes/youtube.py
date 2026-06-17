@@ -12,6 +12,7 @@ import httpx
 import structlog
 
 from api.dependencies import get_youtube_scraper_service
+from api.search_locations import SearchLocation
 from api.services.youtube import YouTubeScraperService
 from api.utils.exporters import export_to_csv, export_to_excel, export_to_html_dashboard, export_download_page_html
 
@@ -57,11 +58,12 @@ async def search_youtube(
     sort: str = Query("relevance", pattern="^(relevance|date|views|rating)$", description="Criteria to sort search results"),
     time: str = Query("all", pattern="^(hour|day|week|month|year|all)$", description="Timeframe filter for search results"),
     limit: int = Query(20, ge=1, le=500, description="Max number of search results to return"),
+    location: Optional[SearchLocation] = Query(None, description="Country for proxy selection (renders as a dropdown of full country names)"),
     format: str = Query("json", pattern="^(json|csv|excel|html)$", description="Output format for search results"),
     scraper: YouTubeScraperService = Depends(get_youtube_scraper_service)
 ):
     try:
-        results = await scraper.search(q, sort, time, limit=limit)
+        results = await scraper.search(q, sort, time, limit=limit, location=location.code if location else None)
         if format != "json":
             return format_export_response(results, "search", format, scraper)
         return results

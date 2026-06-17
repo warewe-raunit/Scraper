@@ -22,6 +22,7 @@ if str(ROOT) not in sys.path:
 
 from tools.browser_manager import launch_browser
 from api.services.proxy_base import ProxyRotatingService
+from api.search_locations import hl_for_country
 from api import config
 
 logger = structlog.get_logger(__name__)
@@ -127,15 +128,23 @@ class YouTubeScraperService(ProxyRotatingService):
             self._api_key = fallback_key
             return fallback_key
 
-    def _get_client_context(self, client_name: str = "WEB", user_agent: Optional[str] = None) -> dict:
-        """Build the client context required by InnerTube endpoints."""
+    def _get_client_context(self, client_name: str = "WEB", user_agent: Optional[str] = None, country: Optional[str] = None) -> dict:
+        """Build the client context required by InnerTube endpoints.
+
+        ``gl`` (country) and ``hl`` (language) are explicit localization signals
+        YouTube weights heavily — often more than the IP. When a location is
+        requested we derive both from it so they agree with the proxy's exit
+        country instead of fighting it; otherwise we default to US/English.
+        """
+        gl = country.strip().upper() if country else "US"
+        hl = hl_for_country(country)
         if client_name == "ANDROID":
             return {
                 "client": {
                     "clientName": "ANDROID",
                     "clientVersion": config.YOUTUBE_ANDROID_CLIENT_VERSION,
-                    "hl": "en",
-                    "gl": "US",
+                    "hl": hl,
+                    "gl": gl,
                     "platform": "MOBILE",
                     "osName": "ANDROID"
                 }
@@ -146,8 +155,8 @@ class YouTubeScraperService(ProxyRotatingService):
                 "client": {
                     "clientName": "WEB",
                     "clientVersion": config.YOUTUBE_WEB_CLIENT_VERSION,
-                    "hl": "en",
-                    "gl": "US",
+                    "hl": hl,
+                    "gl": gl,
                     "userAgent": ua,
                     "clientScreen": "WATCH"
                 }
@@ -465,19 +474,13 @@ class YouTubeScraperService(ProxyRotatingService):
                 
         return url_or_id
 
-    async def _execute_post(self, endpoint: str, payload: dict, max_retries: int = config.YOUTUBE_MAX_RETRIES, force_direct: bool = False) -> dict:
+    async def _execute_post(self, endpoint: str, payload: dict, max_retries: int = config.YOUTUBE_MAX_RETRIES, force_direct: bool = False, location: Optional[str] = None) -> dict:
         """Execute a POST request to an InnerTube endpoint with proxy rotation,
         a fast per-proxy timeout, and a DIRECT (no-proxy) fallback.
 
-        The good-proxies pool is frequently unusable for YouTube's HTTPS InnerTube
-        endpoint (CONNECT-tunnel 502/503, timeouts) even though those proxies pass
-        the lightweight liveness probe — so a proxy-only loop can never succeed and
-        just thrashes the (tiny) pool. InnerTube is a public API that works without
-        a proxy, so we try the rotating pool for the first
-        ``YOUTUBE_MAX_PROXY_ATTEMPTS`` attempts (with a short timeout so dead
-        proxies fail fast) and then fall back to a direct connection, which
-        guarantees the request can still return data. Set
-        ``YOUTUBE_DIRECT_FALLBACK=false`` to force proxy-only.
+        If location is specified, we force proxy usage (no direct fallback) and filter
+        for proxies matching that location. If no matching proxy is available, we fail
+        immediately without attempting direct connections.
         """
         last_exception = None
         for attempt in range(1, max_retries + 1):
@@ -489,11 +492,24 @@ class YouTubeScraperService(ProxyRotatingService):
             # force_direct overrides everything: never use a proxy (used for the
             # player call, which a flagged proxy IP gets a stripped/LOGIN_REQUIRED
             # response for — a clean direct IP returns full videoDetails).
-            if force_direct:
+            if location:
+                use_proxy = True
+            elif force_direct:
                 use_proxy = False
             else:
                 use_proxy = attempt <= config.YOUTUBE_MAX_PROXY_ATTEMPTS or not config.YOUTUBE_DIRECT_FALLBACK
-            proxy = self._get_next_proxy() if use_proxy else None
+
+            if use_proxy:
+                if location:
+                    # On-demand fetch a proxy for this country if the pool lacks one.
+                    proxy = await self._get_next_proxy_async(country=location)
+                    if not proxy:
+                        raise RuntimeError(f"No proxy available for country: {location}")
+                else:
+                    proxy = self._get_next_proxy()
+            else:
+                proxy = None
+
             timeout = config.YOUTUBE_PROXY_REQUEST_TIMEOUT if proxy else config.YOUTUBE_REQUEST_TIMEOUT
 
             logger.info("executing_innertube_post", endpoint=endpoint, attempt=attempt,
@@ -582,7 +598,7 @@ class YouTubeScraperService(ProxyRotatingService):
             logger.warn("player_pool_failed", video_id=video_id, error=str(e))
         return data
 
-    async def search(self, query: str, sort: str = "relevance", timeframe: str = "all", limit: int = 20) -> Dict[str, Any]:
+    async def search(self, query: str, sort: str = "relevance", timeframe: str = "all", limit: int = 20, location: Optional[str] = None) -> Dict[str, Any]:
         """Perform a stealth search request using InnerTube /v1/search with pagination support."""
         # Map sort and timeframe filters to sp parameter
         sp_mapping = {
@@ -609,12 +625,12 @@ class YouTubeScraperService(ProxyRotatingService):
         sp_param = sp_mapping.get((sort, timeframe), "EgIQAQ==")
         
         payload = {
-            "context": self._get_client_context("WEB"),
+            "context": self._get_client_context("WEB", country=location),
             "query": query,
             "params": sp_param
         }
-        
-        data = await self._execute_post("search", payload)
+
+        data = await self._execute_post("search", payload, location=location)
         videos = self.extract_videos(data)
         
         # Paginate if needed
@@ -627,10 +643,10 @@ class YouTubeScraperService(ProxyRotatingService):
             try:
                 while current_token and len(videos) < limit:
                     next_payload = {
-                        "context": self._get_client_context("WEB"),
+                        "context": self._get_client_context("WEB", country=location),
                         "continuation": current_token
                     }
-                    next_data = await self._execute_post("search", next_payload)
+                    next_data = await self._execute_post("search", next_payload, location=location)
                     new_videos = self.extract_videos(next_data)
                     if not new_videos:
                         break
