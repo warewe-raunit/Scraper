@@ -980,6 +980,9 @@ async def persist_session(account_id: str, context: BrowserContext) -> None:
     session_id = profile_session_id(account_id, profile)
     logger.info("browser_manager.persist_session.start", account_id=account_id, session_id=session_id)
     state = await context.storage_state()
+    # Save user agent and Client Hints headers to align HTTP clients with browser fingerprints
+    state["_user_agent"] = profile.get("user_agent")
+    state["_extra_http_headers"] = _profile_http_headers(profile)
     save_session(session_id, state)
     logger.info(
         "browser_manager.persist_session.complete",

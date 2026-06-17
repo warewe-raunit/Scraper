@@ -62,6 +62,7 @@ class AccountState:
     total_requests: int = 0
     total_successes: int = 0
     total_relogins: int = 0
+    login_country: Optional[str] = None
 
     def snapshot(self) -> dict:
         return {
@@ -77,6 +78,7 @@ class AccountState:
             "total_requests": self.total_requests,
             "total_successes": self.total_successes,
             "total_relogins": self.total_relogins,
+            "login_country": self.login_country,
         }
 
 
@@ -152,6 +154,50 @@ class LinkedInAccountPool:
                 self._reactivate_disabled_locked()
             if time.time() >= deadline:
                 raise NoAccountAvailable("No LinkedIn accounts available within wait window.")
+            await asyncio.sleep(0.25)
+
+    async def acquire_multi(self, count: int, acquire_wait_seconds: Optional[float] = None) -> List[AccountState]:
+        """Reserve up to `count` healthy accounts that are in the same country.
+
+        If no group of accounts is free, waits up to acquire_wait_seconds.
+        """
+        wait_sec = acquire_wait_seconds if acquire_wait_seconds is not None else self.acquire_wait_seconds
+        deadline = time.time() + wait_sec
+        while True:
+            async with self._lock:
+                # Reactivate disabled accounts whose backoff expired
+                self._reactivate_disabled_locked()
+
+                # Group free healthy accounts by country
+                # We accept ALIVE or DYING, preferring ALIVE
+                candidates = []
+                for acc in self._accounts.values():
+                    if not acc.in_use and acc.status in (ALIVE, DYING):
+                        candidates.append(acc)
+
+                if candidates:
+                    # Group by login_country (normalize to upper, default to "UNKNOWN")
+                    groups: Dict[str, List[AccountState]] = {}
+                    for acc in candidates:
+                        country = (acc.login_country or "UNKNOWN").strip().upper()
+                        groups.setdefault(country, []).append(acc)
+
+                    # Sort candidates in each group so ALIVE accounts are preferred over DYING
+                    for country in groups:
+                        groups[country].sort(key=lambda a: (0 if a.status == ALIVE else 1, a.last_success_at))
+
+                    # Find the group with the most candidates
+                    best_country = max(groups.keys(), key=lambda c: len(groups[c]))
+                    chosen_group = groups[best_country]
+
+                    # Acquire up to `count` accounts from this group
+                    acquired = chosen_group[:count]
+                    for acc in acquired:
+                        acc.in_use = True
+                    return acquired
+
+            if time.time() >= deadline:
+                raise NoAccountAvailable("No LinkedIn accounts available in the same region.")
             await asyncio.sleep(0.25)
 
     async def release(self, account_id: str, *, success: bool, session_redirected: bool,
@@ -348,6 +394,18 @@ class LinkedInAccountPool:
                     acc.consecutive_relogin_failures = 0
                     acc.total_relogins += 1
                     acc.last_success_at = time.time()
+
+                    for suffix in ("__mobile.json", "__desktop.json", ".json"):
+                        p = SESSIONS_DIR / f"{account_id}{suffix}"
+                        if p.exists():
+                            try:
+                                d = json.loads(p.read_text(encoding="utf-8"))
+                                acc.login_country = d.get("_login_country")
+                                if acc.login_country:
+                                    break
+                            except Exception:
+                                pass
+
                     logger.info("account_pool.relogin_success", account_id=account_id,
                                 total_relogins=acc.total_relogins)
                 else:
@@ -374,12 +432,26 @@ class LinkedInAccountPool:
             account_id = acc["account_id"]
             if account_id in self._accounts:
                 continue
+
+            country = None
+            for suffix in ("__mobile.json", "__desktop.json", ".json"):
+                p = SESSIONS_DIR / f"{account_id}{suffix}"
+                if p.exists():
+                    try:
+                        d = json.loads(p.read_text(encoding="utf-8"))
+                        country = d.get("_login_country")
+                        if country:
+                            break
+                    except Exception:
+                        pass
+
             self._accounts[account_id] = AccountState(
                 account_id=account_id,
                 username=acc["username"],
                 password=acc["password"],
                 static_proxy=acc["proxy_url"],
                 status=self._infer_initial_status(account_id),
+                login_country=country,
             )
             loaded += 1
 

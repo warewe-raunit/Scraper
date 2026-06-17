@@ -488,10 +488,18 @@ async def login(
             else:
                 user_el = await _find_login_field(page, "username", user_sels)
                 pass_el = await _find_login_field(page, "password", pass_sels)
-                # Full form (email+password) OR the "Welcome back" remembered-
-                # account page which shows ONLY a password field (the email is a
-                # pre-filled profile chip). Either is enough to proceed.
-                if pass_el and (user_el or True):
+                # Branch on what's ACTUALLY on the page, not on the URL —
+                # LinkedIn varies the flow run-to-run. A password field means the
+                # login form (full, or "Welcome back" password-only). Proceed.
+                if pass_el:
+                    break
+                # No password field. LinkedIn may have jumped straight to an OTP /
+                # verification step, or the loaded session may already be valid.
+                # Detect either by content and STOP — re-navigating to the next
+                # candidate URL would make LinkedIn send a FRESH OTP email and
+                # we'd race it. The post-submit block handles both cases.
+                if await _detect_otp_input(page, max_wait_seconds=2.0) \
+                        or await _is_logged_in(page, username):
                     break
 
         if login_method == "google":
@@ -608,10 +616,15 @@ async def login(
 
             await _delay(account_id, 3.0, 5.0)
 
+        elif not pass_el:
+            # No password field on the page. LinkedIn either jumped straight to a
+            # verification/OTP step or the loaded session is already valid. Don't
+            # fail here — fall through to the unified verification block below,
+            # which detects the OTP input (by content), fetches the email code,
+            # and confirms login (or reports why it couldn't).
+            log.info("linkedin.login.no_password_field_proceeding_to_verification",
+                     account_id=account_id, url=page.url)
         else:
-            if not pass_el:
-                raise RuntimeError("Password field not found on LinkedIn login page.")
-
             pass_el = await _resolve_editable_element(page, pass_el)
 
             # Full login form: type the email first. On the "Welcome back"

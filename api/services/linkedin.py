@@ -333,6 +333,11 @@ class LinkedInScraperService:
                              account_id=target_account_id, final_url=final_url)
                 return False
 
+            # Preserve underscore-prefixed metadata keys (like _user_agent, _extra_http_headers, _login_proxy)
+            for k, v in original_state.items():
+                if isinstance(k, str) and k.startswith("_") and k not in new_state:
+                    new_state[k] = v
+
             session_file.write_text(json.dumps(new_state, indent=2), encoding="utf-8")
             logger.info(
                 "voyager_refresh.success",
@@ -428,30 +433,53 @@ class LinkedInScraperService:
                        attempts=len(tried_accounts))
         return last_result
 
-    async def validate_account(self, account_id: str) -> bool:
-        """Cheap authenticated probe — True only if the account's session is
-        actually alive (a real Voyager call returns data, not a 302→login).
+    async def _classify_account_health(self, account_id: str) -> str:
+        """Tri-state health verdict for an account's saved session:
 
-        Used by the startup/periodic health sweep so the pool can mark a stale
-        session DEAD before any real request is routed to it. A missing session
-        file or any redirect/exhaustion verdict counts as unhealthy.
+            "healthy"      — a real Voyager call returned data.
+            "dead"         — no session file, or the session 302→login (the
+                             li_at is genuinely expired/invalid). Needs relogin.
+            "inconclusive" — the probe failed for proxy/network reasons (no proxy
+                             reached LinkedIn, or an exception). This proves
+                             NOTHING about the session, so we must NOT relogin —
+                             otherwise a flaky/empty proxy pool would falsely
+                             condemn every account at once.
         """
         if not self._resolve_session_file(account_id):
-            return False
+            return "dead"  # nothing to validate — genuinely needs a login
         probe_path = os.getenv("LINKEDIN_VALIDATE_PROBE_PATH", "/voyager/api/me")
         try:
-            result, _redirected, _exhausted = \
+            result, redirected, _exhausted = \
                 await self._voyager_get_for_account_with_signal(probe_path, account_id)
         except Exception as e:
             logger.warning("linkedin.validate_probe_error",
                            account_id=account_id, error=str(e)[:160])
-            return False
-        return result is not None
+            return "inconclusive"
+        if result is not None:
+            return "healthy"
+        if redirected:
+            return "dead"  # 302→login = the session itself is dead
+        # result is None but NOT a redirect → couldn't reach LinkedIn at all
+        # (proxy exhausted/unreachable). Session is presumed fine; don't relogin.
+        return "inconclusive"
 
-    async def validate_all_accounts(self) -> Dict[str, bool]:
+    async def validate_account(self, account_id: str) -> bool:
+        """Back-compat boolean probe (True only when the session is confirmed
+        alive). Inconclusive proxy/network failures count as not-healthy here but
+        do NOT imply the session is dead — see _classify_account_health.
+        """
+        return (await self._classify_account_health(account_id)) == "healthy"
+
+    async def validate_all_accounts(self) -> Dict[str, str]:
         """Probe every pool account in parallel and report each verdict to the
-        pool. Healthy → marked ALIVE (usable); unhealthy → marked DEAD + queued
-        for relogin. Returns {account_id: healthy}.
+        pool. Only DEFINITIVE verdicts touch account state:
+
+            healthy      → marked ALIVE (usable)
+            dead         → marked DEAD + queued for relogin
+            inconclusive → left untouched (no relogin) — the probe couldn't reach
+                           LinkedIn, so we can't conclude the session is bad.
+
+        Returns {account_id: verdict}.
         """
         from api.services.linkedin_account_pool import LinkedInAccountPool
         pool = await LinkedInAccountPool.instance()
@@ -460,20 +488,25 @@ class LinkedInScraperService:
             return {}
 
         async def _check(aid: str):
-            ok = await self.validate_account(aid)
-            await pool.report_account_health(aid, ok)
-            return aid, ok
+            verdict = await self._classify_account_health(aid)
+            if verdict == "healthy":
+                await pool.report_account_health(aid, True)
+            elif verdict == "dead":
+                await pool.report_account_health(aid, False)
+            # inconclusive → deliberately no report (leave status as-is)
+            return aid, verdict
 
         results = await asyncio.gather(*[_check(a) for a in ids], return_exceptions=True)
-        verdict: Dict[str, bool] = {}
+        verdict: Dict[str, str] = {}
         for r in results:
             if isinstance(r, Exception):
                 continue
-            aid, ok = r
-            verdict[aid] = ok
+            aid, v = r
+            verdict[aid] = v
         logger.info("linkedin.account_validation_complete",
-                    healthy=sum(1 for v in verdict.values() if v),
-                    unhealthy=sum(1 for v in verdict.values() if not v),
+                    healthy=sum(1 for v in verdict.values() if v == "healthy"),
+                    dead=sum(1 for v in verdict.values() if v == "dead"),
+                    inconclusive=sum(1 for v in verdict.values() if v == "inconclusive"),
                     total=len(ids))
         return verdict
 
@@ -525,6 +558,7 @@ class LinkedInScraperService:
         # LinkedIn binds li_at to the login IP; using the same proxy here keeps the
         # IP class stable so the session validates.
         login_proxy = None
+        login_country = None
         known_good_persisted: List[str] = []
         try:
             sf = self._resolve_session_file(target_account_id)
@@ -532,11 +566,30 @@ class LinkedInScraperService:
                 with open(sf, "r", encoding="utf-8") as f:
                     st = json.load(f)
                 login_proxy = st.get("_login_proxy")
+                login_country = st.get("_login_country")
                 kg = st.get("_known_good_proxies")
                 if isinstance(kg, list):
                     known_good_persisted = [p for p in kg if isinstance(p, str)]
         except Exception:
             pass
+
+        # If login_proxy is present but login_country is missing (legacy sessions), resolve and save it
+        if login_proxy and not login_country:
+            try:
+                from tools.proxy_provider import resolve_proxy_country
+                login_country = resolve_proxy_country(login_proxy)
+                if login_country:
+                    sf = self._resolve_session_file(target_account_id)
+                    if sf:
+                        with open(sf, "r", encoding="utf-8") as f:
+                            st = json.load(f)
+                        st["_login_country"] = login_country
+                        with open(sf, "w", encoding="utf-8") as f:
+                            json.dump(st, f, indent=2)
+                        logger.info("voyager_get.resolved_and_saved_login_country",
+                                    account_id=target_account_id, country=login_country)
+            except Exception as e:
+                logger.warning("voyager_get.save_login_country_failed", error=str(e))
 
         # Clear any stale cooldown on the login proxy — earlier versions of this
         # code cooled it down on 4xx LinkedIn responses (a working proxy), and
@@ -550,10 +603,10 @@ class LinkedInScraperService:
             except Exception:
                 pass
 
-        proxy_timeout = int(os.getenv("LINKEDIN_PROXY_TIMEOUT", "8"))
+        proxy_timeout = int(os.getenv("LINKEDIN_PROXY_TIMEOUT", "4"))
         # Give the pinned login proxy a longer timeout — if it's slow but alive,
         # we want to use it instead of rotating to random pool proxies.
-        login_proxy_timeout = int(os.getenv("LINKEDIN_LOGIN_PROXY_TIMEOUT", "15"))
+        login_proxy_timeout = int(os.getenv("LINKEDIN_LOGIN_PROXY_TIMEOUT", "5"))
         url = f"https://www.linkedin.com{api_path}"
 
         async def _attempt(proxy_url: Optional[str]) -> tuple[Optional[int], Optional[Any]]:
@@ -561,7 +614,7 @@ class LinkedInScraperService:
             if not session_file:
                 raise FileNotFoundError(f"Session file not found for account {target_account_id}")
 
-            cookie_header, csrf, _ = self._load_session_cookies(session_file)
+            cookie_header, csrf, state = self._load_session_cookies(session_file)
             if not cookie_header:
                 logger.warning("voyager_no_cookies", path=str(session_file))
                 return None, None
@@ -569,17 +622,53 @@ class LinkedInScraperService:
                 logger.warning("voyager_no_csrf_token", path=str(session_file))
                 return None, None
 
+            # Dynamically resolve user-agent and Client Hints headers from the saved state,
+            # falling back to the deterministic profile if missing (e.g. legacy sessions).
+            from tools.stealth.fingerprint import BrowserProfileManager
+            from tools.browser_manager import _profile_http_headers
+
+            user_agent = state.get("_user_agent")
+            dynamic_headers = state.get("_extra_http_headers")
+            is_mobile = False
+
+            if not user_agent or not dynamic_headers:
+                profile = BrowserProfileManager().generate(target_account_id)
+                user_agent = profile["user_agent"]
+                dynamic_headers = _profile_http_headers(profile)
+                is_mobile = profile.get("is_mobile", False)
+            else:
+                is_mobile = "android" in user_agent.lower() or "iphone" in user_agent.lower()
+
+            device_ff = "MOBILE" if is_mobile else "DESKTOP"
+            os_name = "android" if is_mobile else "web"
+
+            x_li_track = json.dumps({
+                "clientVersion": "1.13.0",
+                "mpVersion": "1.13.0",
+                "osName": os_name,
+                "timezoneOffset": 5.5,
+                "deviceFormFactor": device_ff,
+                "mpName": "voyager-web"
+            }, separators=(',', ':'))
+
             headers = {
                 "accept": "application/vnd.linkedin.normalized+json+2.1",
                 "accept-language": "en-US,en;q=0.9",
                 "csrf-token": csrf,
                 "x-restli-protocol-version": "2.0.0",
                 "x-li-lang": "en_US",
-                "x-li-track": '{"clientVersion":"1.13.0","mpVersion":"1.13.0","osName":"web","timezoneOffset":5.5,"deviceFormFactor":"DESKTOP","mpName":"voyager-web"}',
-                "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1",
+                "x-li-track": x_li_track,
+                "user-agent": user_agent,
                 "cookie": cookie_header,
                 "referer": "https://www.linkedin.com/feed/",
             }
+
+            # Align dynamic headers to avoid case duplicate conflicts
+            for k, v in list(dynamic_headers.items()):
+                if k.lower() in (hk.lower() for hk in headers):
+                    base_key = next(hk for hk in headers if hk.lower() == k.lower())
+                    del headers[base_key]
+            headers.update(dynamic_headers)
 
             from curl_cffi import requests
             session = requests.Session()
@@ -599,7 +688,8 @@ class LinkedInScraperService:
 
         def _pick_proxy() -> Optional[str]:
             if gp.is_enabled():
-                p = gp.get_next()
+                # Force same-country proxy rotation to avoid impossible travel bans
+                p = gp.get_next(country=login_country, fallback_to_any=False)
                 if p:
                     return p
             return static_proxy
@@ -706,9 +796,17 @@ class LinkedInScraperService:
                     direct.append(c)
             for p, ts in sorted(recent.items(), key=lambda kv: -kv[1]):
                 if now - ts <= _STICKY_PROXY_TTL and p not in direct:
+                    if login_country:
+                        p_country = gp.proxy_countries.get(p)
+                        if p_country and p_country != login_country:
+                            continue
                     direct.append(p)
             for p in known_good_persisted:
                 if p not in direct:
+                    if login_country:
+                        p_country = gp.proxy_countries.get(p)
+                        if p_country and p_country != login_country:
+                            continue
                     direct.append(p)
 
             for p in direct:
@@ -753,7 +851,7 @@ class LinkedInScraperService:
                 for p, ok in zip(batch, results):
                     if not ok:
                         tried.add(p)
-                        gp.mark_failed(p)
+                        gp.cool_down(p)  # global provider uses cool_down (no mark_failed)
                 # LinkedIn's IP binding is class-based — same-subnet proxies first.
                 healthy.sort(key=lambda p: _subnet_distance(p, login_ip))
                 logger.info("voyager_fetch.vet_batch", account_id=target_account_id,
@@ -949,14 +1047,9 @@ class LinkedInScraperService:
         """Walk Voyager result pages by advancing the `start` offset until `limit`
         is reached, an empty page ends the set, or a safety ceiling trips.
 
-        Design: a whole walk is PINNED to ONE account, because LinkedIn returns
-        results relative to the session — mixing accounts across pages produces
-        gaps/overlaps (one rate-limited session can return a short page, leaving a
-        hole). The pinned account's pages are still fetched in PARALLEL waves of
-        LINKEDIN_PARALLEL_PAGES (same session, different offsets, concurrently), so
-        a big pull returns in roughly one page's time. If an account yields a
-        suspiciously short total (degraded/rate-limited), we release it and retry
-        the walk on another account, keeping the best result.
+        Design: we distribute parallel page requests across different accounts residing
+        in the same country, rather than firing multiple concurrent requests on a single account.
+        This prevents concurrent request rate-limit blocks and impossible travel bans.
 
         "Next page" is purely the API `start` offset — no browser. LinkedIn refuses
         very deep offsets (~1000), bounded by LINKEDIN_PAGINATION_MAX/_MAX_PAGES.
@@ -1040,44 +1133,98 @@ class LinkedInScraperService:
             out, ok, _redirected, _exhausted = await _walk_on(account_id)
             return out[:target] if ok else None
 
-        # Pool: hold one account per walk; swap to another if it returns a short
-        # (degraded) total so a rate-limited session can't truncate the result.
+        # Pool: distribute requests in parallel waves across different accounts from the same region
         from api.services.linkedin_account_pool import LinkedInAccountPool, NoAccountAvailable
         pool = await LinkedInAccountPool.instance()
-        best: Optional[List[Dict[str, Any]]] = None
+
+        out: List[Dict[str, Any]] = []
+        seen: set = set()
         any_ok_overall = False
-        tried: set = set()
-        for _attempt in range(max(1, account_tries)):
+
+        # Prepare pagination offsets
+        offsets_to_fetch = [i * page_size for i in range(max_pages)]
+        offset_ptr = 0
+
+        while offset_ptr < len(offsets_to_fetch) and len(out) < target:
+            remaining_needed = -(-(target - len(out)) // page_size)
+            wave_size = min(parallel, remaining_needed, len(offsets_to_fetch) - offset_ptr)
+            if wave_size <= 0:
+                break
+
+            wave_offsets = offsets_to_fetch[offset_ptr : offset_ptr + wave_size]
+
             try:
-                acc = await pool.acquire()
+                # Acquire different accounts from the same country/region
+                accounts = await pool.acquire_multi(count=wave_size)
             except NoAccountAvailable:
+                logger.error("voyager_paginate.no_accounts_available")
                 break
-            if acc.account_id in tried:
-                await pool.release(acc.account_id, success=False, session_redirected=False)
+
+            actual_wave_size = len(accounts)
+            if actual_wave_size <= 0:
                 break
-            tried.add(acc.account_id)
-            out: List[Dict[str, Any]] = []
-            ok = False
-            redirected = False
-            exhausted = False
-            try:
-                out, ok, redirected, exhausted = await _walk_on(acc.account_id)
-            finally:
-                # Feed the walk's health signals to the pool so a dead/degraded
-                # session is demoted + relogged, exactly like the single-shot
-                # path. (When out is non-empty, release() treats it as success
-                # and the signals are ignored — only an empty walk demotes.)
-                await pool.release(acc.account_id, success=bool(out),
-                                   session_redirected=redirected,
-                                   proxies_exhausted=exhausted)
-            any_ok_overall = any_ok_overall or ok
-            if best is None or len(out) > len(best):
-                best = out
-            if len(best or []) >= healthy_floor:
-                break  # got a healthy-sized result — good
-        if best is None and not any_ok_overall:
+
+            wave_offsets = wave_offsets[:actual_wave_size]
+            offset_ptr += actual_wave_size
+
+            # Concurrently request pagination offsets using distinct accounts from the same country
+            tasks = [
+                self._voyager_get_for_account_with_signal(build_path(start, page_size), acc.account_id)
+                for start, acc in zip(wave_offsets, accounts)
+            ]
+
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            wave_stop = False
+            for start, acc, r in zip(wave_offsets, accounts, results):
+                success = False
+                redirected = False
+                exhausted = False
+                data = None
+
+                if isinstance(r, tuple) and len(r) == 3:
+                    data, redirected, exhausted = r
+                    if data is not None:
+                        success = True
+
+                if success:
+                    any_ok_overall = True
+                    page = parse_page(data) or []
+                    added = 0
+                    for item in page:
+                        k = dedup_key(item)
+                        if k is not None and k in seen:
+                            continue
+                        if k is not None:
+                            seen.add(k)
+                        out.append(item)
+                        added += 1
+                        if len(out) >= target:
+                            break
+                    logger.info("voyager_paginate.page", start=start, page_items=len(page),
+                                added=added, total=len(out), target=target, account=acc.account_id)
+
+                    if len(page) == 0 or added == 0:
+                        wave_stop = True
+                else:
+                    logger.warning("voyager_paginate.page_failed", start=start, account=acc.account_id)
+                    # Requeue this start offset to be retried in a future wave with a different account
+                    offsets_to_fetch.append(start)
+
+                # Release each account independently with its health status
+                await pool.release(
+                    acc.account_id,
+                    success=success,
+                    session_redirected=redirected,
+                    proxies_exhausted=exhausted
+                )
+
+            if wave_stop or len(out) >= target:
+                break
+
+        if not any_ok_overall and not out:
             return None
-        return (best or [])[:target]
+        return out[:target]
 
     async def scrape_profile(self, public_id: str, account_id: Optional[str] = None) -> Dict[str, Any]:
         """Scrape professional profile details using Voyager API."""

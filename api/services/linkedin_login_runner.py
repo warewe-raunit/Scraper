@@ -64,6 +64,16 @@ def persist_login_proxy_into_session(account_id: str, proxy_url: str) -> None:
         if sess_path.exists():
             d = json.loads(sess_path.read_text(encoding="utf-8"))
             d["_login_proxy"] = proxy_url
+
+            try:
+                from tools.proxy_provider import resolve_proxy_country
+                country = resolve_proxy_country(proxy_url)
+                if country:
+                    d["_login_country"] = country
+                    logger.info("login.country_resolved_for_session", account_id=account_id, country=country)
+            except Exception as e:
+                logger.warning("login.country_resolution_failed", error=str(e))
+
             sess_path.write_text(json.dumps(d, indent=2), encoding="utf-8")
             logger.info("login.proxy_pinned_to_session", path=str(sess_path), proxy=proxy_url[:30] + "...")
     except Exception as e:
