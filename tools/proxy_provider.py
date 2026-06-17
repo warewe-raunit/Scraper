@@ -103,6 +103,8 @@ class GoodProxiesProvider:
         self.max_ping = (os.getenv("GOODPROXIES_MAX_PING") or "").strip()
         self.min_works = (os.getenv("GOODPROXIES_MIN_WORKS") or "").strip()
         self.max_time = (os.getenv("GOODPROXIES_MAX_TIME") or "").strip()
+        self.speed = (os.getenv("GOODPROXIES_SPEED") or "").strip()
+        self.lang = (os.getenv("GOODPROXIES_LANG") or "").strip()
         # US-only by default. Empty env no longer means "worldwide"; it means US.
         # Set GOODPROXIES_COUNTRY explicitly (e.g. "us,ca") to override, or
         # GOODPROXIES_COUNTRY=any to deliberately allow all countries.
@@ -193,6 +195,10 @@ class GoodProxiesProvider:
             params["works"] = self.min_works
         if self.max_time:
             params["time"] = self.max_time
+        if self.speed:
+            params["speed"] = self.speed
+        if self.lang:
+            params["lang"] = self.lang
         if self.country and self.country.lower() != "any":
             params["country"] = self.country
             params["cm"] = "include"  # return ONLY these countries (explicit)
@@ -212,9 +218,16 @@ class GoodProxiesProvider:
         ptype = str(entry.get("type") or "http").strip().lower()
         if not ip or ":" not in ip:
             return None
-        if ptype not in cls.VALID_TYPES:
+        if ptype == "https":
             ptype = "http"
-        return f"{ptype}://{ip}"
+        elif ptype not in cls.VALID_TYPES:
+            ptype = "http"
+        # Emit REMOTE-DNS schemes for SOCKS so curl_cffi/libcurl resolves the
+        # target hostname through the proxy. Plain socks5:// (local DNS) fails on
+        # most socks5 proxies with curl err 97; socks5h:// works. Measured
+        # 2026-06-17: socks5:// -> 0/15 live, socks5h:// -> 8/15 live.
+        scheme = {"socks5": "socks5h", "socks4": "socks4a"}.get(ptype, ptype)
+        return f"{scheme}://{ip}"
 
     def _fetch(self) -> List[str]:
         """Fetch + filter + healthcheck (the one-shot path used by refresh())."""
@@ -280,11 +293,17 @@ class GoodProxiesProvider:
         return [u for (u, _ping, _works) in rows]
 
     def _probe_one(self, proxy_url: str) -> bool:
-        """Return True if the proxy can fetch the healthcheck URL with 2xx/3xx.
+        """Return True if the proxy returns ANY HTTP response for the healthcheck URL.
 
-        Uses a short timeout so a dead proxy is rejected fast. Any exception
-        (timeout, refused, tunnel failure, TLS error, the curl_cffi fingerprint
-        unpack bug) counts as 'dead' for admission purposes.
+        This is a *liveness* probe, not a content check: getting any response back
+        proves the proxy connected and tunneled (HTTPS CONNECT succeeded). The
+        target's status code does NOT indicate proxy health — many datacenter/
+        proxy IPs get a 403/429 from the healthcheck host while tunneling
+        perfectly, so the old ``2xx/3xx only`` rule falsely evicted good, live
+        proxies. Real failures (timeout, connection refused, CONNECT tunnel
+        failure, TLS error, the curl_cffi unpack bug) raise and count as dead.
+        A 5xx is the one status we still reject, since it usually means the proxy
+        gateway itself errored rather than the target responding.
         """
         try:
             resp = cffi_requests.get(
@@ -294,7 +313,7 @@ class GoodProxiesProvider:
                 # No impersonate here: we want a cheap liveness probe, and
                 # impersonate can trigger the curl_cffi unpack bug on some proxies.
             )
-            return 200 <= resp.status_code < 400
+            return resp.status_code < 500
         except Exception:
             return False
 
@@ -389,8 +408,13 @@ class GoodProxiesProvider:
 
         # 2. Floor-gated top-up: refetch only when genuinely short of proxies.
         do_topup = len(live_set) < self.min_live
+        now = time.time()
+        can_fetch = (now - self._last_fetch) >= self.refresh_seconds
+        
         fresh_live: List[str] = []
-        if do_topup:
+        topped_up = False
+        if do_topup and can_fetch:
+            topped_up = True
             need = self.target_live - len(live_set)
             try:
                 raw = self._fetch_raw()
@@ -400,6 +424,7 @@ class GoodProxiesProvider:
             candidates = [p for p in raw if p not in live_set]
             if candidates:
                 fresh_live = self._filter_live(candidates)[: max(0, need)]
+            self._last_fetch = now
 
         newly_added = [p for p in fresh_live if p not in live_set]
         merged = live_now + newly_added
@@ -415,11 +440,10 @@ class GoodProxiesProvider:
             p: s for p, s in self._reverify_strikes.items() if p in merged_set
         }
         self._grace = {p: g for p, g in self._grace.items() if p in merged_set}
-        self._last_fetch = time.time()
         logger.info("proxy_pool_enriched",
                     live=len(merged), target=self.target_live, min_live=self.min_live,
                     reverified=len(live_now), added=len(newly_added),
-                    graced=graced_count, topped_up=do_topup)
+                    graced=graced_count, topped_up=topped_up)
 
     def refresh(self, force: bool = False) -> None:
         """Refresh the pool if the interval has elapsed (or force=True) in a background thread.

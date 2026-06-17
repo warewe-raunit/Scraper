@@ -15,8 +15,15 @@ DEFAULT_PROXY_PORTS = {
     "http": 80,
     "https": 443,
     "socks4": 1080,
+    "socks4a": 1080,
     "socks5": 1080,
+    "socks5h": 1080,
 }
+
+# The proxy pool emits curl-style remote-DNS SOCKS schemes (socks5h/socks4a),
+# but Chromium and CAPTCHA solvers only understand the plain schemes (and
+# Chromium already does remote DNS for socks5), so collapse the aliases here.
+_SCHEME_ALIASES = {"socks5h": "socks5", "socks4a": "socks4"}
 
 
 def parse_proxy_url(proxy_url: str | None) -> dict | None:
@@ -29,6 +36,7 @@ def parse_proxy_url(proxy_url: str | None) -> dict | None:
 
     parsed = urlparse(value)
     scheme = (parsed.scheme or "").lower()
+    scheme = _SCHEME_ALIASES.get(scheme, scheme)
     host = parsed.hostname
     port = parsed.port or DEFAULT_PROXY_PORTS.get(scheme)
     if not scheme or not host or not port:

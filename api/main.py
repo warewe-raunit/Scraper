@@ -111,6 +111,13 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
 
+    # Close any warm X scraper browsers so Chromium processes don't leak.
+    try:
+        from tools.unauth_x_scraper import _x_browser_pool
+        await _x_browser_pool.close_all()
+    except Exception:
+        pass
+
 
 # 2. Instantiate FastAPI App
 app = FastAPI(
@@ -222,21 +229,40 @@ def health_check():
             content={"status": "unhealthy", "error": str(e)}
         )
 
+def proactor_loop_factory(use_subprocess: bool = False) -> "asyncio.AbstractEventLoop":
+    """uvicorn event-loop factory that pins the Proactor loop on Windows.
+
+    uvicorn 0.40 hands subprocess/reload workers a ``SelectorEventLoop``
+    (use_subprocess=True), but Playwright — and any asyncio subprocess — needs
+    the Proactor loop on Windows; a SelectorEventLoop makes browser/relogin
+    launches fail with NotImplementedError. uvicorn resolves this factory per
+    worker (before the loop is created), so forcing Proactor here keeps
+    ``--reload`` working without breaking Chromium. (This factory is only wired
+    in on win32; other platforms keep uvicorn's default 'auto'.)
+    """
+    return asyncio.ProactorEventLoop()
+
+
 if __name__ == "__main__":
     import uvicorn
-    
-    if sys.platform == "win32":
-        # Playwright subprocesses require the Proactor event loop on Windows.
-        # It's the 3.8+ default, but pin it explicitly via the non-deprecated
-        # API (ProactorEventLoop + set_event_loop) so we don't rely on the
-        # default and don't touch the deprecated event-loop *policy* API.
-        config = uvicorn.Config("api.main:app", host="127.0.0.1", port=8000, reload=True, loop="asyncio")
-        server = uvicorn.Server(config)
-        loop = asyncio.ProactorEventLoop()
-        try:
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(server.serve())
-        finally:
-            loop.close()
-    else:
-        uvicorn.run("api.main:app", host="127.0.0.1", port=8000, reload=True)
+
+    host = os.getenv("API_HOST", "127.0.0.1")
+    port = int(os.getenv("API_PORT", "8000"))
+    reload = os.getenv("API_RELOAD", "true").strip().lower() in ("1", "true", "yes", "on")
+
+    # Go through uvicorn.run so the auto-reload supervisor is active. (The old
+    # Windows branch built a Server and called server.serve() directly, which
+    # silently disabled --reload — the reloader lives in the supervisor layer.)
+    # On Windows we MUST force the Proactor loop via a custom loop factory,
+    # because under --reload uvicorn would otherwise pick SelectorEventLoop in
+    # the worker and break Playwright. Watch only source dirs so reloads aren't
+    # triggered by sessions/, downloads/, or logs.
+    loop = "api.main:proactor_loop_factory" if sys.platform == "win32" else "auto"
+    uvicorn.run(
+        "api.main:app",
+        host=host,
+        port=port,
+        reload=reload,
+        reload_dirs=[str(ROOT / "api"), str(ROOT / "tools")] if reload else None,
+        loop=loop,
+    )

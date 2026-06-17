@@ -33,9 +33,9 @@ shared `CooldownPool`.
 | # | Location | Issue | Status this pass |
 |---|----------|-------|------------------|
 | L1 | all 4 services | sync `curl_cffi` in `run_in_executor` saturates the thread pool under slow proxies | **Deferred** (Phase 3 — needs live verification of impersonate/proxy parity) |
-| L2 | `reddit.py` `_execute_with_failover` | backoff `sleep` fires even when switching to a fresh account+IP | **Deferred** (Phase 2) |
+| L2 | `reddit.py` `_execute_with_failover` | backoff `sleep` fires even when switching to a fresh account+IP | **Fixed** (Phase 2) |
 | L3 | `youtube.py` `get_video_details` | independent `player` + `next` POSTs run serially (~3s → 1.5s) | **Fixed** |
-| L4 | `unauth_x_scraper.py` | `LazyBrowser` built + closed per request, defeating its own persistence | **Deferred** (Phase 2) |
+| L4 | `unauth_x_scraper.py` | `LazyBrowser` built + closed per request, defeating its own persistence | **Fixed** (Phase 2) |
 | L5 | `youtube.py` `_get_innertube_key` | Playwright key extraction can sit in the request path | **Fixed** (startup warmup) |
 | L6 | `linkedin.py` | on-demand proxy probe + mid-request Playwright cookie refresh block the client | **Deferred** (Phase 3) |
 | L7 | `dependencies.py` `create_stealth_client` | fingerprint profile regenerated on every request | **Fixed** (per-account cache) |
@@ -114,15 +114,42 @@ shared `CooldownPool`.
 
 ---
 
+## 3b. Phase 2 (applied later) + dev experience
+
+- **L2 — Reddit fast failover** (`reddit.py` `_execute_with_failover`): removed the
+  unconditional per-retry backoff. Failing over to a *different* healthy account
+  (and, via the rotating pool, a fresh IP) now happens immediately. A backoff sleep
+  is applied **only** when the entire account pool is exhausted — the one case
+  where waiting helps — and that path now retries-after-sleep instead of failing on
+  the first exhausted check.
+- **L4 — persistent X browser pool** (`unauth_x_scraper.py`): added `XBrowserPool`,
+  a process-wide pool of warm `LazyBrowser`s keyed by `(account_id, proxy_url,
+  headless)`, replacing the build-and-`close()`-per-request pattern that paid the
+  5–15s stealth launch every fallback. Concurrency is serialized per browser via an
+  `asyncio.Lock` (one page per browser); the pool is bounded (`X_BROWSER_POOL_MAX`,
+  default 4) with LRU + idle-TTL (`X_BROWSER_IDLE_TTL`, default 300s) eviction; an
+  in-use browser is never force-closed; all are closed on shutdown via `close_all()`
+  wired into `lifespan`. Covered by `tests/test_x_browser_pool.py`.
+- **Auto-reload fix** (`main.py`): the Windows entrypoint built a `Server` and called
+  `server.serve()` directly, which **silently disabled `--reload`** (the reloader
+  lives in uvicorn's supervisor layer, not `Server.serve`). Replaced with a single
+  `uvicorn.run(..., reload=...)` for all platforms. **Windows caveat:** under
+  `--reload`, uvicorn 0.40 hands the worker a `SelectorEventLoop`
+  (`asyncio_loop_factory(use_subprocess=True)`), which cannot spawn subprocesses —
+  so Playwright/relogin launches crash with `NotImplementedError`. Fixed by wiring a
+  custom uvicorn loop factory (`loop="api.main:proactor_loop_factory"` on win32) that
+  forces `ProactorEventLoop` in the worker. Reload, host, and port are env-driven
+  (`API_RELOAD` default true, `API_HOST`, `API_PORT`); only `api/` and `tools/` are
+  watched.
+
 ## 4. Deliberately NOT changed (and why)
 
 - **Async `curl_cffi` migration (L1)** — the single biggest throughput win, but it
   changes the network behavior of a working stealth system. Without live proxies +
   account sessions to confirm that `AsyncSession` preserves impersonation and proxy
   behavior, the regression risk outweighs the benefit for this pass.
-- **Reddit no-backoff-on-failover (L2)**, **persistent X browser pool (L4)**,
-  **LinkedIn background probe/cookie healing (L6)** — behavior-changing and best
-  validated against live targets. Documented here as the recommended next phase.
+- **LinkedIn background probe/cookie healing (L6)** — behavior-changing and best
+  validated against live targets. Recommended for a later phase.
 - **`/health` endpoint** — it reports saved-session *file* counts rather than live
   session health. Left as-is to avoid changing an output shape that monitoring may
   depend on; flagged as a known limitation.
@@ -131,27 +158,27 @@ shared `CooldownPool`.
 
 ## 5. Verification
 
-- `python -m pytest tests/` → **13 passed** (was 13; no regressions). The previous
-  Pydantic `regex` deprecation warnings are gone.
+- `python -m pytest tests/` → **19 passed** (Phase 0/1 suite + proxy grace test +
+  5 new `test_x_browser_pool.py` cases; no regressions). The previous Pydantic
+  `regex` deprecation warnings are gone.
 - Import smoke test of every touched module (`api.config`, `api.services.proxy_base`,
   `api.dependencies`, `api.services.reddit`, `api.services.x`, `api.services.youtube`,
-  `api.main`, and all Reddit/YouTube routes) → all import cleanly.
+  `api.main`, `tools.unauth_x_scraper`, and all Reddit/YouTube routes) → all import
+  cleanly.
 - `pyflakes` on every touched file → no warnings.
 - `tests/test_subreddit_route.py` updated to set an explicit `API_KEY` (it
   previously relied on the removed hardcoded default).
 
 > Note: these checks confirm the changes are import-clean, behavior-preserving for
 > the covered paths, and pass the suite. They do **not** exercise live scraping —
-> validate the YouTube parallel-fetch and startup key-warmup against real traffic
-> before relying on them in production.
+> validate the YouTube parallel-fetch, the X browser pool, and the Reddit failover
+> path against real traffic before relying on them in production.
 
 ---
 
 ## 6. Recommended next steps (future phases)
 
-1. **Phase 2** — Reddit: skip backoff when failing over to a different account/IP
-   (only sleep when reusing the same one). X: hold a persistent browser/context
-   pool instead of launching+closing per request.
+1. ~~**Phase 2** — Reddit fast failover; persistent X browser pool.~~ **Done** (see §3b).
 2. **Phase 3** — migrate all HTTP scrapers to `curl_cffi` `AsyncSession`; move
    LinkedIn proxy vetting and cookie healing fully into background tasks.
 3. Make `/health` reflect real session liveness.

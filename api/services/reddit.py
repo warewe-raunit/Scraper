@@ -42,27 +42,39 @@ class RedditScraperService:
         """
         Execute a GET request with structured failover, cooldowns, and re-login retries.
 
-        Robust bounded retry: attempts span at least one rotating-proxy pool
-        refill (~60s), with a short backoff between tries so a transient block
-        gets a fresh account/IP rather than re-burning the same one. The cap
-        (``max_retries``) keeps a genuinely-down target from hanging forever.
-        On exhaustion this raises RuntimeError; the public scrape_* methods
-        translate that into a structured empty result so the caller always
-        receives output.
+        Robust bounded retry with *fast failover*: when a request fails, we switch
+        to a different healthy account immediately — no backoff — because a fresh
+        account (and, with the rotating proxy pool, a fresh IP) doesn't benefit
+        from waiting for the previous one to recover. A backoff sleep is applied
+        ONLY when the entire account pool is exhausted (every account cooling
+        down): there, waiting is the one thing that helps, so we sleep and retry
+        instead of failing instantly. The cap (``max_retries``) keeps a
+        genuinely-down target from hanging forever. On exhaustion this raises
+        RuntimeError; the public scrape_* methods translate that into a structured
+        empty result so the caller always receives output.
         """
         current_account_id = requested_account_id
         backoff_base = config.REDDIT_BACKOFF_BASE
         backoff_cap = config.REDDIT_BACKOFF_CAP
 
         for attempt in range(1, max_retries + 1):
-            if attempt > 1:
-                delay = min(backoff_cap, backoff_base * (2 ** (attempt - 2)))
-                await asyncio.sleep(delay)
-
             # 1. Resolve next healthy account ID
             try:
                 account_id = await self.registry.get_next_healthy_account(current_account_id)
             except Exception as e:
+                # Pool exhausted / all accounts cooling down. This is the only
+                # case where waiting helps — back off so cooldowns and the
+                # rotating proxy pool can recover, then retry until the budget
+                # runs out (instead of failing on the first exhausted check).
+                if attempt < max_retries:
+                    delay = min(backoff_cap, backoff_base * (2 ** (attempt - 1)))
+                    logger.warning(
+                        "reddit_account_pool_exhausted_backing_off",
+                        attempt=attempt, delay_seconds=round(delay, 1), error=str(e)
+                    )
+                    await asyncio.sleep(delay)
+                    current_account_id = None
+                    continue
                 logger.error("failover_failed_no_healthy_accounts", error=str(e), url=url)
                 raise RuntimeError(f"Scrape request failed: {e}")
 

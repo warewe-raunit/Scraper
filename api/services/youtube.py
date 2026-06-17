@@ -465,39 +465,57 @@ class YouTubeScraperService(ProxyRotatingService):
                 
         return url_or_id
 
-    async def _execute_post(self, endpoint: str, payload: dict, max_retries: int = config.YOUTUBE_MAX_RETRIES) -> dict:
-        """Execute a POST request to an InnerTube endpoint with rotated proxies and retries.
+    async def _execute_post(self, endpoint: str, payload: dict, max_retries: int = config.YOUTUBE_MAX_RETRIES, force_direct: bool = False) -> dict:
+        """Execute a POST request to an InnerTube endpoint with proxy rotation,
+        a fast per-proxy timeout, and a DIRECT (no-proxy) fallback.
 
-        Robust bounded retry: enough attempts (with growing backoff) to span at
-        least one rotating-proxy pool refill (~60s) before giving up, then a
-        final direct (no-proxy) attempt so a fully proxy-blocked run still has a
-        chance to return data instead of terminating empty.
+        The good-proxies pool is frequently unusable for YouTube's HTTPS InnerTube
+        endpoint (CONNECT-tunnel 502/503, timeouts) even though those proxies pass
+        the lightweight liveness probe — so a proxy-only loop can never succeed and
+        just thrashes the (tiny) pool. InnerTube is a public API that works without
+        a proxy, so we try the rotating pool for the first
+        ``YOUTUBE_MAX_PROXY_ATTEMPTS`` attempts (with a short timeout so dead
+        proxies fail fast) and then fall back to a direct connection, which
+        guarantees the request can still return data. Set
+        ``YOUTUBE_DIRECT_FALLBACK=false`` to force proxy-only.
         """
         last_exception = None
         for attempt in range(1, max_retries + 1):
             key = await self._get_innertube_key()
             url = f"https://www.youtube.com/youtubei/v1/{endpoint}?key={key}"
-            proxy = self._get_next_proxy()
-            
-            logger.info("executing_innertube_post", endpoint=endpoint, attempt=attempt, proxy=proxy[:30] + "..." if proxy else None)
-            
+
+            # Proxy for the first few attempts, then direct. If direct fallback is
+            # disabled we keep using the pool for every attempt (original behavior).
+            # force_direct overrides everything: never use a proxy (used for the
+            # player call, which a flagged proxy IP gets a stripped/LOGIN_REQUIRED
+            # response for — a clean direct IP returns full videoDetails).
+            if force_direct:
+                use_proxy = False
+            else:
+                use_proxy = attempt <= config.YOUTUBE_MAX_PROXY_ATTEMPTS or not config.YOUTUBE_DIRECT_FALLBACK
+            proxy = self._get_next_proxy() if use_proxy else None
+            timeout = config.YOUTUBE_PROXY_REQUEST_TIMEOUT if proxy else config.YOUTUBE_REQUEST_TIMEOUT
+
+            logger.info("executing_innertube_post", endpoint=endpoint, attempt=attempt,
+                        proxy=(proxy[:30] + "...") if proxy else "direct")
+
             try:
                 loop = asyncio.get_running_loop()
                 session = requests.Session()
                 if proxy:
                     session.proxies = {"http": proxy, "https": proxy}
-                    
+
                 headers = {
                     "content-type": "application/json",
                     "user-agent": payload.get("context", {}).get("client", {}).get("userAgent", "Mozilla/5.0"),
                     "accept": "*/*",
                     "origin": "https://www.youtube.com"
                 }
-                
+
                 # Check status and response
                 response = await loop.run_in_executor(
                     None,
-                    lambda: session.post(url, json=payload, headers=headers, impersonate=config.HTTP_IMPERSONATE, timeout=config.YOUTUBE_REQUEST_TIMEOUT)
+                    lambda: session.post(url, json=payload, headers=headers, impersonate=config.HTTP_IMPERSONATE, timeout=timeout)
                 )
 
                 if response.status_code == 200:
@@ -506,28 +524,63 @@ class YouTubeScraperService(ProxyRotatingService):
                 raise RuntimeError(f"InnerTube POST request failed with status {response.status_code}: {response.text[:200]}")
             except Exception as e:
                 last_exception = e
-                # Flag the proxy as bad and put it on cooldown for 5 minutes
+                # Flag a bad proxy for cooldown (no-op on the direct path).
                 if proxy:
                     self._cool_down_proxy(proxy, duration_seconds=config.YOUTUBE_PROXY_COOLDOWN_SECONDS)
-                    
+
                 logger.warn(
                     "innertube_post_attempt_failed",
                     endpoint=endpoint,
                     attempt=attempt,
-                    proxy=proxy[:30] + "..." if proxy else None,
+                    proxy=(proxy[:30] + "...") if proxy else "direct",
                     error=str(e)
                 )
                 if attempt < max_retries:
-                    # Capped exponential backoff so the loop spans a ~60s pool
-                    # refill across the attempt budget (instead of 0.5*attempt,
-                    # which barely waited a couple of seconds total).
-                    await asyncio.sleep(min(12.0, 1.5 * (2 ** (attempt - 1))))
+                    # Short backoff between attempts. Direct attempts don't need a
+                    # long wait (no pool to refill), so cap it tighter once direct.
+                    delay = 0.5 if not use_proxy else min(8.0, 1.0 * (2 ** (attempt - 1)))
+                    await asyncio.sleep(delay)
 
         raise RuntimeError(
-            f"All {max_retries} attempts (spanning proxy-pool refreshes + a "
-            f"direct fallback) failed for InnerTube POST to {endpoint}. "
-            f"Last error: {last_exception}"
+            f"All {max_retries} attempts (rotating proxies + direct fallback) "
+            f"failed for InnerTube POST to {endpoint}. Last error: {last_exception}"
         )
+
+    async def _fetch_player(self, video_id: str) -> dict:
+        """Fetch the player response, preferring a response that actually carries
+        videoDetails (views/description/length).
+
+        YouTube strips videoDetails (LOGIN_REQUIRED / "confirm you're not a bot")
+        when the player request comes from a flagged datacenter/proxy IP, but a
+        clean DIRECT request from the server IP returns them (status may still be
+        UNPLAYABLE — videoDetails come regardless). So we try DIRECT first and
+        only fall back to the rotating pool if direct fails outright. Streaming
+        URLs still require a poToken and won't appear here — use the yt-dlp-backed
+        /download route for those.
+        """
+        payload = {
+            "context": self._get_client_context("WEB"),
+            "videoId": video_id,
+            # Ask for age/racy-gated details too, so videoDetails aren't withheld.
+            "contentCheckOk": True,
+            "racyCheckOk": True,
+        }
+        # 1. Direct first (clean IP → full videoDetails).
+        try:
+            data = await self._execute_post("player", payload, max_retries=2, force_direct=True)
+            if data.get("videoDetails"):
+                return data
+        except Exception as e:
+            logger.warn("player_direct_failed", video_id=video_id, error=str(e))
+            data = {}
+        # 2. Fall back to the proxy pool (last resort; may return stripped data).
+        try:
+            pooled = await self._execute_post("player", payload)
+            if pooled.get("videoDetails") or not data:
+                return pooled
+        except Exception as e:
+            logger.warn("player_pool_failed", video_id=video_id, error=str(e))
+        return data
 
     async def search(self, query: str, sort: str = "relevance", timeframe: str = "all", limit: int = 20) -> Dict[str, Any]:
         """Perform a stealth search request using InnerTube /v1/search with pagination support."""
@@ -615,28 +668,28 @@ class YouTubeScraperService(ProxyRotatingService):
         """Retrieve video details, stream formats, and comments using player and next APIs."""
         video_id = self.extract_video_id(url_or_id)
 
-        # Fetch player (details/streams) and next (description/likes/comments
-        # token) concurrently — they are independent InnerTube calls, so running
-        # them in parallel roughly halves the base latency. Use WEB client
-        # context to avoid Precondition Check/Attestation errors on Android.
-        player_payload = {
-            "context": self._get_client_context("WEB"),
-            "videoId": video_id
-        }
+        # Fetch player (details) and next (description/likes/comments token)
+        # concurrently — independent InnerTube calls, so running them in parallel
+        # roughly halves base latency. The player call uses _fetch_player, which
+        # prefers a clean DIRECT IP so YouTube returns full videoDetails instead
+        # of the stripped LOGIN_REQUIRED response a flagged proxy IP gets.
         next_payload = {
             "context": self._get_client_context("WEB"),
             "videoId": video_id
         }
         player_result, next_result = await asyncio.gather(
-            self._execute_post("player", player_payload),
+            self._fetch_player(video_id),
             self._execute_post("next", next_payload),
             return_exceptions=True,
         )
 
-        # player is required: propagate its failure exactly as the serial path did.
+        # player is best-effort now: if it fully fails, fall back to next-derived
+        # metadata rather than 500-ing the whole request.
+        player_data: dict = {}
         if isinstance(player_result, BaseException):
-            raise player_result
-        player_data = player_result
+            logger.warn("player_endpoint_failed", video_id=video_id, error=str(player_result))
+        else:
+            player_data = player_result or {}
 
         # next is best-effort: a failure degrades gracefully to empty (was a
         # try/except around the serial call).
@@ -646,13 +699,28 @@ class YouTubeScraperService(ProxyRotatingService):
         else:
             next_data = next_result
 
-        # Verify playability
+        # Playability. A non-OK status here (UNPLAYABLE / LOGIN_REQUIRED) almost
+        # always just means YouTube withheld the STREAM URLs — those require a
+        # poToken now — while still returning full videoDetails/metadata. So it's
+        # only a real problem when we got NO metadata back; otherwise it's the
+        # expected streaming gate and we note it at info level (use the yt-dlp
+        # /download route for actual stream URLs).
         playability = player_data.get("playabilityStatus", {})
         playability_status = playability.get("status", "OK")
         playability_reason = playability.get("reason", "unknown")
 
         if playability_status != "OK":
-            logger.warn("video_playability_warning", video_id=video_id, status=playability_status, reason=playability_reason)
+            if player_data.get("videoDetails"):
+                logger.info(
+                    "video_streaming_gated",
+                    video_id=video_id, status=playability_status, reason=playability_reason,
+                    note="metadata returned; stream URLs need a poToken — use /download",
+                )
+            else:
+                logger.warning(
+                    "video_playability_warning",
+                    video_id=video_id, status=playability_status, reason=playability_reason,
+                )
 
         details = player_data.get("videoDetails", {}) or {}
         streaming = player_data.get("streamingData", {}) or {}

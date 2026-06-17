@@ -36,6 +36,16 @@ def _env_str(name: str, default: str) -> str:
     return val if val is not None and val.strip() else default
 
 
+_TRUE = {"1", "true", "yes", "on"}
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return val.strip().lower() in _TRUE
+
+
 # --------------------------------------------------------------- HTTP client
 # curl_cffi browser-impersonation target used by every HTTP-based scraper.
 HTTP_IMPERSONATE = _env_str("HTTP_IMPERSONATE", "chrome120")
@@ -55,9 +65,18 @@ REDDIT_TRANSIENT_COOLDOWN_SECONDS = _env_int("REDDIT_TRANSIENT_COOLDOWN_SECONDS"
 
 # -------------------------------------------------------------------- YouTube
 YOUTUBE_REQUEST_TIMEOUT = _env_int("YOUTUBE_REQUEST_TIMEOUT", 15)
+# Shorter per-proxy timeout: a dead/slow proxy should fail fast instead of
+# burning the full request timeout before we move on or fall back to direct.
+YOUTUBE_PROXY_REQUEST_TIMEOUT = _env_int("YOUTUBE_PROXY_REQUEST_TIMEOUT", 8)
 YOUTUBE_KEY_REQUEST_TIMEOUT = _env_int("YOUTUBE_KEY_REQUEST_TIMEOUT", 10)
 YOUTUBE_MAX_RETRIES = _env_int("YOUTUBE_MAX_RETRIES", 8)
 YOUTUBE_PROXY_COOLDOWN_SECONDS = _env_int("YOUTUBE_PROXY_COOLDOWN_SECONDS", 300)
+# InnerTube is a public API that works without a proxy. After this many proxy
+# attempts fail (or on the final attempt) fall back to a DIRECT connection so the
+# request still returns data when the rotating pool is unusable for YouTube's
+# HTTPS endpoint. Set YOUTUBE_DIRECT_FALLBACK=false to force proxy-only.
+YOUTUBE_MAX_PROXY_ATTEMPTS = _env_int("YOUTUBE_MAX_PROXY_ATTEMPTS", 3)
+YOUTUBE_DIRECT_FALLBACK = _env_bool("YOUTUBE_DIRECT_FALLBACK", True)
 YOUTUBE_WEB_CLIENT_VERSION = _env_str("YOUTUBE_WEB_CLIENT_VERSION", "2.20240101.01.00")
 YOUTUBE_ANDROID_CLIENT_VERSION = _env_str("YOUTUBE_ANDROID_CLIENT_VERSION", "19.01.35")
 YOUTUBE_DEFAULT_USER_AGENT = _env_str(

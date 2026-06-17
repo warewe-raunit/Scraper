@@ -10,9 +10,11 @@ from __future__ import annotations
 import asyncio
 import os
 import random
+import time
 import urllib.parse
 import hashlib
-from typing import Optional, List, Dict, Any
+from collections import OrderedDict
+from typing import Optional, List, Dict, Any, Tuple
 
 import structlog
 from playwright.async_api import Page
@@ -22,9 +24,106 @@ from curl_cffi import requests as cffi_requests
 from tools.browser_manager import LazyBrowser, active_profile_session_id
 from tools.session_store import load_session, session_age_seconds
 from tools.stealth.fingerprint import BrowserProfileManager
-from tools.stealth.helpers import _delay, _random_scroll
+from tools.stealth.helpers import _delay
 
 logger = structlog.get_logger(__name__)
+
+
+class _PooledBrowser:
+    """A warm LazyBrowser plus the lock that serializes access to its page."""
+
+    __slots__ = ("lazy", "lock", "last_used")
+
+    def __init__(self, lazy: LazyBrowser):
+        self.lazy = lazy
+        self.lock = asyncio.Lock()
+        self.last_used = time.monotonic()
+
+
+class XBrowserPool:
+    """Keeps Playwright browsers warm across requests instead of launching +
+    closing one per scrape (the 110-script stealth launch costs 5-15s).
+
+    A browser is pinned to its proxy at launch, so entries are keyed by
+    (account_id, proxy_url, headless). With the small rotating proxy pool the
+    same proxies recur often, so reuse is real. Concurrency is handled by a
+    per-browser lock (a LazyBrowser has a single page; concurrent navigation
+    would corrupt it), and the pool is bounded with LRU + idle-TTL eviction so
+    Chromium processes don't accumulate. Evicted/idle browsers are closed (which
+    also persists their session); everything is closed on shutdown via close_all.
+    """
+
+    def __init__(self) -> None:
+        self.max_size = max(1, int(os.getenv("X_BROWSER_POOL_MAX", "4")))
+        self.idle_ttl = float(os.getenv("X_BROWSER_IDLE_TTL", "300"))
+        self._entries: "OrderedDict[Tuple[str, Optional[str], bool], _PooledBrowser]" = OrderedDict()
+        self._guard = asyncio.Lock()
+
+    async def acquire(self, account_id: str, proxy_url: Optional[str], headless: bool) -> _PooledBrowser:
+        """Return a warm pooled browser for the key, creating one if needed.
+
+        The caller MUST hold ``entry.lock`` for the duration of its use of the
+        page (and release it when done) so two requests never drive the same
+        page concurrently.
+        """
+        key = (account_id, proxy_url, headless)
+        victims: List[_PooledBrowser] = []
+        async with self._guard:
+            entry = self._entries.get(key)
+            if entry is None:
+                entry = _PooledBrowser(
+                    LazyBrowser(account_id=account_id, proxy_url=proxy_url, headless=headless)
+                )
+                self._entries[key] = entry
+            entry.last_used = time.monotonic()
+            self._entries.move_to_end(key)  # mark most-recently-used
+            victims = self._collect_evictions_locked(keep=key)
+        # Close evicted browsers outside the guard so a slow close() doesn't
+        # block other acquires.
+        for v in victims:
+            await self._safe_close(v)
+        return entry
+
+    def _collect_evictions_locked(self, keep) -> List[_PooledBrowser]:
+        """Pop idle and over-capacity entries (never the just-used `keep`, never
+        an in-use/locked one). Returns the popped browsers to close."""
+        now = time.monotonic()
+        victims: List[_PooledBrowser] = []
+
+        # Idle TTL eviction.
+        for k in [k for k, e in self._entries.items()
+                  if k != keep and not e.lock.locked() and now - e.last_used > self.idle_ttl]:
+            victims.append(self._entries.pop(k))
+
+        # Size eviction: drop least-recently-used (front) that aren't busy.
+        while len(self._entries) > self.max_size:
+            victim_key = next(
+                (k for k, e in self._entries.items() if k != keep and not e.lock.locked()),
+                None,
+            )
+            if victim_key is None:
+                break  # everything else is busy; don't force-close in-use browsers
+            victims.append(self._entries.pop(victim_key))
+        return victims
+
+    @staticmethod
+    async def _safe_close(entry: _PooledBrowser) -> None:
+        try:
+            await entry.lazy.close()
+        except Exception as e:  # never let cleanup raise into the request path
+            logger.warning("x_browser_pool.close_failed", error=str(e)[:160])
+
+    async def close_all(self) -> None:
+        """Close every pooled browser (call on app shutdown)."""
+        async with self._guard:
+            entries = list(self._entries.values())
+            self._entries.clear()
+        for e in entries:
+            await self._safe_close(e)
+
+
+# Process-wide pool shared by scrape_profile / scrape_search.
+_x_browser_pool = XBrowserPool()
 
 
 def _format_tweet_links(tweets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -594,7 +693,9 @@ async def scrape_profile(
         
         # 3. Fallback to browser (Playwright)
         log.info("unauth_x.direct_scrape.fallback_to_browser", account_id=account_id)
-        lazy_browser = LazyBrowser(account_id=account_id, proxy_url=proxy_url, headless=headless)
+        entry = await _x_browser_pool.acquire(account_id, proxy_url, headless)
+        lazy_browser = entry.lazy
+        await entry.lock.acquire()
         try:
             page = await lazy_browser.get_page()
             log.info("unauth_x.navigating", url=target_url)
@@ -700,7 +801,8 @@ async def scrape_profile(
                     "error": "PROXY_BLOCKED"
                 }
         finally:
-            await lazy_browser.close()
+            # Keep the browser warm in the pool; just release our turn on it.
+            entry.lock.release()
 
 
 async def scrape_search(
@@ -801,7 +903,9 @@ async def scrape_search(
                 
         # 3. Fallback to browser (Playwright)
         log.info("unauth_x.search.direct_scrape.fallback_to_browser", account_id=account_id)
-        lazy_browser = LazyBrowser(account_id=account_id, proxy_url=proxy_url, headless=headless)
+        entry = await _x_browser_pool.acquire(account_id, proxy_url, headless)
+        lazy_browser = entry.lazy
+        await entry.lock.acquire()
         try:
             page = await lazy_browser.get_page()
             log.info("unauth_x.search.navigating", url=target_url)
@@ -901,7 +1005,8 @@ async def scrape_search(
                     "error": "PROXY_BLOCKED"
                 }
         finally:
-            await lazy_browser.close()
+            # Keep the browser warm in the pool; just release our turn on it.
+            entry.lock.release()
             
     return {
         "success": False,
