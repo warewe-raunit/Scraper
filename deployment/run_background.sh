@@ -43,8 +43,19 @@ fi
 
 echo -e "${GREEN}==> Starting API server in background using ${PYTHON_CMD}...${NC}"
 
-# Launch in background using nohup and redirect stdout/stderr to log file
-nohup ${PYTHON_CMD} -m uvicorn api.main:app --host 0.0.0.0 --port 18080 > "${LOG_FILE}" 2>&1 &
+# Run HEADFUL relogin on a headless server: the LinkedIn relogin browser needs an
+# X display. If xvfb-run is available, launch the whole app under a virtual
+# display so headful Chromium has somewhere to render. Falls back to a direct
+# launch (works on a desktop with a real display) if xvfb-run is missing.
+export LINKEDIN_RELOGIN_HEADLESS=${LINKEDIN_RELOGIN_HEADLESS:-false}
+if command -v xvfb-run >/dev/null 2>&1; then
+    echo -e "${GREEN}==> Wrapping in xvfb-run (virtual display for headful browser)...${NC}"
+    nohup xvfb-run -a --server-args="-screen 0 1920x1080x24 -ac -nolisten tcp" \
+        ${PYTHON_CMD} -m uvicorn api.main:app --host 0.0.0.0 --port 18080 > "${LOG_FILE}" 2>&1 &
+else
+    echo -e "${RED}==> xvfb-run not found; launching directly. Install it for headful on a server: sudo apt-get install -y xvfb xauth${NC}"
+    nohup ${PYTHON_CMD} -m uvicorn api.main:app --host 0.0.0.0 --port 18080 > "${LOG_FILE}" 2>&1 &
+fi
 
 # Save PID
 PID=$!

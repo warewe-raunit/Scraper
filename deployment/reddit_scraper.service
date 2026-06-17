@@ -7,16 +7,22 @@ Type=simple
 User=root
 WorkingDirectory=/root/Scraper
 Environment=PYTHONUNBUFFERED=1
+# Run the LinkedIn relogin browser HEADFUL on the server. Headful Chromium needs
+# an X display; xvfb-run (below) provides a virtual one. Force headful explicitly
+# so it can't be flipped to headless by a stale .env value.
+Environment=LINKEDIN_RELOGIN_HEADLESS=false
 
-# Auto-detect if a virtual environment exists in either venv/ or myenv312/ and run uvicorn
+# Launch the whole app under a virtual X display (Xvfb) via xvfb-run, so any
+# headful Chromium the relogin launches has a display to render into. xvfb-run -a
+# auto-picks a free display number and exports DISPLAY for the process. Requires
+# the `xvfb` package (setup_service.sh installs it).
+# Auto-detect the venv (venv/ or myenv312/) and exec uvicorn under xvfb.
 ExecStart=/bin/bash -c '\
-  if [ -f venv/bin/uvicorn ]; then \
-    exec venv/bin/python -m uvicorn api.main:app --host 0.0.0.0 --port 18080; \
-  elif [ -f myenv312/bin/uvicorn ]; then \
-    exec myenv312/bin/python -m uvicorn api.main:app --host 0.0.0.0 --port 18080; \
-  else \
-    exec python3 -m uvicorn api.main:app --host 0.0.0.0 --port 18080; \
-  fi'
+  if [ -f venv/bin/uvicorn ]; then PY=venv/bin/python; \
+  elif [ -f myenv312/bin/uvicorn ]; then PY=myenv312/bin/python; \
+  else PY=python3; fi; \
+  exec xvfb-run -a --server-args="-screen 0 1920x1080x24 -ac -nolisten tcp" \
+    "$PY" -m uvicorn api.main:app --host 0.0.0.0 --port 18080'
 
 Restart=always
 RestartSec=5

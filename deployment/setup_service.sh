@@ -30,6 +30,25 @@ SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}"
 DEPLOY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 PROJECT_ROOT="$(dirname "${DEPLOY_DIR}")"
 
+# 0. Install Xvfb (virtual X display) so the relogin browser can run HEADFUL on
+#    a headless server. The service wraps uvicorn in `xvfb-run`, which needs the
+#    xvfb + xauth packages. Idempotent — skips if already present.
+if ! command -v xvfb-run >/dev/null 2>&1; then
+    echo -e "${GREEN}==> Installing Xvfb (needed for headful browser on server)...${NC}"
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -y && apt-get install -y xvfb xauth
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y xorg-x11-server-Xvfb xorg-x11-xauth
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y xorg-x11-server-Xvfb xorg-x11-xauth
+    else
+        echo -e "${RED}Could not find apt-get/dnf/yum. Install 'xvfb' + 'xauth' manually.${NC}"
+        exit 1
+    fi
+else
+    echo -e "${GREEN}==> Xvfb already installed.${NC}"
+fi
+
 # 1. Copy the service template
 echo -e "${GREEN}==> Copying service configuration to ${SERVICE_PATH}...${NC}"
 cp "${DEPLOY_DIR}/${SERVICE_NAME}" "${SERVICE_PATH}"
