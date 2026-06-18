@@ -4,7 +4,7 @@ api/routes/youtube.py — FastAPI router for YouTube scraping and exporting.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Literal
 from fastapi import APIRouter, Query, HTTPException, status, Depends, Response, BackgroundTasks
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 import os
@@ -55,12 +55,12 @@ def format_export_response(data: dict, export_type: str, requested_format: str, 
 )
 async def search_youtube(
     q: str = Query(..., description="The search query keyword"),
-    sort: str = Query("relevance", pattern="^(relevance|date|views|rating)$", description="Criteria to sort search results"),
-    time: str = Query("all", pattern="^(hour|day|week|month|year|all)$", description="Timeframe filter for search results"),
+    sort: Literal["relevance", "date", "views", "rating"] = Query("relevance", description="Criteria to sort search results (dropdown)"),
+    time: Literal["hour", "day", "week", "month", "year", "all"] = Query("all", description="Timeframe filter for search results (dropdown)"),
     limit: int = Query(20, ge=1, le=500, description="Max number of search results to return"),
     location: Optional[SearchLocation] = Query(None, description="Country for proxy selection (renders as a dropdown of full country names)"),
     max_subscribers: Optional[int] = Query(None, ge=0, description="Only return videos from channels with at most this many subscribers. Channels with hidden/unknown counts are excluded. Slower (resolves each channel)."),
-    format: str = Query("json", pattern="^(json|csv|excel|html)$", description="Output format for search results"),
+    format: Literal["json", "csv", "excel", "html"] = Query("json", description="Output format for search results (dropdown)"),
     scraper: YouTubeScraperService = Depends(get_youtube_scraper_service)
 ):
     try:
