@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import os
 import random
+import re
 import time
 import urllib.parse
 import hashlib
@@ -588,6 +589,359 @@ async def _check_page_for_blocks(page: Page, log) -> tuple[bool, bool]:
         return True, False
 
     return False, False
+
+
+def x_status_to_nitter_path(url_or_id: str) -> Optional[str]:
+    """Convert an X/Twitter status URL (or a bare 'user/status/id') into the
+    Nitter conversation path '/{user}/status/{id}'.
+
+    Accepts:
+      - https://x.com/jack/status/20
+      - https://twitter.com/jack/status/20?s=20
+      - https://nitter.net/jack/status/20
+      - jack/status/20
+    Returns None if no status id can be located.
+    """
+    if not url_or_id:
+        return None
+    s = url_or_id.strip()
+    # Username-less permalinks: /i/web/status/{id} or /i/status/{id}.
+    m = re.search(r"/i/(?:web/)?status/(\d+)", s)
+    if m:
+        return f"/i/status/{m.group(1)}"
+    # Full /{user}/status/{id} (handles x.com, twitter.com, nitter.*, bare path).
+    m = re.search(r"(?:^|/)([A-Za-z0-9_]{1,15})/status(?:es)?/(\d+)", s)
+    if m:
+        return f"/{m.group(1)}/status/{m.group(2)}"
+    # Fallback: a bare numeric status id with no username.
+    m = re.search(r"^(\d{6,})$", s)
+    if m:
+        return f"/i/status/{m.group(1)}"
+    return None
+
+
+def _extract_thread_item(item) -> Optional[Dict[str, Any]]:
+    """Extract one tweet dict from a Nitter '.timeline-item'/'.main-tweet' node.
+
+    Unlike _parse_html_timeline this keys off '.tweet-date a' for the permalink
+    (always present on conversation pages — the main tweet has no '.tweet-link'
+    overlay anchor), so it works for both the focused tweet and its replies.
+    """
+    content_el = item.select_one(".tweet-content")
+    date_el = item.select_one(".tweet-date a")
+    if not date_el and not content_el:
+        return None
+
+    # Strip Nitter's #m anchor and any query string so links compare cleanly.
+    raw_link = date_el.get("href", "") if date_el else ""
+    link = raw_link.split("#")[0].split("?")[0]
+    tweet_id = link.split("/")[-1] if "/" in link else ""
+
+    username_el = item.select_one(".username")
+    fullname_el = item.select_one(".fullname")
+    avatar_el = item.select_one(".avatar")
+
+    replies, retweets, likes, quotes = 0, 0, 0, 0
+    for stat in item.select(".tweet-stats .tweet-stat"):
+        # The icon type class (icon-comment/-retweet/-heart/-quote) may sit on the
+        # .icon-container or on a child span depending on the Nitter version, so
+        # scan the whole stat subtree's class names rather than one node.
+        classes = " ".join(
+            " ".join(el.get("class", [])) for el in stat.find_all(True)
+        )
+        val_text = stat.text.replace(",", "").strip()
+        val = int(val_text) if val_text.isdigit() else 0
+        if "comment" in classes:
+            replies = val
+        elif "retweet" in classes:
+            retweets = val
+        elif "heart" in classes:
+            likes = val
+        elif "quote" in classes:
+            quotes = val
+
+    return {
+        "link": link,
+        "id": tweet_id,
+        "username": username_el.text.strip() if username_el else "",
+        "fullname": fullname_el.text.strip() if fullname_el else "",
+        "avatar": avatar_el.get("src", "") if avatar_el else "",
+        "content": content_el.text.strip() if content_el else "",
+        "date": date_el.get("title", "") if date_el else "",
+        "stats": {
+            "replies": replies,
+            "retweets": retweets,
+            "likes": likes,
+            "quotes": quotes,
+        },
+        "is_retweet": bool(item.select_one(".retweet-header")),
+    }
+
+
+def _parse_thread_html(html: str) -> dict:
+    """Parse a Nitter conversation page into the focused tweet + its replies.
+
+    Returns {"main_tweet": {...}|{}, "replies": [...], "next_link": str}. The
+    main tweet lives in '.main-tweet'; replies are the '.timeline-item' nodes in
+    the '.replies'/'.conversation' container (each '.reply' may nest sub-replies,
+    all of which are '.timeline-item's — we flatten them in document order).
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    main_tweet = {}
+    main_el = soup.select_one(".main-tweet .timeline-item") or soup.select_one(".main-tweet")
+    main_link = ""
+    if main_el:
+        parsed_main = _extract_thread_item(main_el)
+        if parsed_main:
+            main_tweet = parsed_main
+            main_link = parsed_main.get("link", "")
+
+    replies = []
+    seen = set()
+    replies_root = soup.select_one(".replies") or soup.select_one(".conversation")
+    reply_items = replies_root.select(".timeline-item") if replies_root else []
+    # On instances that don't wrap replies in '.replies', fall back to every
+    # '.timeline-item' that isn't the main tweet.
+    if not reply_items:
+        reply_items = soup.select(".timeline-item")
+    for item in reply_items:
+        # Skip the main tweet if it surfaced inside the reply scan.
+        if main_el is not None and item is main_el:
+            continue
+        if "show-more" in item.get("class", []):
+            continue
+        parsed = _extract_thread_item(item)
+        if not parsed:
+            continue
+        link = parsed.get("link") or ""
+        if link and link == main_link:
+            continue
+        key = link or parsed.get("content", "")
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        replies.append(parsed)
+
+    # "Load more" replies cursor — same logic as the timeline parser: pick the
+    # last '.show-more' anchor that isn't a "Load newest" back-reference.
+    next_link = ""
+    for anchor in soup.select(".show-more a"):
+        if "newest" in anchor.get_text(" ", strip=True).lower():
+            continue
+        next_link = anchor.get("href", "")
+
+    return {"main_tweet": main_tweet, "replies": replies, "next_link": next_link}
+
+
+async def scrape_thread(
+    status_url: str,
+    limit: int = 20,
+    instances: Optional[List[str]] = None,
+    proxy_url: Optional[str] = None,
+    headless: bool = True,
+) -> Dict[str, Any]:
+    """Scrape a tweet's full conversation thread (focused tweet + replies)
+    without authentication.
+
+    Mirrors scrape_profile/scrape_search: try a fast direct curl_cffi GET on the
+    saved stealth session first, fall back to the warm Playwright browser pool to
+    solve Cloudflare, paginate the "Load more" reply cursor until `limit` replies
+    are gathered, and ALWAYS return a structured dict (never raise).
+
+    Args:
+        status_url: Full X/Twitter status URL (e.g. https://x.com/jack/status/20).
+        limit: Target number of replies to collect.
+        instances: List of Nitter proxy instance URLs.
+        proxy_url: Proxy URL for browser context / direct fetch.
+        headless: Whether to run browser headlessly.
+
+    Returns:
+        Dict with main_tweet, replies, source_instance, success, error.
+    """
+    nitter_path = x_status_to_nitter_path(status_url)
+    log = logger.bind(status_url=status_url, action="UNAUTH_SCRAPE_THREAD")
+    if not nitter_path:
+        return {
+            "success": False,
+            "main_tweet": {},
+            "replies": [],
+            "source_instance": None,
+            "error": f"Could not extract a tweet/status id from: {status_url}",
+        }
+
+    if not instances:
+        instances = list(DEFAULT_NITTER_INSTANCES)
+        random.shuffle(instances)
+
+    def _collect(parsed: dict, main_holder: dict, replies: list, seen: set) -> int:
+        """Merge a parsed page into the running thread; return # new replies."""
+        if parsed.get("main_tweet") and not main_holder.get("main"):
+            main_holder["main"] = parsed["main_tweet"]
+        added = 0
+        for r in parsed.get("replies", []):
+            link = r.get("link") or ""
+            key = link or r.get("content", "")
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            replies.append(r)
+            added += 1
+        return added
+
+    for attempt, base_url in enumerate(instances, start=1):
+        log.info("unauth_x.thread.attempt", attempt=attempt, instance=base_url)
+
+        proxy_hash = hashlib.md5(proxy_url.encode("utf-8")).hexdigest()[:10] if proxy_url else "direct"
+        instance_hash = hashlib.md5(base_url.encode("utf-8")).hexdigest()[:10]
+        account_id = f"x_unauth_{proxy_hash}_{instance_hash}"
+
+        target_url = urllib.parse.urljoin(base_url, nitter_path)
+        main_holder: dict = {}
+        replies: List[Dict[str, Any]] = []
+        seen: set = set()
+
+        # 1. Direct curl_cffi attempt.
+        direct_html, direct_reason = await _attempt_direct_scrape(target_url, proxy_url, account_id, log)
+        if direct_html:
+            try:
+                parsed = _parse_thread_html(direct_html)
+                if parsed.get("main_tweet") or parsed.get("replies"):
+                    _collect(parsed, main_holder, replies, seen)
+                    log.info("unauth_x.thread.direct.parse_success",
+                             replies=len(replies), has_main=bool(main_holder.get("main")))
+
+                    next_link = parsed.get("next_link")
+                    current_url = target_url
+                    while next_link and len(replies) < limit:
+                        paginated_url = urllib.parse.urljoin(current_url, next_link)
+                        page_html, _ = await _attempt_direct_scrape(paginated_url, proxy_url, account_id, log)
+                        if not page_html:
+                            break
+                        page_parsed = _parse_thread_html(page_html)
+                        new_added = _collect(page_parsed, main_holder, replies, seen)
+                        log.info("unauth_x.thread.direct.paginate.added", count=new_added, total=len(replies))
+                        if new_added == 0:
+                            break
+                        next_link = page_parsed.get("next_link")
+                        current_url = paginated_url
+
+                    return {
+                        "success": True,
+                        "main_tweet": main_holder.get("main", {}),
+                        "replies": _format_tweet_links(replies[:limit]),
+                        "reply_count": len(replies[:limit]),
+                        "source_instance": base_url,
+                        "error": None,
+                    }
+            except Exception as e:
+                log.warning("unauth_x.thread.direct.parse_failed", error=str(e))
+        else:
+            if direct_reason not in ("CLOUDFLARE", "SESSION_EXPIRED", "NO_SESSION"):
+                log.info("unauth_x.thread.direct.skip_browser_fallback", reason=direct_reason, instance=base_url)
+                continue
+
+        # 2. Browser fallback.
+        log.info("unauth_x.thread.fallback_to_browser", account_id=account_id)
+        entry = await _x_browser_pool.acquire(account_id, proxy_url, headless)
+        lazy_browser = entry.lazy
+        await entry.lock.acquire()
+        try:
+            page = await lazy_browser.get_page()
+            log.info("unauth_x.thread.navigating", url=target_url)
+            await page.goto(target_url, wait_until="domcontentloaded", timeout=45000)
+            await _delay("unauth_x_thread", 2.0, 4.0)
+
+            is_blocked, is_proxy_issue = await _handle_page_navigation_and_blocks(
+                page, log, "main_thread", proxy_url
+            )
+            if is_blocked:
+                if is_proxy_issue and proxy_url is not None:
+                    log.warning("unauth_x.thread.proxy_blocked_early_abort", instance=base_url)
+                    return {
+                        "success": False,
+                        "main_tweet": {},
+                        "replies": [],
+                        "source_instance": None,
+                        "error": "PROXY_BLOCKED",
+                    }
+                log.warning("unauth_x.thread.instance_blocked", instance=base_url)
+                continue
+
+            html = await page.content()
+            parsed = _parse_thread_html(html)
+            if parsed.get("main_tweet") or parsed.get("replies"):
+                _collect(parsed, main_holder, replies, seen)
+                log.info("unauth_x.thread.parse_success",
+                         replies=len(replies), has_main=bool(main_holder.get("main")))
+
+                next_link = parsed.get("next_link")
+                current_url = target_url
+                while next_link and len(replies) < limit:
+                    paginated_url = urllib.parse.urljoin(current_url, next_link)
+                    await page.goto(paginated_url, wait_until="domcontentloaded", timeout=45000)
+                    await _delay("unauth_x_thread", 1.5, 3.0)
+
+                    is_blocked, _ = await _handle_page_navigation_and_blocks(
+                        page, log, "paginate_thread", proxy_url
+                    )
+                    if is_blocked:
+                        log.warning("unauth_x.thread.paginate.blocked")
+                        break
+
+                    page_parsed = _parse_thread_html(await page.content())
+                    new_added = _collect(page_parsed, main_holder, replies, seen)
+                    log.info("unauth_x.thread.paginate.added", count=new_added, total=len(replies))
+                    if new_added == 0:
+                        break
+                    next_link = page_parsed.get("next_link")
+                    current_url = paginated_url
+
+                return {
+                    "success": True,
+                    "main_tweet": main_holder.get("main", {}),
+                    "replies": _format_tweet_links(replies[:limit]),
+                    "reply_count": len(replies[:limit]),
+                    "source_instance": base_url,
+                    "error": None,
+                }
+        except Exception as e:
+            err_msg = str(e)
+            log.error("unauth_x.thread.attempt_failed", instance=base_url, error=err_msg)
+            try:
+                await page.evaluate("() => { try { window.stop(); } catch(err) {} }")
+                await asyncio.sleep(0.5)
+            except Exception:
+                pass
+            is_proxy_error = any(indicator in err_msg for indicator in [
+                "ERR_TUNNEL_CONNECTION_FAILED",
+                "ERR_PROXY_CONNECTION_FAILED",
+                "ERR_CONNECTION_RESET",
+                "ERR_TIMED_OUT",
+                "TimeoutError",
+                "net::ERR_",
+            ])
+            if is_proxy_error and proxy_url is not None:
+                log.warning("unauth_x.thread.proxy_connection_failed_early_abort", instance=base_url)
+                return {
+                    "success": False,
+                    "main_tweet": {},
+                    "replies": [],
+                    "source_instance": None,
+                    "error": "PROXY_BLOCKED",
+                }
+        finally:
+            entry.lock.release()
+
+    return {
+        "success": False,
+        "main_tweet": {},
+        "replies": [],
+        "source_instance": None,
+        "error": "All public Nitter instances were blocked, rate-limited, or failed to respond.",
+    }
 
 
 async def scrape_profile(

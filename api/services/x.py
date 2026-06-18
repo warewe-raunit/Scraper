@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from tools.unauth_x_scraper import scrape_profile, scrape_search
+from tools.unauth_x_scraper import scrape_profile, scrape_search, scrape_thread
 from tools.retry_policy import AttemptOutcome, RetryPolicy, robust_retry
 from tools.proxy_provider import get_proxy_provider
 from api.services.proxy_base import ProxyRotatingService
@@ -186,6 +186,80 @@ class XScraperService(ProxyRotatingService):
             exhausted_result=lambda last: (
                 last.result if last and last.result is not None
                 else {"success": False, "tweets": [],
+                      "error": "No proxies available."}
+            ),
+        )
+
+    async def get_thread(
+        self,
+        status_url: str,
+        limit: int = 20,
+        proxy_url: Optional[str] = None,
+        headless: bool = True,
+        location: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Scrape a tweet's full conversation thread (focused tweet + replies).
+
+        Same robust bounded-retry behavior as get_profile/search: rotates proxies
+        across at least one pool refill and always returns a structured result.
+        ``location`` only selects the proxy exit country (X conversations are not
+        IP-personalized); when requested but unavailable, the call fails fast
+        rather than leaking the server IP via a direct connection.
+        """
+        async def _attempt(n: int) -> AttemptOutcome:
+            if proxy_url:
+                resolved_proxy = proxy_url
+            elif location:
+                resolved_proxy = await self._get_next_proxy_async(country=location)
+            else:
+                resolved_proxy = self._get_next_proxy()
+            if location and not resolved_proxy:
+                return AttemptOutcome(
+                    success=False,
+                    result={"success": False, "main_tweet": {}, "replies": [],
+                            "error": f"No proxies available for the selected location: {location}."},
+                    retryable=False,
+                    error=f"No proxies available for the selected location: {location}."
+                )
+
+            if resolved_proxy:
+                logger.info(
+                    "using_proxy_for_x_thread",
+                    proxy=resolved_proxy[:30] + "...",
+                    attempt=n,
+                )
+            result = await scrape_thread(
+                status_url=status_url,
+                limit=limit,
+                proxy_url=resolved_proxy,
+                headless=headless,
+            )
+            if result.get("success"):
+                if self.db and result.get("replies"):
+                    await self.db.save_x_tweets(result["replies"])
+                return AttemptOutcome(success=True, result=result)
+            logger.warning(
+                "x_thread_attempt_failed_rotating_proxy",
+                proxy=resolved_proxy[:30] + "..." if resolved_proxy else "None",
+                attempt=n,
+                error=result.get("error"),
+            )
+            return AttemptOutcome(
+                success=False,
+                result=result,
+                retryable=not proxy_url,
+                cooldown_target=resolved_proxy if not proxy_url else None,
+                error=result.get("error"),
+            )
+
+        policy = self._retry_policy("x_thread", pinned=bool(proxy_url))
+        return await robust_retry(
+            _attempt,
+            policy=policy,
+            on_cooldown=self._cool_down_proxy,
+            exhausted_result=lambda last: (
+                last.result if last and last.result is not None
+                else {"success": False, "main_tweet": {}, "replies": [],
                       "error": "No proxies available."}
             ),
         )

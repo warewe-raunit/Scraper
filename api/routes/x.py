@@ -55,6 +55,46 @@ async def get_x_profile(
         )
 
 @router.get(
+    "/thread",
+    summary="Scrape an X tweet thread (replies)",
+    description="Given a tweet/post URL, return the focused tweet plus its reply thread. Set 'limit' to cap the number of replies returned."
+)
+async def get_x_thread(
+    url: str = Query(..., description="Full X/Twitter status URL (e.g. https://x.com/jack/status/20)"),
+    limit: int = Query(20, ge=1, le=200, description="Max number of replies to return"),
+    location: Optional[SearchLocation] = Query(None, description="Country for proxy exit selection (renders as a dropdown of full country names). Only selects the proxy's exit country — it does not change which replies are returned."),
+    format: Literal["json", "csv"] = Query("json", description="Output format for results"),
+    proxy: Optional[str] = Query(None, description="Optional custom proxy URL to use for this request"),
+    headless: bool = Query(True, description="Run browser context in headless mode"),
+    scraper: XScraperService = Depends(get_x_scraper_service)
+):
+    try:
+        result = await scraper.get_thread(
+            status_url=url,
+            limit=limit,
+            proxy_url=proxy,
+            headless=headless,
+            location=location.code if location else None
+        )
+        if not result.get("success"):
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=result.get("error") or "Failed to scrape thread from public instances."
+            )
+
+        if format == "csv":
+            return csv_response(result, "x_thread")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("x_thread_scrape_failed", url=url, error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to scrape X thread: {e}"
+        )
+
+@router.get(
     "/search",
     summary="Search X tweets",
     description="Scrape tweets matching a search query keyword with advanced filters without authentication."

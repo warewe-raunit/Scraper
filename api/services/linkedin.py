@@ -1003,6 +1003,34 @@ class LinkedInScraperService:
                 return match.group(1)
         return profile_or_url
 
+    def extract_activity_urn(self, post_or_url: str) -> Optional[str]:
+        """Extract the canonical 'urn:li:activity:N' (or ugcPost/share) URN from a
+        LinkedIn post URL, raw URN, or bare numeric id.
+
+        Handles:
+          - https://www.linkedin.com/posts/john-doe_slug-activity-7298...-AbCd
+          - https://www.linkedin.com/feed/update/urn:li:activity:7298.../
+          - urn:li:activity:7298...
+          - 7298... (bare numeric id → assumed activity)
+        Returns None if no id can be located.
+        """
+        if not post_or_url:
+            return None
+        s = post_or_url.strip()
+        # Full urn already present (activity / ugcPost / share).
+        m = re.search(r"urn:li:(activity|ugcPost|share):(\d+)", s)
+        if m:
+            return f"urn:li:{m.group(1)}:{m.group(2)}"
+        # /posts/...-activity-<id>-<tracking> permalink form.
+        m = re.search(r"(activity|ugcPost|share)[-:](\d{6,})", s)
+        if m:
+            return f"urn:li:{m.group(1)}:{m.group(2)}"
+        # Bare numeric id → treat as an activity urn.
+        m = re.search(r"\b(\d{12,})\b", s)
+        if m:
+            return f"urn:li:activity:{m.group(1)}"
+        return None
+
     def extract_company_name(self, company_or_url: str) -> str:
         """Extract company name from a LinkedIn URL or return the raw company name."""
         company_or_url = company_or_url.strip()
@@ -1510,6 +1538,189 @@ class LinkedInScraperService:
             "website": website,
             "locations": locations
         }
+
+    async def scrape_post_comments(
+        self,
+        post_url: str,
+        limit: int = 25,
+        sort: str = "relevant",
+        account_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Scrape the comment thread on a LinkedIn post using the Voyager API.
+
+        Accepts a post URL / activity URN / bare id, resolves the activity URN,
+        then paginates the comments collection until `limit` comments are
+        gathered. Follows the same REST-default + captured-GraphQL env override
+        pattern as the other endpoints: set LINKEDIN_VOYAGER_COMMENTS_PATH to a
+        captured queryId path (with {urn}/{count}/{start}/{sort} placeholders)
+        when LinkedIn rotates the REST decoration.
+        """
+        urn = self.extract_activity_urn(post_url)
+        if not urn:
+            raise ValueError(f"Could not extract a post/activity id from: {post_url}")
+
+        available_ids = self._get_available_sessions()
+        if not available_ids:
+            raise RuntimeError("No active LinkedIn sessions found. Please run the login runner first.")
+        account_id = account_id if (account_id and account_id in available_ids) else None
+
+        page_size = int(os.getenv("LINKEDIN_COMMENTS_PAGE_SIZE", "50"))
+        # LinkedIn sortOrder enum: RELEVANCE (top) / REVERSE_CHRONOLOGICAL (recent).
+        sort_key = (sort or "relevant").strip().lower()
+        sort_order = "REVERSE_CHRONOLOGICAL" if sort_key in ("recent", "newest", "chronological") else "RELEVANCE"
+
+        urn_enc = quote(urn, safe="")
+        override = os.getenv("LINKEDIN_VOYAGER_COMMENTS_PATH", "").strip()
+        if override:
+            def build_path(start: int, count: int) -> str:
+                return (override
+                        .replace("{urn}", urn_enc)
+                        .replace("{count}", str(count))
+                        .replace("{start}", str(start))
+                        .replace("{sort}", sort_order))
+            logger.info("voyager_comments.using_override_path")
+        else:
+            def build_path(start: int, count: int) -> str:
+                return (
+                    "/voyager/api/feed/comments"
+                    f"?count={count}"
+                    "&q=comments"
+                    f"&sortOrder={sort_order}"
+                    f"&start={start}"
+                    f"&updateId={urn_enc}"
+                )
+
+        comments = await self._paginate_voyager(
+            build_path, self._parse_voyager_comments,
+            limit=limit, account_id=account_id, page_size=page_size,
+            dedup_key=lambda c: c.get("comment_urn") or (c.get("author") or "") + (c.get("text") or "")[:60],
+        )
+        if comments is None:
+            raise RuntimeError(f"Failed to fetch comments for post '{urn}' using Voyager API.")
+
+        return {
+            "success": True,
+            "post_urn": urn,
+            "post_url": f"https://www.linkedin.com/feed/update/{urn}/",
+            "sort": sort_order,
+            "count": len(comments[:limit]),
+            "scraped_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "data": comments[:limit],
+        }
+
+    @staticmethod
+    def _comment_text(node: Any, _depth: int = 0) -> str:
+        """Recursively pull the human-readable body out of a comment's text
+        container. LinkedIn nests the string as commentary/comment/value →
+        {"text": "..."} (sometimes doubly), across both REST and GraphQL shapes.
+        """
+        if _depth > 5 or node is None:
+            return ""
+        if isinstance(node, str):
+            return node
+        if isinstance(node, dict):
+            for key in ("text", "values", "value", "attributedText"):
+                if key in node:
+                    found = LinkedInScraperService._comment_text(node[key], _depth + 1)
+                    if found:
+                        return found
+        if isinstance(node, list):
+            for v in node:
+                found = LinkedInScraperService._comment_text(v, _depth + 1)
+                if found:
+                    return found
+        return ""
+
+    def _parse_voyager_comments(self, data: dict) -> Optional[List[Dict[str, Any]]]:
+        """Parse a Voyager comments response into a flat list of comment dicts.
+
+        Tolerant of REST (com.linkedin.voyager.feed.Comment) and Dash/GraphQL
+        (social.Comment / fsd_comment) shapes: a comment is any `included` object
+        whose $type contains 'Comment' or whose entityUrn is a comment urn. Author
+        name is resolved from an inline commenter object or a *commenter urn ref.
+        """
+        included = data.get("included")
+        if not isinstance(included, list):
+            return None
+
+        urn_map = {item["entityUrn"]: item for item in included
+                   if isinstance(item, dict) and "entityUrn" in item}
+
+        def _resolve_author(comment: dict) -> str:
+            commenter = comment.get("commenter")
+            # Inline object: look for a name/title text field.
+            if isinstance(commenter, dict):
+                for key in ("title", "name", "displayName"):
+                    txt = self._comment_text(commenter.get(key))
+                    if txt:
+                        return txt
+                # Mini-profile style first/last name.
+                first = commenter.get("firstName")
+                last = commenter.get("lastName")
+                if first or last:
+                    return f"{first or ''} {last or ''}".strip()
+                ref = commenter.get("*miniProfile") or commenter.get("*member")
+                if isinstance(ref, str) and ref in urn_map:
+                    prof = urn_map[ref]
+                    return f"{prof.get('firstName', '')} {prof.get('lastName', '')}".strip()
+            # Urn ref form: "*commenter": "urn:li:fsd_profile:..."
+            ref = comment.get("*commenter")
+            if isinstance(ref, str) and ref in urn_map:
+                prof = urn_map[ref]
+                for key in ("title", "name"):
+                    txt = self._comment_text(prof.get(key))
+                    if txt:
+                        return txt
+                return f"{prof.get('firstName', '')} {prof.get('lastName', '')}".strip()
+            return ""
+
+        comments: List[Dict[str, Any]] = []
+        seen = set()
+        for item in included:
+            if not isinstance(item, dict):
+                continue
+            t = str(item.get("$type", ""))
+            urn = str(item.get("entityUrn", ""))
+            is_comment = ("Comment" in t) or bool(re.search(r"urn:li:(?:fsd_)?comment:", urn))
+            if not is_comment:
+                continue
+
+            text = (self._comment_text(item.get("commentary"))
+                    or self._comment_text(item.get("comment"))
+                    or self._comment_text(item.get("commentV2")))
+            if not text:
+                continue
+            if urn and urn in seen:
+                continue
+            if urn:
+                seen.add(urn)
+
+            created = item.get("createdAt") or item.get("createdTime")
+            created_str = ""
+            if isinstance(created, (int, float)) and created > 0:
+                try:
+                    created_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(created / 1000))
+                except Exception:
+                    created_str = ""
+
+            likes = 0
+            social = item.get("socialDetail") or {}
+            if isinstance(social, dict):
+                lk = social.get("totalSocialActivityCounts") or social.get("likes") or {}
+                if isinstance(lk, dict):
+                    likes = lk.get("numLikes") or lk.get("total") or (lk.get("paging") or {}).get("total") or 0
+
+            comments.append({
+                "author": _resolve_author(item),
+                "text": text.strip(),
+                "created_at": created_str,
+                "likes": likes,
+                "comment_urn": urn or None,
+            })
+
+        if not comments:
+            return None
+        return comments
 
     # Verified LinkedIn geo URN ids for common locations. Anything not here is
     # resolved once via the typeahead API and cached; unresolvable locations are

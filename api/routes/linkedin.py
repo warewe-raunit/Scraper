@@ -114,6 +114,22 @@ def convert_to_csv(endpoint_type: str, result: dict) -> str:
             ]
             writer.writerow(row)
             
+    elif endpoint_type == "comments":
+        headers = ["post_urn", "author", "text", "created_at", "likes", "comment_urn", "scraped_at"]
+        writer.writerow(headers)
+        comment_list = data if isinstance(data, list) else []
+        for c in comment_list:
+            row = [
+                result.get("post_urn", ""),
+                c.get("author", ""),
+                c.get("text", ""),
+                c.get("created_at", "") or "",
+                c.get("likes", 0),
+                c.get("comment_urn", "") or "",
+                scraped_at
+            ]
+            writer.writerow(row)
+
     elif endpoint_type == "search":
         headers = ["query", "category", "title", "url", "snippet", "scraped_at"]
         writer.writerow(headers)
@@ -230,6 +246,40 @@ async def search_linkedin_jobs(
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Failed to search LinkedIn jobs: {e}"
+        )
+
+class CommentSortOrder(str, Enum):
+    RELEVANT = "relevant"
+    RECENT = "recent"
+
+@router.get(
+    "/post/comments",
+    summary="Scrape comments on a LinkedIn post",
+    description="Given a LinkedIn post URL (or activity URN), return the comment thread. Use 'limit' to cap the number of comments returned."
+)
+async def get_linkedin_post_comments(
+    url: str = Query(..., description="Full LinkedIn post URL or activity URN (e.g. https://www.linkedin.com/posts/..-activity-7298..-AbCd or urn:li:activity:7298..)"),
+    sort: CommentSortOrder = Query(CommentSortOrder.RELEVANT, description="Comment sort order (relevant = top, recent = chronological)"),
+    limit: int = Query(25, ge=1, le=1000, description="Max number of comments to retrieve (paginated)"),
+    format: ResponseFormat = Query(ResponseFormat.JSON, description="Output format"),
+    account_id: Optional[str] = Query(None, description="Optional specific LinkedIn account ID to use"),
+    scraper: LinkedInScraperService = Depends(get_linkedin_scraper_service)
+):
+    try:
+        result = await scraper.scrape_post_comments(
+            post_url=url,
+            limit=limit,
+            sort=sort.value,
+            account_id=account_id,
+        )
+        return format_response("comments", result.get("post_urn", "post"), result, format)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except Exception as e:
+        logger.error("linkedin_post_comments_failed", url=url, error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Failed to scrape LinkedIn post comments: {e}"
         )
 
 @router.get(
