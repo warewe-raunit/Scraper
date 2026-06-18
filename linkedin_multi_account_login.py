@@ -43,7 +43,7 @@ async def login_account(account: dict, captcha_config: dict | None, headless: bo
     — this CLI just unpacks the account dict and delegates so the two paths
     can't drift.
     """
-    return await login_account_with_retries(
+    success, reason = await login_account_with_retries(
         account_id=account["account_id"],
         username=account["username"],
         password=account["password"],
@@ -51,6 +51,7 @@ async def login_account(account: dict, captcha_config: dict | None, headless: bo
         captcha_config=captcha_config,
         headless=headless,
     )
+    return success
 
 async def main():
     load_dotenv(override=True)

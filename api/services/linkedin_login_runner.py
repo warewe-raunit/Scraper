@@ -192,7 +192,7 @@ async def login_account_with_retries(
     captcha_config: Optional[dict] = None,
     headless: bool = True,
     max_proxy_swaps: Optional[int] = None,
-) -> bool:
+) -> tuple[bool, str]:
     """Run a LinkedIn login. Reddit-style LazyBrowser pattern with proxy-swap
     retry on net::ERR_* / timeout (because goodproxies rotate and most are dead).
     """
@@ -201,6 +201,7 @@ async def login_account_with_retries(
         os.getenv("LINKEDIN_LOGIN_PROXY_SWAP_MAX", "3")
     )
 
+    last_err = "no_attempts"
     for swap in range(swaps):
         outcome, err, used_proxy = await _login_once(
             account_id, username, password, static_proxy, captcha_config, headless, use_rotating
@@ -215,10 +216,11 @@ async def login_account_with_retries(
                 persist_login_proxy_into_session(account_id, pin)
             else:
                 logger.warning("login.no_proxy_to_pin", account_id=account_id)
-            return True
+            return True, "success"
         if outcome == "fatal":
-            return False
+            return False, err
+        last_err = err
         logger.info("login.swapping_proxy", account_id=account_id, attempt=swap + 1, max=swaps)
 
     logger.error("login.all_proxy_swaps_exhausted", account_id=account_id)
-    return False
+    return False, last_err or "all_proxy_swaps_exhausted"

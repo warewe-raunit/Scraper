@@ -402,3 +402,122 @@ async def test_reddit_protect_rotation_guarantees(monkeypatch, tmp_path):
     for _ in range(5):
         selected_rot = await registry_protect.get_next_healthy_account()
         assert selected_rot == "acc_02"
+
+
+@pytest.mark.anyio
+async def test_linkedin_relogin_restriction_verdict(monkeypatch, tmp_path):
+    temp_file = tmp_path / "ban_state.json"
+    monkeypatch.setenv("BAN_STATE_FILE", str(temp_file))
+    monkeypatch.setenv("ACCOUNT_BAN_DETECTION", "true")
+    monkeypatch.setenv("LINKEDIN_AUTO_RELOGIN", "true")
+
+    import api.services.linkedin_account_pool as pool_mod
+    import api.services.linkedin_env as env_mod
+
+    monkeypatch.setattr(env_mod, "parse_linkedin_accounts_env", lambda: [
+        {"account_id": "acc_li_01", "username": "user01", "password": "pw", "proxy_url": None}
+    ])
+    
+    # Mock login runner to return False and "restricted" reason
+    import api.services.linkedin_login_runner as runner_mod
+    async def mock_login(*args, **kwargs):
+        return False, "This account is temporarily restricted due to security verification."
+    monkeypatch.setattr(runner_mod, "login_account_with_retries", mock_login)
+
+    # Force clean pool instantiation
+    monkeypatch.setattr(pool_mod.LinkedInAccountPool, "_instance", None)
+    pool = await pool_mod.LinkedInAccountPool.instance()
+    
+    # Trigger relogin
+    await pool._run_relogin_once("acc_li_01")
+    
+    # Check that ledger is restricted
+    acc = pool._accounts["acc_li_01"]
+    assert acc.ledger is not None
+    assert acc.ledger.ban_state == "restricted"
+
+
+@pytest.mark.anyio
+async def test_linkedin_snapshot_fields(monkeypatch, tmp_path):
+    temp_file = tmp_path / "ban_state.json"
+    monkeypatch.setenv("BAN_STATE_FILE", str(temp_file))
+    monkeypatch.setenv("ACCOUNT_BAN_DETECTION", "true")
+
+    import api.services.linkedin_account_pool as pool_mod
+    import api.services.linkedin_env as env_mod
+
+    monkeypatch.setattr(env_mod, "parse_linkedin_accounts_env", lambda: [
+        {"account_id": "acc_li_01", "username": "user01", "password": "pw", "proxy_url": None}
+    ])
+    
+    monkeypatch.setattr(pool_mod.LinkedInAccountPool, "_instance", None)
+    pool = await pool_mod.LinkedInAccountPool.instance()
+    
+    pool.record_signal("acc_li_01", "forbidden") # +3.0
+    pool.record_signal("acc_li_01", "forbidden") # +3.0 -> risk_score = 6.0 (at_risk)
+
+    snap = pool.snapshot()
+    acc_snap = next(a for a in snap["accounts"] if a["account_id"] == "acc_li_01")
+    
+    assert acc_snap["ban_state"] == "at_risk"
+    assert acc_snap["risk_score"] == 6.0
+    assert acc_snap["last_signal"] == "forbidden"
+    assert acc_snap["flagged_at"] is not None
+    assert "acc_li_01" in snap["flagged"]
+
+
+@pytest.mark.anyio
+async def test_linkedin_protect_rotation_guarantees(monkeypatch, tmp_path):
+    temp_file = tmp_path / "ban_state.json"
+    monkeypatch.setenv("BAN_STATE_FILE", str(temp_file))
+    monkeypatch.setenv("ACCOUNT_BAN_DETECTION", "true")
+
+    import api.services.linkedin_account_pool as pool_mod
+    import api.services.linkedin_env as env_mod
+
+    monkeypatch.setattr(env_mod, "parse_linkedin_accounts_env", lambda: [
+        {"account_id": "acc_li_01", "username": "user01", "password": "pw", "proxy_url": None},
+        {"account_id": "acc_li_02", "username": "user02", "password": "pw", "proxy_url": None}
+    ])
+    
+    # Phase 1: protect=false -> terminal ban status is ignored
+    monkeypatch.setenv("ACCOUNT_BAN_PROTECT", "false")
+    monkeypatch.setattr(pool_mod.LinkedInAccountPool, "_instance", None)
+    pool = await pool_mod.LinkedInAccountPool.instance()
+    
+    pool.confirm_verdict("acc_li_01", "suspended")
+    
+    async with pool._lock:
+        selected = pool._pick_next_alive_locked()
+    assert selected is not None
+    # With protect=false, acc_li_01 is still ALIVE in status and chosen
+    assert selected.account_id in ("acc_li_01", "acc_li_02")
+
+    # Phase 2: protect=true -> terminal status excludes, at_risk demoted
+    monkeypatch.setenv("ACCOUNT_BAN_PROTECT", "true")
+    monkeypatch.setattr(pool_mod.LinkedInAccountPool, "_instance", None)
+    pool_protect = await pool_mod.LinkedInAccountPool.instance()
+    
+    pool_protect.confirm_verdict("acc_li_01", "suspended")
+    
+    # acc_li_01 is suspended, so pick_next should ONLY return acc_li_02
+    for _ in range(5):
+        async with pool_protect._lock:
+            selected_rot = pool_protect._pick_next_alive_locked()
+        assert selected_rot is not None
+        assert selected_rot.account_id == "acc_li_02"
+
+    # Demote at_risk: let's clear terminal status of acc_li_01 and make it at_risk
+    pool_protect.confirm_verdict("acc_li_01", "clear")
+    pool_protect.record_signal("acc_li_01", "forbidden")
+    pool_protect.record_signal("acc_li_01", "forbidden") # risk_score = 6.0 (at_risk)
+    
+    # Both are ALIVE, but acc_li_01 is at_risk, acc_li_02 is clear.
+    # Pass 1 should pick acc_li_02 first, then fallback to acc_li_01 only in Pass 2 if acc_li_02 is in_use.
+    # Let's verify pick_next:
+    pool_protect._index = 0  # reset round-robin index
+    
+    # Pick next (without in_use) -> picks acc_li_02 because it's not at_risk
+    async with pool_protect._lock:
+        selected_rot = pool_protect._pick_next_alive_locked()
+    assert selected_rot.account_id == "acc_li_02"

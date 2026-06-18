@@ -491,6 +491,8 @@ class LinkedInScraperService:
             verdict = await self._classify_account_health(aid)
             if verdict == "healthy":
                 await pool.report_account_health(aid, True)
+                if hasattr(pool, "confirm_verdict"):
+                    pool.confirm_verdict(aid, "clear")
             elif verdict == "dead":
                 await pool.report_account_health(aid, False)
             # inconclusive → deliberately no report (leave status as-is)
@@ -964,6 +966,14 @@ class LinkedInScraperService:
                 return _ret(None, redirected=True)
 
         if status != 200 or resp is None:
+            if status == 999:
+                try:
+                    from api.services.linkedin_account_pool import LinkedInAccountPool
+                    pool = await LinkedInAccountPool.instance()
+                    pool.record_signal(target_account_id, "soft_block")
+                except Exception as e:
+                    logger.warning("voyager_fetch.soft_block_record_failed", error=str(e))
+
             text_head = ""
             try:
                 text_head = (resp.text or "")[:500] if resp is not None else ""
