@@ -81,9 +81,15 @@ YOUTUBE_DIRECT_FALLBACK = _env_bool("YOUTUBE_DIRECT_FALLBACK", True)
 # far the paginate-until-limit walk goes so a tiny cap can't run unbounded.
 YOUTUBE_SUBFILTER_MAX_PAGES = _env_int("YOUTUBE_SUBFILTER_MAX_PAGES", 6)
 YOUTUBE_SUBFILTER_MAX_CHANNEL_LOOKUPS = _env_int("YOUTUBE_SUBFILTER_MAX_CHANNEL_LOOKUPS", 80)
-# Per channel-subscriber lookup retry budget (kept tiny — a failed channel
-# lookup just drops that video, it must not stall the whole request).
-YOUTUBE_SUBFILTER_LOOKUP_RETRIES = _env_int("YOUTUBE_SUBFILTER_LOOKUP_RETRIES", 2)
+# Channel-subscriber lookup: 1 attempt = ZERO retries. A channel lookup that
+# fails just drops that video; it must never stall the request retrying dead
+# proxies. _execute_post rotates to a fresh proxy per attempt, so raising this
+# rotates (it never retries the same proxy), but the default is a single shot.
+YOUTUBE_SUBFILTER_LOOKUP_RETRIES = _env_int("YOUTUBE_SUBFILTER_LOOKUP_RETRIES", 1)
+# Resolve channel subs over a DIRECT connection only (public metadata, fast and
+# reliable) — no slow dead-proxy browse calls. Set false to allow a proxy
+# fallback when the direct call returns nothing.
+YOUTUBE_SUBFILTER_DIRECT_ONLY = _env_bool("YOUTUBE_SUBFILTER_DIRECT_ONLY", True)
 # Max concurrent channel lookups per page (so they can't stampede the pool).
 YOUTUBE_SUBFILTER_CONCURRENCY = _env_int("YOUTUBE_SUBFILTER_CONCURRENCY", 8)
 YOUTUBE_WEB_CLIENT_VERSION = _env_str("YOUTUBE_WEB_CLIENT_VERSION", "2.20240101.01.00")

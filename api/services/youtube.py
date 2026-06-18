@@ -519,9 +519,12 @@ class YouTubeScraperService(ProxyRotatingService):
             "context": self._get_client_context("WEB"),
             "browseId": channel_id,
         }
+        # Direct only (default): one fast shot, zero retries. A proxy fallback is
+        # opt-in (YOUTUBE_SUBFILTER_DIRECT_ONLY=false) for the rare case direct is
+        # blocked; even then it's a single attempt, no retry on a dead proxy.
+        attempts = [True] if config.YOUTUBE_SUBFILTER_DIRECT_ONLY else [True, False]
         text = ""
-        # Direct first, then one proxy attempt — each with a tiny retry budget.
-        for force_direct in (True, False):
+        for force_direct in attempts:
             try:
                 data = await self._execute_post(
                     "browse", payload,
