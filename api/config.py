@@ -79,8 +79,13 @@ YOUTUBE_MAX_PROXY_ATTEMPTS = _env_int("YOUTUBE_MAX_PROXY_ATTEMPTS", 3)
 YOUTUBE_DIRECT_FALLBACK = _env_bool("YOUTUBE_DIRECT_FALLBACK", True)
 # Subscriber-cap filter (search?max_subscribers=N) safety ceilings: bound how
 # far the paginate-until-limit walk goes so a tiny cap can't run unbounded.
-YOUTUBE_SUBFILTER_MAX_PAGES = _env_int("YOUTUBE_SUBFILTER_MAX_PAGES", 10)
-YOUTUBE_SUBFILTER_MAX_CHANNEL_LOOKUPS = _env_int("YOUTUBE_SUBFILTER_MAX_CHANNEL_LOOKUPS", 150)
+YOUTUBE_SUBFILTER_MAX_PAGES = _env_int("YOUTUBE_SUBFILTER_MAX_PAGES", 6)
+YOUTUBE_SUBFILTER_MAX_CHANNEL_LOOKUPS = _env_int("YOUTUBE_SUBFILTER_MAX_CHANNEL_LOOKUPS", 80)
+# Per channel-subscriber lookup retry budget (kept tiny — a failed channel
+# lookup just drops that video, it must not stall the whole request).
+YOUTUBE_SUBFILTER_LOOKUP_RETRIES = _env_int("YOUTUBE_SUBFILTER_LOOKUP_RETRIES", 2)
+# Max concurrent channel lookups per page (so they can't stampede the pool).
+YOUTUBE_SUBFILTER_CONCURRENCY = _env_int("YOUTUBE_SUBFILTER_CONCURRENCY", 8)
 YOUTUBE_WEB_CLIENT_VERSION = _env_str("YOUTUBE_WEB_CLIENT_VERSION", "2.20240101.01.00")
 YOUTUBE_ANDROID_CLIENT_VERSION = _env_str("YOUTUBE_ANDROID_CLIENT_VERSION", "19.01.35")
 YOUTUBE_DEFAULT_USER_AGENT = _env_str(

@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import time
 import asyncio
 from pathlib import Path
 from typing import Optional, Dict, Any, List
@@ -38,6 +39,11 @@ class YouTubeScraperService(ProxyRotatingService):
         super().__init__(db, pool_label="youtube_proxy")
         self._api_key: Optional[str] = None
         self._api_key_lock = asyncio.Lock()
+        # Cross-request channel subscriber-count cache (channel_id -> (text, count,
+        # expiry_monotonic)). Sub counts barely move, and popular channels recur
+        # across searches, so caching them avoids re-resolving on every request.
+        self._sub_count_cache: Dict[str, tuple] = {}
+        self._sub_count_ttl = float(os.getenv("YOUTUBE_SUBCOUNT_CACHE_TTL", "3600"))
         logger.info("youtube_scraper_service_initialized", proxy_count=len(self.proxy_pool))
 
     async def _get_innertube_key(self, max_retries: int = 2) -> str:
@@ -489,23 +495,48 @@ class YouTubeScraperService(ProxyRotatingService):
         return int(value * mult)
 
     async def get_channel_subscriber_count(self, channel_id: str) -> tuple[str, Optional[int]]:
-        """Resolve a channel's subscriber count via a single InnerTube browse
-        call. Returns ``(text, count)`` where text is YouTube's raw subscriber
-        string (e.g. "12.3K subscribers", "" when absent) and count is the parsed
-        integer, or None when hidden/unparseable/unavailable."""
+        """Resolve a channel's subscriber count. Returns ``(text, count)`` where
+        text is YouTube's raw subscriber string (e.g. "12.3K subscribers", "" when
+        absent) and count is the parsed integer, or None when
+        hidden/unparseable/unavailable.
+
+        Channel subscriber count is public metadata that doesn't depend on geo or
+        the blocked search/player path, so this resolves DIRECT first (fast and
+        reliable, and it doesn't drain the proxy pool — which matters because the
+        subscriber-cap filter fires many of these concurrently), falling back to
+        a single proxy attempt only if direct fails. Both paths use a tiny retry
+        budget so a bad channel lookup fails fast instead of stalling the request.
+        Results are cached across requests (TTL).
+        """
         if not channel_id:
             return "", None
+        now = time.monotonic()
+        cached = self._sub_count_cache.get(channel_id)
+        if cached and cached[2] > now:
+            return cached[0], cached[1]
+
         payload = {
             "context": self._get_client_context("WEB"),
             "browseId": channel_id,
         }
-        try:
-            data = await self._execute_post("browse", payload)
-        except Exception as e:
-            logger.warn("channel_subscriber_lookup_failed", channel_id=channel_id, error=str(e))
-            return "", None
-        text = self.extract_subscriber_count(data)
-        return text, self.parse_subscriber_text(text)
+        text = ""
+        # Direct first, then one proxy attempt — each with a tiny retry budget.
+        for force_direct in (True, False):
+            try:
+                data = await self._execute_post(
+                    "browse", payload,
+                    max_retries=config.YOUTUBE_SUBFILTER_LOOKUP_RETRIES,
+                    force_direct=force_direct,
+                )
+            except Exception:
+                continue
+            text = self.extract_subscriber_count(data)
+            if text:
+                break
+
+        count = self.parse_subscriber_text(text)
+        self._sub_count_cache[channel_id] = (text, count, now + self._sub_count_ttl)
+        return text, count
 
     def extract_video_id(self, url_or_id: str) -> str:
         """Robust helper to extract 11-char YouTube video ID from URL or return raw ID."""
@@ -717,9 +748,15 @@ class YouTubeScraperService(ProxyRotatingService):
             room = config.YOUTUBE_SUBFILTER_MAX_CHANNEL_LOOKUPS - lookups_done
             if room > 0 and need:
                 batch = need[:room]
-                results = await asyncio.gather(
-                    *[self.get_channel_subscriber_count(cid) for cid in batch]
-                )
+                # Bound concurrency so a page's worth of lookups can't stampede
+                # the proxy pool / YouTube all at once.
+                sem = asyncio.Semaphore(config.YOUTUBE_SUBFILTER_CONCURRENCY)
+
+                async def _resolve(cid):
+                    async with sem:
+                        return await self.get_channel_subscriber_count(cid)
+
+                results = await asyncio.gather(*[_resolve(cid) for cid in batch])
                 for cid, res in zip(batch, results):
                     sub_cache[cid] = res
                 lookups_done += len(batch)
