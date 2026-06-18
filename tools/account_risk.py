@@ -47,6 +47,7 @@ class RiskLedger:
     decay: float = 0.85
     warn_threshold: float = 6.0
     suspect_threshold: float = 10.0
+    consecutive_forbidden_threshold: int = 4
 
     def record(self, signal: str, weight: float | None = None) -> None:
         """Apply one signal. 'ok' decays; danger signals add weight & update
@@ -83,7 +84,7 @@ class RiskLedger:
             # Check for suspects first, then warn
             is_suspect = (
                 self.risk_score >= self.suspect_threshold
-                or self.consecutive_forbidden >= 4
+                or self.consecutive_forbidden >= self.consecutive_forbidden_threshold
                 or signal == "challenge_after_relogin"
             )
             
@@ -128,6 +129,7 @@ class RiskLedger:
             "decay": self.decay,
             "warn_threshold": self.warn_threshold,
             "suspect_threshold": self.suspect_threshold,
+            "consecutive_forbidden_threshold": self.consecutive_forbidden_threshold,
         }
 
     @classmethod
@@ -143,4 +145,5 @@ class RiskLedger:
             decay=d.get("decay", 0.85),
             warn_threshold=d.get("warn_threshold", 6.0),
             suspect_threshold=d.get("suspect_threshold", 10.0),
+            consecutive_forbidden_threshold=d.get("consecutive_forbidden_threshold", 4),
         )

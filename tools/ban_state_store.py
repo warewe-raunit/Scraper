@@ -11,10 +11,14 @@ from pathlib import Path
 import structlog
 from tools.account_risk import RiskLedger
 
+import threading
+
 logger = structlog.get_logger(__name__)
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_FILE_PATH = str(ROOT / "sessions" / "ban_state.json")
+
+_save_lock = threading.Lock()
 
 def get_store_path() -> Path:
     """Resolve the store file path from env or use default."""
@@ -48,24 +52,25 @@ def save(ledgers: dict[str, RiskLedger]) -> None:
     """Save the risk ledgers atomically to the JSON file.
     Wrapped in try/except to avoid crashing the caller on write failures."""
     path = get_store_path()
-    try:
-        # Ensure parent directory exists
-        path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Serialize ledgers
-        serialized = {aid: ledger.to_dict() for aid, ledger in ledgers.items()}
-        
-        # Atomic write: write to a temp file in the same directory and replace
-        temp_dir = path.parent
-        with tempfile.NamedTemporaryFile("w", dir=temp_dir, delete=False, suffix=".tmp", encoding="utf-8") as tf:
-            json.dump(serialized, tf, indent=2)
-            temp_path = tf.name
-            
+    with _save_lock:
         try:
-            os.replace(temp_path, path)
-        except Exception:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-            raise
-    except Exception as e:
-        logger.error("ban_state_store.save_failed", path=str(path), error=str(e))
+            # Ensure parent directory exists
+            path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Serialize ledgers
+            serialized = {aid: ledger.to_dict() for aid, ledger in ledgers.items()}
+            
+            # Atomic write: write to a temp file in the same directory and replace
+            temp_dir = path.parent
+            with tempfile.NamedTemporaryFile("w", dir=temp_dir, delete=False, suffix=".tmp", encoding="utf-8") as tf:
+                json.dump(serialized, tf, indent=2)
+                temp_path = tf.name
+                
+            try:
+                os.replace(temp_path, path)
+            except Exception:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                raise
+        except Exception as e:
+            logger.error("ban_state_store.save_failed", path=str(path), error=str(e))
