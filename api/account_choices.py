@@ -8,14 +8,17 @@ dropdowns. The enums are built once at import (env config is stable for the
 process lifetime; new accounts need an .env change + restart anyway). When no
 accounts are configured we fall back to plain `str` so the param still works.
 
-StrEnum members ARE their string value, so they pass through the service layer
-(dict lookups, URL building, logging) transparently — no normalization needed.
+The members are a `str`-mixin Enum (NOT enum.StrEnum, which is 3.11+ — the
+server runs Python 3.10), so each member IS its string value: it compares equal
+to the plain id, hashes the same (dict lookups in the service layer work), and
+renders as the id via f-string/JSON. Only the explicit ``str(member)`` form
+differs, so normalize with ``account_id_value()`` when a plain string is needed.
 """
 
 from __future__ import annotations
 
 import re
-from enum import StrEnum
+from enum import Enum
 from typing import List, Optional, Type
 
 import structlog
@@ -42,11 +45,17 @@ def _safe_members(ids: List[str]) -> dict:
     return out
 
 
-def _build(enum_name: str, ids: List[str]) -> Optional[Type[StrEnum]]:
+def _build(enum_name: str, ids: List[str]) -> Optional[Type[Enum]]:
     members = _safe_members(ids)
     if not members:
         return None
-    return StrEnum(enum_name, members)
+    # str-mixin Enum (3.10-compatible). type=str makes each member a real str.
+    return Enum(enum_name, members, type=str)
+
+
+def account_id_value(account_id) -> str:
+    """Normalize an account_id param (enum member or plain str) to a plain str."""
+    return account_id.value if isinstance(account_id, Enum) else account_id
 
 
 def _reddit_ids() -> List[str]:

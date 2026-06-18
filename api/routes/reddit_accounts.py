@@ -8,7 +8,7 @@ from __future__ import annotations
 from fastapi import APIRouter
 import structlog
 
-from api.account_choices import RedditAccount
+from api.account_choices import RedditAccount, account_id_value
 from api.dependencies import get_registry
 
 logger = structlog.get_logger(__name__)
@@ -39,5 +39,6 @@ async def get_reddit_account_pool_status():
     ),
 )
 async def reddit_force_relogin(account_id: RedditAccount):
-    queued = await get_registry().force_relogin(str(account_id))
-    return {"queued": queued, "account_id": str(account_id)}
+    aid = account_id_value(account_id)
+    queued = await get_registry().force_relogin(aid)
+    return {"queued": queued, "account_id": aid}

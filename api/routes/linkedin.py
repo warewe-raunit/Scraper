@@ -11,7 +11,7 @@ from typing import Optional, Any, List
 from fastapi import APIRouter, Query, HTTPException, status, Depends, Response
 import structlog
 
-from api.account_choices import LinkedInAccount
+from api.account_choices import LinkedInAccount, account_id_value
 from api.dependencies import get_linkedin_scraper_service
 from api.services.linkedin import LinkedInScraperService
 
@@ -300,9 +300,10 @@ async def get_account_pool_status():
 )
 async def force_relogin(account_id: LinkedInAccount):
     from api.services.linkedin_account_pool import LinkedInAccountPool
+    aid = account_id_value(account_id)
     pool = await LinkedInAccountPool.instance()
-    await pool.force_relogin(str(account_id))
-    return {"queued": True, "account_id": str(account_id)}
+    await pool.force_relogin(aid)
+    return {"queued": True, "account_id": aid}
 
 
 @router.get(
