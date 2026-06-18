@@ -72,21 +72,68 @@ def _patcher(record) -> None:
     """Compute display fields on each record for the console format string."""
     extra = record["extra"]
     extra.setdefault("logger_name", record["name"])
+    # Compact label for the console: just the last dotted component
+    # (api.services.linkedin -> linkedin), so lines stay short and readable —
+    # especially on the server where journald prepends its own timestamp+host.
+    full = extra.get("logger_name") or record["name"] or ""
+    extra["short"] = full.rsplit(".", 1)[-1]
     ctx = {
         k: v
         for k, v in extra.items()
-        if k not in ("logger_name", "ctx") and v is not None
+        if k not in ("logger_name", "ctx", "short", "ctx_sep") and v is not None
     }
     extra["ctx"] = " ".join(f"{k}={v}" for k, v in ctx.items())
 
 
+# Time-only (journald already stamps the full date on the server) + short logger
+# name keeps each line compact and scannable.
 _CONSOLE_FORMAT = (
-    "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
-    "<level>{level: <8}</level> | "
-    "<cyan>{extra[logger_name]}</cyan> - "
+    "<green>{time:HH:mm:ss}</green> | "
+    "<level>{level: <7}</level> | "
+    "<cyan>{extra[short]}</cyan> | "
     "<level>{message}</level>"
     "<dim>{extra[ctx_sep]}{extra[ctx]}</dim>"
 )
+
+
+# High-frequency, low-signal events suppressed by default to cut log volume (and
+# the latency of emitting them). WARNING/ERROR are NEVER suppressed — only these
+# chatty INFO/DEBUG events are. Override the set with LOG_SUPPRESS_EVENTS (comma
+# separated) or disable suppression entirely with LOG_VERBOSE=1.
+_DEFAULT_SUPPRESS_EVENTS = ",".join([
+    "request_started",
+    "voyager_get.account_acquired",
+    "voyager_get.cleared_login_proxy_cooldown",
+    "voyager_fetch.attempt",
+    "voyager_fetch.vet_batch",
+    "voyager_fetch.success",
+    "proxy_pool_enriched",
+    "using_proxy_for_x_profile",
+    "using_proxy_for_x_search",
+    "using_proxy_for_x_thread",
+    "reddit_api_response_received",
+])
+
+_WARNING_NO = 30  # loguru: WARNING=30; anything >= is always kept
+
+
+def _make_noise_filter():
+    """Build a Loguru sink filter that drops the chatty events above unless
+    LOG_VERBOSE is set. Records at WARNING+ always pass, so problems are never
+    hidden — this only trims repetitive INFO/DEBUG progress lines."""
+    if os.getenv("LOG_VERBOSE", "0").lower() in ("1", "true", "yes", "on"):
+        return None  # keep everything
+    raw = os.getenv("LOG_SUPPRESS_EVENTS", _DEFAULT_SUPPRESS_EVENTS)
+    suppressed = {e.strip() for e in raw.split(",") if e.strip()}
+    if not suppressed:
+        return None
+
+    def _filter(record) -> bool:
+        if record["level"].no >= _WARNING_NO:
+            return True
+        return record["message"] not in suppressed
+
+    return _filter
 
 
 def _console_patcher(record) -> None:
@@ -124,18 +171,27 @@ def configure_logging() -> None:
     loguru_logger.remove()
     loguru_logger.configure(patcher=_console_patcher)
 
+    # Drop the chatty high-frequency events from BOTH sinks (less noise, less
+    # I/O latency). WARNING+ always survives. LOG_VERBOSE=1 restores everything.
+    noise_filter = _make_noise_filter()
+
     # stdout sink: pretty colored console, or serialized JSON when LOG_FORMAT=json.
+    # colorize is left to auto-detect (None): a TTY (local dev) gets color; a pipe
+    # (systemd/journald on the server) gets clean plain text instead of raw ANSI
+    # escape codes cluttering the journal.
     if log_format == "json":
-        loguru_logger.add(sys.stdout, level=level, serialize=True, enqueue=True)
+        loguru_logger.add(sys.stdout, level=level, serialize=True, enqueue=True,
+                          filter=noise_filter)
     else:
         loguru_logger.add(
             sys.stdout,
             level=level,
             format=_CONSOLE_FORMAT,
-            colorize=True,
+            colorize=None,
             enqueue=True,
             backtrace=False,
             diagnose=False,
+            filter=noise_filter,
         )
 
     # Rotating, compressed JSON file sink — durable, machine-readable history.
@@ -149,6 +205,7 @@ def configure_logging() -> None:
         enqueue=True,
         backtrace=False,
         diagnose=False,
+        filter=noise_filter,
     )
 
     structlog.configure(
