@@ -136,11 +136,12 @@ async def lifespan(app: FastAPI):
 
 # 2. Instantiate FastAPI App
 app = FastAPI(
-    title="Reddit Stealth API Scraper",
+    title="Scraper API",
     description=(
-        "A highly scalable, performant Reddit scraper that intercepts and wraps "
-        "official Reddit OAuth APIs using stealth browser session cookies and "
-        "custom device client hints to avoid rate limiting and detection."
+        "A highly scalable, performant multi-platform scraper (Reddit, LinkedIn, "
+        "YouTube, and X) that wraps official/public APIs using stealth browser "
+        "session cookies and custom device client hints to avoid rate limiting "
+        "and detection."
     ),
     version="1.0.0",
     docs_url="/docs",

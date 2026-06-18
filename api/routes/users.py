@@ -12,7 +12,7 @@ from api.routes import csv_response
 from api.services.reddit import RedditScraperService
 
 logger = structlog.get_logger(__name__)
-router = APIRouter(prefix="/user", tags=["Users"])
+router = APIRouter(prefix="/user", tags=["Reddit"])
 
 @router.get(
     "/{username}/about",

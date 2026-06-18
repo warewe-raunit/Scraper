@@ -11,7 +11,7 @@ import structlog
 from api.dependencies import get_registry
 
 logger = structlog.get_logger(__name__)
-router = APIRouter(prefix="/reddit", tags=["Reddit Accounts"])
+router = APIRouter(prefix="/reddit", tags=["Reddit"])
 
 
 @router.get(
