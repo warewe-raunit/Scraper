@@ -112,6 +112,15 @@ def configure_logging() -> None:
     log_file = Path(os.getenv("LOG_FILE", str(log_dir / "app.log")))
     log_file.parent.mkdir(parents=True, exist_ok=True)
 
+    # Stamp the PID into the filename so each process rotates its OWN file.
+    # uvicorn spawns a worker/reloader subprocess; if every process adds a sink to
+    # the SAME path, rotation does os.rename() on a file another process holds
+    # open, which raises PermissionError (WinError 32) on Windows and spams the
+    # console on every log line. Per-PID files keep rotation collision-free across
+    # platforms. Opt out with LOG_FILE_PER_PROCESS=0 (e.g. single-process deploys).
+    if os.getenv("LOG_FILE_PER_PROCESS", "1").lower() not in ("0", "false", "no", "off"):
+        log_file = log_file.with_name(f"{log_file.stem}.{os.getpid()}{log_file.suffix}")
+
     loguru_logger.remove()
     loguru_logger.configure(patcher=_console_patcher)
 
