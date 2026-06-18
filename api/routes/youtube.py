@@ -59,11 +59,12 @@ async def search_youtube(
     time: str = Query("all", pattern="^(hour|day|week|month|year|all)$", description="Timeframe filter for search results"),
     limit: int = Query(20, ge=1, le=500, description="Max number of search results to return"),
     location: Optional[SearchLocation] = Query(None, description="Country for proxy selection (renders as a dropdown of full country names)"),
+    max_subscribers: Optional[int] = Query(None, ge=0, description="Only return videos from channels with at most this many subscribers. Channels with hidden/unknown counts are excluded. Slower (resolves each channel)."),
     format: str = Query("json", pattern="^(json|csv|excel|html)$", description="Output format for search results"),
     scraper: YouTubeScraperService = Depends(get_youtube_scraper_service)
 ):
     try:
-        results = await scraper.search(q, sort, time, limit=limit, location=location.code if location else None)
+        results = await scraper.search(q, sort, time, limit=limit, location=location.code if location else None, max_subscribers=max_subscribers)
         if format != "json":
             return format_export_response(results, "search", format, scraper)
         return results

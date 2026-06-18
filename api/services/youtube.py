@@ -270,7 +270,18 @@ class YouTubeScraperService(ProxyRotatingService):
         for src_list in sources:
             if isinstance(src_list, list):
                 thumbnails.extend(src_list)
-                
+
+        # Channel id — the new lockup UI buries it in a browseEndpoint. Pick the
+        # first browseId that looks like a channel id (UC...). Needed so the
+        # subscriber-cap filter can resolve this video's channel.
+        channel_id = ""
+        for be in self.find_nested_keys(vm, "browseEndpoint"):
+            if isinstance(be, dict):
+                bid = be.get("browseId", "")
+                if isinstance(bid, str) and bid.startswith("UC") and len(bid) == 24:
+                    channel_id = bid
+                    break
+
         return {
             "id": video_id,
             "video_id": video_id,
@@ -280,8 +291,8 @@ class YouTubeScraperService(ProxyRotatingService):
             "published_time": published_time,
             "duration": length_text,
             "channel_name": "",
-            "channel_id": "",
-            "channel_url": "",
+            "channel_id": channel_id,
+            "channel_url": f"https://www.youtube.com/channel/{channel_id}" if channel_id else "",
             "thumbnails": thumbnails,
             "video_url": f"https://www.youtube.com/watch?v={video_id}" if video_id else ""
         }
@@ -448,6 +459,54 @@ class YouTubeScraperService(ProxyRotatingService):
                 return val
         return ""
 
+    @staticmethod
+    def parse_subscriber_text(text: Optional[str]) -> Optional[int]:
+        """Parse YouTube's subscriber-count text into an integer, or None when
+        hidden/unparseable.
+
+        Handles abbreviated forms (K/M/B, which YouTube rounds, so the result is
+        approximate near boundaries) and plain comma-grouped counts:
+            "1.2M subscribers" -> 1_200_000
+            "12.3K subscribers" -> 12_300
+            "1,234 subscribers" -> 1_234
+            "1.1B subscribers"  -> 1_100_000_000
+            "No subscribers" / "" / None -> None
+        """
+        if not text:
+            return None
+        m = re.search(r"([\d,]+(?:\.\d+)?)\s*([KMB])?", text, re.IGNORECASE)
+        if not m:
+            return None
+        num_str, suffix = m.group(1), m.group(2)
+        num_str = num_str.replace(",", "")
+        try:
+            value = float(num_str)
+        except ValueError:
+            return None
+        mult = {"k": 1_000, "m": 1_000_000, "b": 1_000_000_000}.get(
+            (suffix or "").lower(), 1
+        )
+        return int(value * mult)
+
+    async def get_channel_subscriber_count(self, channel_id: str) -> tuple[str, Optional[int]]:
+        """Resolve a channel's subscriber count via a single InnerTube browse
+        call. Returns ``(text, count)`` where text is YouTube's raw subscriber
+        string (e.g. "12.3K subscribers", "" when absent) and count is the parsed
+        integer, or None when hidden/unparseable/unavailable."""
+        if not channel_id:
+            return "", None
+        payload = {
+            "context": self._get_client_context("WEB"),
+            "browseId": channel_id,
+        }
+        try:
+            data = await self._execute_post("browse", payload)
+        except Exception as e:
+            logger.warn("channel_subscriber_lookup_failed", channel_id=channel_id, error=str(e))
+            return "", None
+        text = self.extract_subscriber_count(data)
+        return text, self.parse_subscriber_text(text)
+
     def extract_video_id(self, url_or_id: str) -> str:
         """Robust helper to extract 11-char YouTube video ID from URL or return raw ID."""
         url_or_id = url_or_id.strip()
@@ -598,8 +657,17 @@ class YouTubeScraperService(ProxyRotatingService):
             logger.warn("player_pool_failed", video_id=video_id, error=str(e))
         return data
 
-    async def search(self, query: str, sort: str = "relevance", timeframe: str = "all", limit: int = 20, location: Optional[str] = None) -> Dict[str, Any]:
-        """Perform a stealth search request using InnerTube /v1/search with pagination support."""
+    async def search(self, query: str, sort: str = "relevance", timeframe: str = "all", limit: int = 20, location: Optional[str] = None, max_subscribers: Optional[int] = None) -> Dict[str, Any]:
+        """Perform a stealth search request using InnerTube /v1/search with pagination support.
+
+        When ``max_subscribers`` is set, only videos whose channel has at most
+        that many subscribers are returned. Because search results don't carry
+        subscriber counts, each result's channel is resolved with an extra browse
+        call (deduped + cached); channels with hidden/unresolvable counts are
+        dropped. The search keeps paginating until ``limit`` passing videos are
+        collected or a safety ceiling (config.YOUTUBE_SUBFILTER_MAX_PAGES /
+        _MAX_CHANNEL_LOOKUPS) is hit.
+        """
         # Map sort and timeframe filters to sp parameter
         sp_mapping = {
             ("relevance", "all"): "EgIQAQ==",
@@ -631,17 +699,59 @@ class YouTubeScraperService(ProxyRotatingService):
         }
 
         data = await self._execute_post("search", payload, location=location)
-        videos = self.extract_videos(data)
-        
-        # Paginate if needed
+
+        filtering = max_subscribers is not None
+        # Per-request channel sub-count cache: channel_id -> (text, count|None).
+        sub_cache: Dict[str, tuple] = {}
+        lookups_done = 0
+
+        async def _passing(new_videos: List[dict]) -> List[dict]:
+            """Resolve sub counts for new videos' channels and return only those
+            at/under the cap (strict: hidden/unresolvable channels are dropped)."""
+            nonlocal lookups_done
+            # Unique channel ids we haven't resolved yet, bounded by the lookup ceiling.
+            need = list(dict.fromkeys(
+                v.get("channel_id") for v in new_videos
+                if v.get("channel_id") and v.get("channel_id") not in sub_cache
+            ))
+            room = config.YOUTUBE_SUBFILTER_MAX_CHANNEL_LOOKUPS - lookups_done
+            if room > 0 and need:
+                batch = need[:room]
+                results = await asyncio.gather(
+                    *[self.get_channel_subscriber_count(cid) for cid in batch]
+                )
+                for cid, res in zip(batch, results):
+                    sub_cache[cid] = res
+                lookups_done += len(batch)
+
+            kept = []
+            for v in new_videos:
+                cid = v.get("channel_id")
+                if not cid or cid not in sub_cache:
+                    continue  # unresolved channel -> drop (strict)
+                text, count = sub_cache[cid]
+                if count is None or count > max_subscribers:
+                    continue  # hidden or over the cap -> drop
+                kept.append({**v, "subscribers": text, "subscriber_count": count})
+            return kept
+
+        first = self.extract_videos(data)
+        videos = (await _passing(first)) if filtering else first
+
+        # Paginate until we have `limit` videos (passing, when filtering).
         if len(videos) < limit:
             tokens = self.find_nested_keys(data, "continuationItemRenderer")
             current_token = None
             if tokens:
                 current_token = tokens[0].get("continuationEndpoint", {}).get("continuationCommand", {}).get("token")
-                
+
+            pages = 0
+            max_pages = config.YOUTUBE_SUBFILTER_MAX_PAGES if filtering else 1_000_000
             try:
-                while current_token and len(videos) < limit:
+                while current_token and len(videos) < limit and pages < max_pages:
+                    if filtering and lookups_done >= config.YOUTUBE_SUBFILTER_MAX_CHANNEL_LOOKUPS:
+                        break  # lookup ceiling hit
+                    pages += 1
                     next_payload = {
                         "context": self._get_client_context("WEB", country=location),
                         "continuation": current_token
@@ -650,13 +760,14 @@ class YouTubeScraperService(ProxyRotatingService):
                     new_videos = self.extract_videos(next_data)
                     if not new_videos:
                         break
-                        
-                    for v in new_videos:
+
+                    candidates = (await _passing(new_videos)) if filtering else new_videos
+                    for v in candidates:
                         if not any(x["id"] == v["id"] for x in videos):
                             videos.append(v)
                             if len(videos) >= limit:
                                 break
-                                
+
                     # Extract next continuation token
                     next_tokens = self.find_nested_keys(next_data, "continuationItemRenderer")
                     if next_tokens:
@@ -665,10 +776,10 @@ class YouTubeScraperService(ProxyRotatingService):
                         current_token = None
             except Exception as e:
                 logger.warn("youtube_search_pagination_failed", query=query, error=str(e))
-                
+
         # Slice results to requested limit
         videos = videos[:limit]
-        
+
         if self.db:
             await self.db.save_youtube_videos(videos)
             
