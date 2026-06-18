@@ -99,6 +99,15 @@ class AccountRegistry:
         # cooldown timers survive dynamic re-registration.
         self._pool = CooldownPool(label="reddit_account", default_cooldown=300, redact=str)
         self._sync_lock = asyncio.Lock()
+
+        # Background relogin orchestration (mirrors the LinkedIn account pool):
+        # a bounded set of workers keeps every account's session ALIVE
+        # proactively — independent of user traffic — so a request never has to
+        # wait on a fresh login. Each relogin spins a Playwright browser, so the
+        # concurrency is small by default.
+        self._relogin_sem = asyncio.Semaphore(int(os.getenv("REDDIT_RELOGIN_CONCURRENCY", "2")))
+        self._relogin_tasks: Dict[str, asyncio.Task] = {}
+
         self.initialize_registry()
 
     def initialize_registry(self):
@@ -349,3 +358,190 @@ class AccountRegistry:
                 self.cool_down_account(account_id, duration_seconds=600)
                 logger.error("relogin_exception_occurred", account_id=account_id, error=str(e))
                 return False
+
+    # --------------------------------------------------- health + auto-relogin
+
+    def snapshot(self) -> dict:
+        """Per-account health + pool counters (for the accounts/status endpoint).
+
+        Includes accounts configured in .env that have no session yet (status
+        "no_session") so ops can see which accounts still need a first login.
+        """
+        from api.dependencies import parse_accounts_from_env, find_session_file
+
+        now = time.time()
+        configured = {a["account_id"] for a in parse_accounts_from_env()}
+        all_ids = sorted(set(self.states.keys()) | configured)
+
+        accounts: List[Dict[str, Any]] = []
+        for aid in all_ids:
+            st = self.states.get(aid)
+            sf = find_session_file(aid)
+            session_age = round(now - sf.stat().st_mtime, 1) if sf else None
+            relogging = aid in self._relogin_tasks and not self._relogin_tasks[aid].done()
+            if st:
+                accounts.append({
+                    "account_id": aid,
+                    "status": st.status,
+                    "healthy": st.is_healthy(),
+                    "cooldown_remaining": round(st.time_remaining_cooldown(), 1),
+                    "ratelimit_remaining": st.ratelimit_remaining,
+                    "has_session": sf is not None,
+                    "session_age_seconds": session_age,
+                    "relogging": relogging,
+                })
+            else:
+                accounts.append({
+                    "account_id": aid,
+                    "status": "no_session",
+                    "healthy": False,
+                    "cooldown_remaining": 0.0,
+                    "ratelimit_remaining": None,
+                    "has_session": False,
+                    "session_age_seconds": session_age,
+                    "relogging": relogging,
+                })
+
+        counters = {
+            "configured": len(configured),
+            "registered": len(self.states),
+            "healthy": sum(1 for a in accounts if a["healthy"]),
+            "needs_relogin": sum(1 for a in accounts if a["status"] == "needs_relogin"),
+            "cool_down": sum(1 for a in accounts if a["status"] == "cool_down"),
+            "no_session": sum(1 for a in accounts if a["status"] == "no_session"),
+            "relogging": sum(1 for a in accounts if a["relogging"]),
+        }
+        return {"accounts": accounts, "counters": counters}
+
+    async def force_relogin(self, account_id: str) -> bool:
+        """External trigger: flag an account for relogin and queue a background
+        worker. Returns True if a relogin was queued (or already running)."""
+        state = self.states.get(account_id)
+        if state is not None:
+            state.status = "needs_relogin"
+        return self._schedule_relogin(account_id)
+
+    def _schedule_relogin(self, account_id: str) -> bool:
+        """Queue a deduplicated background relogin worker for one account.
+
+        Gated by REDDIT_AUTO_RELOGIN (default on); when off the pool never
+        launches a browser to re-login (saved-sessions-only mode). Returns
+        whether a worker is queued/running for this account.
+        """
+        if os.getenv("REDDIT_AUTO_RELOGIN", "true").lower() not in ("1", "true", "yes", "on"):
+            logger.info("reddit_relogin_skipped_disabled", account_id=account_id)
+            return False
+        existing = self._relogin_tasks.get(account_id)
+        if existing is not None and not existing.done():
+            return True  # already in flight
+        self._relogin_tasks[account_id] = asyncio.create_task(self._run_relogin_once(account_id))
+        return True
+
+    async def _run_relogin_once(self, account_id: str) -> bool:
+        """Background relogin worker: refresh (or create) the session for one
+        account. Bounded by _relogin_sem; serialized against the request-path
+        relogin via the per-account lock. Works even when the account has no
+        prior state (first-time login) — on success it registers the account."""
+        from api.dependencies import parse_accounts_from_env
+
+        target_acc = next(
+            (a for a in parse_accounts_from_env() if a["account_id"] == account_id), None
+        )
+        if not target_acc:
+            logger.error("reddit_bg_relogin_credentials_missing", account_id=account_id)
+            return False
+
+        captcha_provider = os.getenv("CAPTCHA_PROVIDER")
+        captcha_api_key = os.getenv("CAPTCHA_API_KEY")
+        captcha_config = None
+        if captcha_provider and captcha_api_key:
+            captcha_config = {"provider": captcha_provider.strip(), "api_key": captcha_api_key.strip()}
+
+        # Headful by default so interactive challenges can be solved in a visible
+        # window; set REDDIT_RELOGIN_HEADLESS=true for unattended/server runs.
+        headless = os.getenv(
+            "REDDIT_RELOGIN_HEADLESS", os.getenv("BROWSER_HEADLESS", "false")
+        ).lower() in ("1", "true", "yes", "on")
+
+        async with self._relogin_sem:
+            state = self.states.get(account_id)
+            # Serialize with the request-path trigger_relogin for this account.
+            lock = state.lock if state is not None else None
+            if lock is not None:
+                await lock.acquire()
+            try:
+                # Another worker/request may have healed it while we waited.
+                if state is not None and state.status == "healthy":
+                    self.check_proactive_expiry(account_id)
+                    if state.status == "healthy":
+                        logger.info("reddit_bg_relogin_skipped_already_healthy", account_id=account_id)
+                        return True
+
+                logger.info("reddit_bg_relogin_start", account_id=account_id, username=target_acc.get("username"))
+                try:
+                    success = await login_account(target_acc, captcha_config, headless=headless)
+                except Exception as e:
+                    logger.error("reddit_bg_relogin_exception", account_id=account_id, error=str(e)[:200])
+                    success = False
+            finally:
+                if lock is not None:
+                    lock.release()
+
+        if success:
+            # Register the (possibly brand-new) session so it starts serving.
+            if account_id not in self.states:
+                self.initialize_registry()
+            st = self.states.get(account_id)
+            if st is not None:
+                st.status = "healthy"
+                self._pool.clear(account_id)  # lift any active cooldown timer
+            logger.info("reddit_bg_relogin_success", account_id=account_id)
+            return True
+
+        # Cooldown a known account so the sweeper doesn't hammer a failing login.
+        if account_id in self.states:
+            self.cool_down_account(account_id, duration_seconds=600)
+        logger.warning("reddit_bg_relogin_failed", account_id=account_id)
+        return False
+
+    async def sweep_and_relogin(self) -> dict:
+        """One proactive health pass over ALL configured accounts: pick up new
+        session files, flag expired/aged/missing sessions, and queue background
+        relogins for them. Returns the post-sweep snapshot counters."""
+        # Pick up any session files written since startup (e.g. by a prior sweep).
+        self.initialize_registry()
+
+        from api.dependencies import parse_accounts_from_env
+
+        queued = 0
+        for acc in parse_accounts_from_env():
+            aid = acc["account_id"]
+            state = self.states.get(aid)
+            needs = False
+            if state is None:
+                needs = True  # configured but no usable session yet
+            else:
+                self.check_proactive_expiry(aid)
+                needs = state.status == "needs_relogin"
+            if needs and self._schedule_relogin(aid):
+                queued += 1
+
+        counters = self.snapshot()["counters"]
+        logger.info("reddit_account_health_sweep", queued=queued, **counters)
+        return counters
+
+    async def run_health_loop(self) -> None:
+        """Run an immediate startup sweep, then repeat on
+        REDDIT_HEALTH_CHECK_INTERVAL (seconds; 0 disables the repeat). Keeps
+        every account's session alive proactively, not just at query time."""
+        try:
+            await self.sweep_and_relogin()
+        except Exception as e:
+            logger.warning("reddit_account_health_sweep_failed", error=str(e))
+        interval = int(os.getenv("REDDIT_HEALTH_CHECK_INTERVAL", "300"))
+        while interval > 0:
+            await asyncio.sleep(interval)
+            try:
+                await self.sweep_and_relogin()
+            except Exception as e:
+                logger.warning("reddit_account_health_sweep_failed", error=str(e))

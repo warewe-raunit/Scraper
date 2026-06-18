@@ -87,6 +87,21 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(_account_health_sweep())
         logger.info("linkedin_account_health_sweep_dispatched")
 
+    # Keep every Reddit account's session ALIVE proactively (not just when a
+    # request hits a 401): sweep all configured accounts at startup and on an
+    # interval, relogging any whose session is missing, aged out, or whose token
+    # is expiring — in the background, bounded by REDDIT_RELOGIN_CONCURRENCY.
+    # Gated by REDDIT_AUTO_RELOGIN (the actual relogin) + REDDIT_VALIDATE_ON_STARTUP.
+    if os.getenv("REDDIT_VALIDATE_ON_STARTUP", "true").lower() in ("1", "true", "yes", "on"):
+        async def _reddit_account_health_loop():
+            try:
+                from api.dependencies import get_registry
+                await get_registry().run_health_loop()
+            except Exception as e:
+                logger.warning("reddit_account_health_loop_failed", error=str(e))
+        asyncio.create_task(_reddit_account_health_loop())
+        logger.info("reddit_account_health_loop_dispatched")
+
     # Warm the YouTube InnerTube API key in the background so the FIRST video
     # request doesn't pay the (potentially Playwright-backed) key-extraction
     # cost inline. Non-blocking; falls back to lazy extraction if it fails.
@@ -193,10 +208,11 @@ async def log_requests(request: Request, call_next):
         )
 
 # 5. Register Routes and Routers
-from api.routes import subreddits, posts, comments, users, youtube, x, linkedin
+from api.routes import subreddits, posts, comments, users, youtube, x, linkedin, reddit_accounts
 from api.dependencies import verify_api_key
 
 app.include_router(subreddits.router, prefix="/api/v1", dependencies=[Depends(verify_api_key)])
+app.include_router(reddit_accounts.router, prefix="/api/v1", dependencies=[Depends(verify_api_key)])
 app.include_router(posts.router, prefix="/api/v1", dependencies=[Depends(verify_api_key)])
 app.include_router(comments.router, prefix="/api/v1", dependencies=[Depends(verify_api_key)])
 app.include_router(users.router, prefix="/api/v1", dependencies=[Depends(verify_api_key)])
