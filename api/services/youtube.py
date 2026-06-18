@@ -515,12 +515,14 @@ class YouTubeScraperService(ProxyRotatingService):
         hidden/unparseable/unavailable.
 
         Channel subscriber count is public metadata that doesn't depend on geo or
-        the blocked search/player path, so this resolves DIRECT first (fast and
-        reliable, and it doesn't drain the proxy pool — which matters because the
-        subscriber-cap filter fires many of these concurrently), falling back to
-        a single proxy attempt only if direct fails. Both paths use a tiny retry
-        budget so a bad channel lookup fails fast instead of stalling the request.
-        Results are cached across requests (TTL).
+        the blocked search/player path, so this resolves over a DIRECT connection
+        (fast, reliable, and it doesn't drain the proxy pool — which matters
+        because the subscriber-cap filter fires many of these concurrently). A
+        single proxy attempt is used as a fallback only when
+        YOUTUBE_SUBFILTER_DIRECT_ONLY is false. Lookups use a tiny retry budget so
+        a bad channel fails fast instead of stalling the request. Results are
+        cached across requests only when YOUTUBE_SUBCOUNT_CACHE_TTL > 0 (off by
+        default).
         """
         if not channel_id:
             return "", None
@@ -711,7 +713,7 @@ class YouTubeScraperService(ProxyRotatingService):
         When ``max_subscribers`` is set, only videos whose channel has at most
         that many subscribers are returned. Because search results don't carry
         subscriber counts, each result's channel is resolved with an extra browse
-        call (deduped + cached); channels with hidden/unresolvable counts are
+        call (deduped per request); channels with hidden/unresolvable counts are
         dropped. The search keeps paginating until ``limit`` passing videos are
         collected or a safety ceiling (config.YOUTUBE_SUBFILTER_MAX_PAGES /
         _MAX_CHANNEL_LOOKUPS) is hit.
