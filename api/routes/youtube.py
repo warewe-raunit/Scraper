@@ -85,7 +85,7 @@ async def get_video_details(
     video_id: Optional[str] = Query(None, description="11-character YouTube video ID"),
     limit: int = Query(20, ge=0, le=500, description="Max number of comments to return"),
     include_raw: bool = Query(False, description="Whether to include raw InnerTube API payloads for debugging or offline download"),
-    format: str = Query("json", pattern="^(json|csv|excel|html|raw)$", description="Output format for details"),
+    format: Literal["json", "csv", "excel", "html", "raw"] = Query("json", description="Output format for details"),
     scraper: YouTubeScraperService = Depends(get_youtube_scraper_service)
 ):
     if not url and not video_id:
@@ -115,8 +115,8 @@ async def get_video_details(
 )
 async def get_channel_videos(
     channel_id: str,
-    type: str = Query("videos", pattern="^(videos|live)$", description="Select either 'videos' or 'live' streams"),
-    format: str = Query("json", pattern="^(json|csv|excel|html)$", description="Output format for video list"),
+    type: Literal["videos", "live"] = Query("videos", description="Select either 'videos' or 'live' streams"),
+    format: Literal["json", "csv", "excel", "html"] = Query("json", description="Output format for video list"),
     scraper: YouTubeScraperService = Depends(get_youtube_scraper_service)
 ):
     try:
@@ -138,7 +138,7 @@ async def get_channel_videos(
 )
 async def get_playlist(
     playlist_id: str,
-    format: str = Query("json", pattern="^(json|csv|excel|html)$", description="Output format for video list"),
+    format: Literal["json", "csv", "excel", "html"] = Query("json", description="Output format for video list"),
     scraper: YouTubeScraperService = Depends(get_youtube_scraper_service)
 ):
     try:
@@ -192,9 +192,9 @@ async def download_youtube_video(
     background_tasks: BackgroundTasks,
     url: Optional[str] = Query(None, description="Full YouTube video URL"),
     video_id: Optional[str] = Query(None, description="11-character YouTube video ID"),
-    resolution: str = Query("360p", pattern="^(144p|240p|360p|480p|720p|1080p|1440p|2160p)$", description="Target video resolution"),
+    resolution: Literal["144p", "240p", "360p", "480p", "720p", "1080p", "1440p", "2160p"] = Query("360p", description="Target video resolution"),
     stream_from_server: bool = Query(False, description="Legacy file mode. If True, the backend downloads a temporary MP4 before returning it."),
-    format: str = Query("stream", pattern="^(stream|json|html|redirect|file)$", description="Response format: 'stream' (default) downloads in Swagger without saving a backend file, 'json' returns URL metadata, 'html' shows a page, 'redirect' redirects the browser, 'file' downloads a temporary backend file first."),
+    format: Literal["stream", "json", "html", "redirect", "file"] = Query("stream", description="Response format: 'stream' (default) downloads in Swagger without saving a backend file, 'json' returns URL metadata, 'html' shows a page, 'redirect' redirects the browser, 'file' downloads a temporary backend file first."),
     scraper: YouTubeScraperService = Depends(get_youtube_scraper_service)
 ):
     if not url and not video_id:

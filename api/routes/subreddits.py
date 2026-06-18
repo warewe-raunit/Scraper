@@ -25,8 +25,8 @@ router = APIRouter(prefix="/subreddit", tags=["Subreddits"])
 )
 async def get_subreddit_posts(
     subreddit: str,
-    sort: str = Query("hot", pattern="^(hot|new|top|rising)$", description="Sort criteria for listings"),
-    time: str = Query("all", pattern="^(hour|day|week|month|year|all)$", description="Timeframe filter (only active when sort='top')"),
+    sort: Literal["hot", "new", "top", "rising"] = Query("hot", description="Sort criteria for listings"),
+    time: Literal["hour", "day", "week", "month", "year", "all"] = Query("all", description="Timeframe filter (only active when sort='top')"),
     limit: int = Query(25, ge=1, le=100, description="Max number of posts to return"),
     after: Optional[str] = Query(None, description="Pagination token (after) for the next page"),
     account_id: Optional[str] = Query(None, description="Specify a specific account ID to use. If omitted, rotates available sessions."),

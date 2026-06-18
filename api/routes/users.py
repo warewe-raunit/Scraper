@@ -42,8 +42,8 @@ async def get_user_about(
 )
 async def get_user_posts(
     username: str,
-    sort: str = Query("new", pattern="^(new|hot|top)$", description="Sort criteria for submitted posts"),
-    time: str = Query("all", pattern="^(hour|day|week|month|year|all)$", description="Timeframe filter (only active when sort='top')"),
+    sort: Literal["new", "hot", "top"] = Query("new", description="Sort criteria for submitted posts"),
+    time: Literal["hour", "day", "week", "month", "year", "all"] = Query("all", description="Timeframe filter (only active when sort='top')"),
     limit: int = Query(25, ge=1, le=100, description="Max number of posts to return"),
     after: Optional[str] = Query(None, description="Pagination token (after) for the next page"),
     account_id: Optional[str] = Query(None, description="Specify a specific account ID to use. If omitted, rotates available sessions."),
@@ -67,8 +67,8 @@ async def get_user_posts(
 )
 async def get_user_comments(
     username: str,
-    sort: str = Query("new", pattern="^(new|hot|top)$", description="Sort criteria for comments"),
-    time: str = Query("all", pattern="^(hour|day|week|month|year|all)$", description="Timeframe filter (only active when sort='top')"),
+    sort: Literal["new", "hot", "top"] = Query("new", description="Sort criteria for comments"),
+    time: Literal["hour", "day", "week", "month", "year", "all"] = Query("all", description="Timeframe filter (only active when sort='top')"),
     limit: int = Query(25, ge=1, le=100, description="Max number of comments to return"),
     after: Optional[str] = Query(None, description="Pagination token (after) for the next page"),
     account_id: Optional[str] = Query(None, description="Specify a specific account ID to use. If omitted, rotates available sessions."),
