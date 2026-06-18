@@ -8,6 +8,7 @@ import json
 import time
 import pytest
 from tools.account_risk import RiskLedger, BanState, DEFAULT_WEIGHTS
+from tools import ban_state_store
 
 def test_ok_decays_score():
     ledger = RiskLedger(account_id="test_acc", platform="reddit")
@@ -24,7 +25,7 @@ def test_ok_decays_score():
     
     # Repeated OK returns to clear/zero
     for _ in range(40):
-            ledger.record("ok")
+        ledger.record("ok")
     assert ledger.risk_score == 0.0
     assert ledger.ban_state == BanState.CLEAR.value
 
@@ -123,3 +124,45 @@ def test_to_from_dict():
     assert ledger2.risk_score == 4.0
     assert ledger2.ban_state == BanState.CLEAR.value
     assert len(ledger2.last_signals) == 2
+
+def test_persistence_roundtrip(tmp_path):
+    # Setup temp file path
+    temp_file = tmp_path / "ban_state.json"
+    os.environ["BAN_STATE_FILE"] = str(temp_file)
+    
+    ledger_reddit = RiskLedger(account_id="reddit_acc", platform="reddit")
+    ledger_reddit.record("forbidden")
+    
+    ledger_linkedin = RiskLedger(account_id="linkedin_acc", platform="linkedin")
+    ledger_linkedin.record("rate_limited")
+    
+    ledgers = {
+        "reddit_acc": ledger_reddit,
+        "linkedin_acc": ledger_linkedin,
+    }
+    
+    # Save
+    ban_state_store.save(ledgers)
+    assert temp_file.exists()
+    
+    # Load
+    loaded = ban_state_store.load()
+    assert len(loaded) == 2
+    assert loaded["reddit_acc"].account_id == "reddit_acc"
+    assert loaded["reddit_acc"].platform == "reddit"
+    assert loaded["reddit_acc"].risk_score == 3.0
+    assert loaded["linkedin_acc"].account_id == "linkedin_acc"
+    assert loaded["linkedin_acc"].platform == "linkedin"
+    assert loaded["linkedin_acc"].risk_score == 1.0
+
+def test_persistence_corrupt_file_graceful(tmp_path):
+    # Setup temp file path
+    temp_file = tmp_path / "ban_state.json"
+    os.environ["BAN_STATE_FILE"] = str(temp_file)
+    
+    # Write corrupt JSON
+    with open(temp_file, "w") as f:
+        f.write("{invalid json")
+        
+    loaded = ban_state_store.load()
+    assert loaded == {}
