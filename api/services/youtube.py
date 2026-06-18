@@ -42,8 +42,10 @@ class YouTubeScraperService(ProxyRotatingService):
         # Cross-request channel subscriber-count cache (channel_id -> (text, count,
         # expiry_monotonic)). Sub counts barely move, and popular channels recur
         # across searches, so caching them avoids re-resolving on every request.
+        # Default OFF (TTL=0) for now so every request re-resolves live counts;
+        # set YOUTUBE_SUBCOUNT_CACHE_TTL=3600 to re-enable a 1h cache.
         self._sub_count_cache: Dict[str, tuple] = {}
-        self._sub_count_ttl = float(os.getenv("YOUTUBE_SUBCOUNT_CACHE_TTL", "3600"))
+        self._sub_count_ttl = float(os.getenv("YOUTUBE_SUBCOUNT_CACHE_TTL", "0"))
         logger.info("youtube_scraper_service_initialized", proxy_count=len(self.proxy_pool))
 
     async def _get_innertube_key(self, max_retries: int = 2) -> str:
