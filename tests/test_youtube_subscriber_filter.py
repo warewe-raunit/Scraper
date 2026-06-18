@@ -164,6 +164,28 @@ def test_page_ceiling_returns_partial(monkeypatch):
 
 # --------------------------------------------------------- lockup channel id
 
+def test_extract_subscriber_count_modern_pageheader():
+    """Modern channel pages (pageHeaderRenderer) carry the count as a plain
+    'content' string, not subscriberCountText. Must still be extracted."""
+    svc = yt.YouTubeScraperService()
+    data = {"header": {"pageHeaderRenderer": {"content": {"x": {
+        "metadataParts": [
+            {"text": {"content": "860K subscribers"},
+             "accessibilityLabel": "860 thousand subscribers"},
+            {"text": {"content": "1.2K videos"}},
+        ]
+    }}}}}
+    text = svc.extract_subscriber_count(data)
+    assert "subscribers" in text
+    assert svc.parse_subscriber_text(text) == 860_000
+
+
+def test_extract_subscriber_count_legacy_field():
+    svc = yt.YouTubeScraperService()
+    data = {"subscriberCountText": {"simpleText": "29.9M subscribers"}}
+    assert svc.extract_subscriber_count(data) == "29.9M subscribers"
+
+
 def test_lockup_extracts_channel_id():
     svc = yt.YouTubeScraperService()
     vm = {

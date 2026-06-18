@@ -457,12 +457,24 @@ class YouTubeScraperService(ProxyRotatingService):
         return "0"
 
     def extract_subscriber_count(self, next_data: Any) -> str:
-        """Parse subscriber count for a channel from the watch page layout."""
+        """Parse subscriber count text from a watch or channel page layout.
+
+        Handles both the legacy ``subscriberCountText`` field and the modern
+        channel ``pageHeaderRenderer`` format, where the count is just a string
+        like "860K subscribers" buried in a ``content``/``accessibilityLabel``
+        field (no dedicated subscriber key)."""
+        # 1. Legacy field (watch page, older channel headers).
         sub_texts = self.find_nested_keys(next_data, "subscriberCountText")
         for text in sub_texts:
             val = self.parse_runs(text)
             if val:
                 return val
+        # 2. Modern channel page: scan content/label strings for "... subscribers".
+        pattern = re.compile(r"[\d][\d.,]*\s*[KMB]?\s+subscribers?\b", re.IGNORECASE)
+        for key in ("content", "accessibilityLabel", "simpleText"):
+            for s in self.find_nested_keys(next_data, key):
+                if isinstance(s, str) and pattern.search(s):
+                    return s
         return ""
 
     @staticmethod
