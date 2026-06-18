@@ -56,7 +56,7 @@ def test_execute_post_falls_back_to_direct(monkeypatch):
         return "FAKE_KEY"
 
     monkeypatch.setattr(svc, "_get_innertube_key", _fake_key)
-    monkeypatch.setattr(svc, "_get_next_proxy", lambda: "http://dead-proxy:8080")
+    monkeypatch.setattr(svc, "_get_next_proxy", lambda *a, **k: "http://dead-proxy:8080")
 
     async def run():
         async def _no_sleep(_):
@@ -83,7 +83,7 @@ def test_direct_fallback_disabled_stays_on_proxy(monkeypatch):
         return "FAKE_KEY"
 
     monkeypatch.setattr(svc, "_get_innertube_key", _fake_key)
-    monkeypatch.setattr(svc, "_get_next_proxy", lambda: "http://dead-proxy:8080")
+    monkeypatch.setattr(svc, "_get_next_proxy", lambda *a, **k: "http://dead-proxy:8080")
 
     async def run():
         async def _no_sleep(_):

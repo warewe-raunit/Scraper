@@ -154,10 +154,77 @@ def test_grace_window_keeps_freshly_admitted_proxy():
     assert p.pool.items == []
 
 
+def test_resolve_proxy_country():
+    from tools.proxy_provider import resolve_proxy_country, get_proxy_provider
+    import urllib.request
+    
+    gp = get_proxy_provider()
+    gp.enabled = True
+    gp.api_key = "test-key"
+    gp.proxy_countries["http://12.34.56.78:8080"] = "US"
+    
+    # Test case 1: Cached country lookup
+    assert resolve_proxy_country("http://12.34.56.78:8080") == "US"
+    
+    # Test case 2: Local address lookup should return None
+    assert resolve_proxy_country("http://127.0.0.1:8080") is None
+    
+    # Test case 3: Mocked external lookup
+    original_urlopen = urllib.request.urlopen
+    try:
+        class DummyResponse:
+            def read(self):
+                return b'{"countryCode": "DE"}'
+            def __enter__(self):
+                return self
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                pass
+                
+        urllib.request.urlopen = lambda req, timeout=None: DummyResponse()
+        assert resolve_proxy_country("http://99.99.99.99:8080") == "DE"
+    finally:
+        urllib.request.urlopen = original_urlopen
+
+
+def test_get_next_geo_rotation():
+    p = _make_provider()
+    p.enabled = True
+    p.api_key = "test-key"
+    
+    # Set items and populate their countries
+    proxies = ["http://1.1.1.1:80", "http://2.2.2.2:80", "http://3.3.3.3:80"]
+    p.pool.set_items(proxies)
+    p.proxy_countries = {
+        "http://1.1.1.1:80": "US",
+        "http://2.2.2.2:80": "US",
+        "http://3.3.3.3:80": "RU",
+    }
+    
+    # Request US proxy specifically with fallback_to_any=False
+    p1 = p.get_next(country="US", fallback_to_any=False)
+    p2 = p.get_next(country="US", fallback_to_any=False)
+    assert p1 in ("http://1.1.1.1:80", "http://2.2.2.2:80")
+    assert p2 in ("http://1.1.1.1:80", "http://2.2.2.2:80")
+    
+    # Request RU proxy specifically with fallback_to_any=False
+    p3 = p.get_next(country="RU", fallback_to_any=False)
+    assert p3 == "http://3.3.3.3:80"
+    
+    # Request DE proxy (absent) with fallback_to_any=False -> should return None
+    p_none = p.get_next(country="DE", fallback_to_any=False)
+    assert p_none is None
+    
+    # Request DE proxy (absent) with fallback_to_any=True -> should return any proxy from pool
+    p_any = p.get_next(country="DE", fallback_to_any=True)
+    assert p_any in proxies
+
+
 if __name__ == "__main__":
     test_transient_probe_failure_does_not_evict()
     test_recovered_proxy_resets_strikes()
     test_no_topup_fetch_when_at_or_above_floor()
     test_topup_fetch_only_when_below_floor()
     test_grace_window_keeps_freshly_admitted_proxy()
+    test_resolve_proxy_country()
+    test_get_next_geo_rotation()
     print("ALL PROXY PERSISTENCE TESTS PASSED")
