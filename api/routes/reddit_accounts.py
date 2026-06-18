@@ -8,6 +8,7 @@ from __future__ import annotations
 from fastapi import APIRouter
 import structlog
 
+from api.account_choices import RedditAccount
 from api.dependencies import get_registry
 
 logger = structlog.get_logger(__name__)
@@ -37,6 +38,6 @@ async def get_reddit_account_pool_status():
         "background. No-op queue=false if REDDIT_AUTO_RELOGIN is disabled."
     ),
 )
-async def reddit_force_relogin(account_id: str):
-    queued = await get_registry().force_relogin(account_id)
-    return {"queued": queued, "account_id": account_id}
+async def reddit_force_relogin(account_id: RedditAccount):
+    queued = await get_registry().force_relogin(str(account_id))
+    return {"queued": queued, "account_id": str(account_id)}

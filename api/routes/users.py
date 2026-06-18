@@ -7,6 +7,7 @@ from __future__ import annotations
 from typing import Literal, Optional
 from fastapi import APIRouter, Query, HTTPException, status, Depends
 import structlog
+from api.account_choices import RedditAccount
 from api.dependencies import get_reddit_scraper_service
 from api.routes import csv_response
 from api.services.reddit import RedditScraperService
@@ -21,7 +22,7 @@ router = APIRouter(prefix="/user", tags=["Reddit"])
 )
 async def get_user_about(
     username: str,
-    account_id: Optional[str] = Query(None, description="Specify a specific account ID to use. If omitted, rotates available sessions."),
+    account_id: Optional[RedditAccount] = Query(None, description="Specific account to use (dropdown of configured accounts). If omitted, rotates available sessions."),
     format: Literal["json", "csv"] = Query("json", description="Output format"),
     scraper: RedditScraperService = Depends(get_reddit_scraper_service)
 ):
@@ -46,7 +47,7 @@ async def get_user_posts(
     time: Literal["hour", "day", "week", "month", "year", "all"] = Query("all", description="Timeframe filter (only active when sort='top')"),
     limit: int = Query(25, ge=1, le=100, description="Max number of posts to return"),
     after: Optional[str] = Query(None, description="Pagination token (after) for the next page"),
-    account_id: Optional[str] = Query(None, description="Specify a specific account ID to use. If omitted, rotates available sessions."),
+    account_id: Optional[RedditAccount] = Query(None, description="Specific account to use (dropdown of configured accounts). If omitted, rotates available sessions."),
     format: Literal["json", "csv"] = Query("json", description="Output format"),
     scraper: RedditScraperService = Depends(get_reddit_scraper_service)
 ):
@@ -71,7 +72,7 @@ async def get_user_comments(
     time: Literal["hour", "day", "week", "month", "year", "all"] = Query("all", description="Timeframe filter (only active when sort='top')"),
     limit: int = Query(25, ge=1, le=100, description="Max number of comments to return"),
     after: Optional[str] = Query(None, description="Pagination token (after) for the next page"),
-    account_id: Optional[str] = Query(None, description="Specify a specific account ID to use. If omitted, rotates available sessions."),
+    account_id: Optional[RedditAccount] = Query(None, description="Specific account to use (dropdown of configured accounts). If omitted, rotates available sessions."),
     format: Literal["json", "csv"] = Query("json", description="Output format"),
     scraper: RedditScraperService = Depends(get_reddit_scraper_service)
 ):

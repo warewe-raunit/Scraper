@@ -11,6 +11,7 @@ from typing import Optional, Any, List
 from fastapi import APIRouter, Query, HTTPException, status, Depends, Response
 import structlog
 
+from api.account_choices import LinkedInAccount
 from api.dependencies import get_linkedin_scraper_service
 from api.services.linkedin import LinkedInScraperService
 
@@ -172,7 +173,7 @@ async def get_linkedin_profile(
     profile_id: str,
     profile_url: Optional[str] = Query(None, description="Optional full LinkedIn Profile URL (if provided, overrides profile_id)"),
     format: ResponseFormat = Query(ResponseFormat.JSON, description="Output format"),
-    account_id: Optional[str] = Query(None, description="Optional specific LinkedIn account ID to use"),
+    account_id: Optional[LinkedInAccount] = Query(None, description="Specific LinkedIn account to use (dropdown of configured accounts). If omitted, rotates available sessions."),
     scraper: LinkedInScraperService = Depends(get_linkedin_scraper_service)
 ):
     target = profile_url if profile_url else profile_id
@@ -196,7 +197,7 @@ async def get_linkedin_company(
     company_name: str,
     company_url: Optional[str] = Query(None, description="Optional full LinkedIn Company URL (if provided, overrides company_name)"),
     format: ResponseFormat = Query(ResponseFormat.JSON, description="Output format"),
-    account_id: Optional[str] = Query(None, description="Optional specific LinkedIn account ID to use"),
+    account_id: Optional[LinkedInAccount] = Query(None, description="Specific LinkedIn account to use (dropdown of configured accounts). If omitted, rotates available sessions."),
     scraper: LinkedInScraperService = Depends(get_linkedin_scraper_service)
 ):
     target = company_url if company_url else company_name
@@ -225,7 +226,7 @@ async def search_linkedin_jobs(
     date_posted: Optional[DatePostedRange] = Query(None, description="Filter by when the job was posted"),
     limit: int = Query(25, ge=1, le=1000, description="Max job postings to retrieve (paginated)"),
     format: ResponseFormat = Query(ResponseFormat.JSON, description="Output format"),
-    account_id: Optional[str] = Query(None, description="Optional specific LinkedIn account ID to use"),
+    account_id: Optional[LinkedInAccount] = Query(None, description="Specific LinkedIn account to use (dropdown of configured accounts). If omitted, rotates available sessions."),
     scraper: LinkedInScraperService = Depends(get_linkedin_scraper_service)
 ):
     try:
@@ -262,7 +263,7 @@ async def get_linkedin_post_comments(
     sort: CommentSortOrder = Query(CommentSortOrder.RELEVANT, description="Comment sort order (relevant = top, recent = chronological)"),
     limit: int = Query(25, ge=1, le=1000, description="Max number of comments to retrieve (paginated)"),
     format: ResponseFormat = Query(ResponseFormat.JSON, description="Output format"),
-    account_id: Optional[str] = Query(None, description="Optional specific LinkedIn account ID to use"),
+    account_id: Optional[LinkedInAccount] = Query(None, description="Specific LinkedIn account to use (dropdown of configured accounts). If omitted, rotates available sessions."),
     scraper: LinkedInScraperService = Depends(get_linkedin_scraper_service)
 ):
     try:
@@ -297,11 +298,11 @@ async def get_account_pool_status():
     "/accounts/{account_id}/relogin",
     summary="Force a background relogin for one account",
 )
-async def force_relogin(account_id: str):
+async def force_relogin(account_id: LinkedInAccount):
     from api.services.linkedin_account_pool import LinkedInAccountPool
     pool = await LinkedInAccountPool.instance()
-    await pool.force_relogin(account_id)
-    return {"queued": True, "account_id": account_id}
+    await pool.force_relogin(str(account_id))
+    return {"queued": True, "account_id": str(account_id)}
 
 
 @router.get(
@@ -314,7 +315,7 @@ async def search_linkedin_blended(
     category: SearchCategory = Query(SearchCategory.ALL, description="Search category filter (people, jobs, companies, posts, groups)"),
     limit: int = Query(25, ge=1, le=1000, description="Max results to retrieve (paginated; not used for category=all)"),
     format: ResponseFormat = Query(ResponseFormat.JSON, description="Output format"),
-    account_id: Optional[str] = Query(None, description="Optional specific LinkedIn account ID to use"),
+    account_id: Optional[LinkedInAccount] = Query(None, description="Specific LinkedIn account to use (dropdown of configured accounts). If omitted, rotates available sessions."),
     scraper: LinkedInScraperService = Depends(get_linkedin_scraper_service)
 ):
     try:
