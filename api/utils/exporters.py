@@ -9,15 +9,14 @@ import csv
 import io
 import json
 import re
+from html import escape
 from typing import Any, Dict, List, Union
 from fastapi import Response
 
 _MOJIBAKE_MARKERS = ("Ã", "Â", "â", "ðŸ", "ð\x9f")
 
 def _escape_html(text: Any) -> str:
-    if text is None:
-        return ""
-    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+    return "" if text is None else escape(str(text))
 
 def _repair_mojibake(value: str) -> str:
     if not any(marker in value for marker in _MOJIBAKE_MARKERS) and not any(0x80 <= ord(char) <= 0x9F for char in value):
@@ -107,6 +106,18 @@ _PREFERRED_ORDER = [
     "id", "username", "fullname", "content", "date", "likes", "retweets", "replies", "link",
 ]
 
+def _ordered_keys(rows: List[Dict[str, Any]]) -> List[str]:
+    """Unique keys across rows, sorted by _PREFERRED_ORDER then first-seen."""
+    keys = list(dict.fromkeys(key for row in rows for key in row.keys()))
+    seen = {k: idx for idx, k in enumerate(keys)}
+    def sort_val(k):
+        try:
+            return (_PREFERRED_ORDER.index(k), seen[k])
+        except ValueError:
+            return (len(_PREFERRED_ORDER), seen[k])
+    keys.sort(key=sort_val)
+    return keys
+
 def _format_header(key: str) -> str:
     """Format a snake_case key into a clean Title Case header."""
     if key in _HEADER_MAPPING:
@@ -133,17 +144,7 @@ def export_to_csv(data: Any, filename: str) -> Response:
     output = io.StringIO()
 
     if rows:
-        original_keys = list(dict.fromkeys(key for row in rows for key in row.keys()))
-        
-        # Sort keys based on preferred ordering
-        key_to_original_idx = {k: idx for idx, k in enumerate(original_keys)}
-        def key_sort_val(k):
-            try:
-                return (_PREFERRED_ORDER.index(k), key_to_original_idx[k])
-            except ValueError:
-                return (len(_PREFERRED_ORDER), key_to_original_idx[k])
-        original_keys.sort(key=key_sort_val)
-        
+        original_keys = _ordered_keys(rows)
         mapped_headers = [_format_header(key) for key in original_keys]
         writer = csv.writer(output)
         writer.writerow(mapped_headers)
@@ -168,17 +169,7 @@ def export_to_excel(data: Any, filename: str) -> Response:
     html += '<body><table>\n'
     
     if rows:
-        original_keys = list(dict.fromkeys(key for row in rows for key in row.keys()))
-        
-        # Sort keys based on preferred ordering
-        key_to_original_idx = {k: idx for idx, k in enumerate(original_keys)}
-        def key_sort_val(k):
-            try:
-                return (_PREFERRED_ORDER.index(k), key_to_original_idx[k])
-            except ValueError:
-                return (len(_PREFERRED_ORDER), key_to_original_idx[k])
-        original_keys.sort(key=key_sort_val)
-        
+        original_keys = _ordered_keys(rows)
         mapped_headers = [_format_header(key) for key in original_keys]
         html += '<tr>' + ''.join(f'<th>{_escape_html(name)}</th>' for name in mapped_headers) + '</tr>\n'
         for row in rows:
