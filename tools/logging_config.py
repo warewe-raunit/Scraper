@@ -153,6 +153,11 @@ def configure_logging() -> None:
     level = os.getenv("LOG_LEVEL", "INFO").upper()
     log_format = os.getenv("LOG_FORMAT", "console").lower()
 
+    # colorize: unset -> None (auto-detect: TTY yes, pipe no). LOG_COLOR=1 forces
+    # ANSI on even through a pipe (journald/systemd shows color); LOG_COLOR=0 forces off.
+    _color_env = os.getenv("LOG_COLOR")
+    colorize = None if _color_env is None else _color_env.lower() in ("1", "true", "yes", "on")
+
     root = Path(__file__).resolve().parents[1]
     log_dir = Path(os.getenv("LOG_DIR", str(root / "logs")))
     log_file = Path(os.getenv("LOG_FILE", str(log_dir / "app.log")))
@@ -186,7 +191,7 @@ def configure_logging() -> None:
             sys.stdout,
             level=level,
             format=_CONSOLE_FORMAT,
-            colorize=None,
+            colorize=colorize,
             enqueue=True,
             backtrace=False,
             diagnose=False,
