@@ -117,6 +117,30 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(_warm_youtube_key())
         logger.info("youtube_key_warmup_dispatched")
 
+    # Mint/refresh X (Nitter) instance tokens in the BACKGROUND — the same model
+    # as the LinkedIn login runner: solve each instance's bot-check off the request
+    # path, cache the token, and refresh before its ~50min TTL. Once warmed, X
+    # requests use the cheap curl path and (with X_INLINE_BROWSER_SOLVE=false)
+    # never launch a browser inline. Waits briefly first so the proxy pool is
+    # stocked before the solves run.
+    if os.getenv("X_WARMUP_ON_STARTUP", "true").lower() in ("1", "true", "yes", "on"):
+        async def _x_token_warmer():
+            try:
+                from tools.unauth_x_scraper import warm_all_instances
+                await asyncio.sleep(int(os.getenv("X_WARM_INITIAL_DELAY", "15")))
+                interval = int(os.getenv("X_TOKEN_WARM_INTERVAL", "2400"))  # 40 min
+                while True:
+                    res = await warm_all_instances()
+                    logger.info("x_token_warm_complete",
+                                warmed=sum(1 for v in res.values() if v), total=len(res))
+                    if interval <= 0:
+                        break
+                    await asyncio.sleep(interval)
+            except Exception as e:
+                logger.warning("x_token_warm_failed", error=str(e))
+        asyncio.create_task(_x_token_warmer())
+        logger.info("x_token_warmer_dispatched")
+
     yield
 
     # --- shutdown ---

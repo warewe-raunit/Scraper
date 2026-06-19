@@ -23,7 +23,8 @@ from bs4 import BeautifulSoup
 from curl_cffi import requests as cffi_requests
 
 from tools.browser_manager import LazyBrowser, active_profile_session_id
-from tools.session_store import load_session, session_age_seconds
+from tools.session_store import load_session, save_session, session_age_seconds
+from tools.proxy_provider import get_proxy_provider
 from tools.stealth.fingerprint import BrowserProfileManager
 from tools.stealth.helpers import _delay
 
@@ -270,6 +271,76 @@ def _get_stealth_session_info(account_id: str) -> tuple[Optional[str], str]:
     return cookie_str, user_agent
 
 
+# --- Shared per-instance Cloudflare token cache --------------------------------
+# A solved cf_clearance is bound to the User-Agent, NOT the exit IP (verified
+# 2026-06-19: a token solved on proxy A passes the challenge through proxy B). So
+# ONE token serves the whole rotating proxy fleet for a given instance. We cache
+# it keyed by instance only (not proxy), with the UA it was solved under, so every
+# proxy's cheap curl path can reuse it immediately instead of re-solving in a
+# browser. Effective token life ~60 min (the 9f_nonce/9f_solution cookies); we
+# treat X_SESSION_TTL_SECONDS (default 3000s = 50 min) as the cache window and keep
+# the reactive re-solve as the safety net.
+
+def _instance_token_ttl() -> int:
+    try:
+        return int(os.getenv("X_SESSION_TTL_SECONDS", "3000"))
+    except ValueError:
+        return 3000
+
+
+def _instance_token_key(instance_hash: str) -> str:
+    return f"x_cf_{instance_hash}"
+
+
+def _load_instance_token(instance_hash: str) -> tuple[Optional[str], Optional[str]]:
+    """Return (cookie_str, user_agent) for the shared instance token, or
+    (None, None) when absent or past the TTL."""
+    key = _instance_token_key(instance_hash)
+    ttl = _instance_token_ttl()
+    if ttl > 0:
+        age = session_age_seconds(key)
+        if age is not None and age >= ttl:
+            return None, None
+    data = load_session(key)
+    if not data or not data.get("cookies"):
+        return None, None
+    cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in data["cookies"])
+    return cookie_str, data.get("ua") or ""
+
+
+def _save_instance_token(instance_hash: str, cookies: list, user_agent: str) -> None:
+    """Cache a freshly-solved token so every proxy's cheap path reuses it at once."""
+    if not cookies:
+        return
+    save_session(_instance_token_key(instance_hash), {"cookies": cookies, "ua": user_agent})
+
+
+async def _persist_instance_token_from_browser(lazy_browser, page, instance_hash: str, log) -> None:
+    """After the browser clears the instance's bot-check, snapshot its cookies +
+    real UA into the shared instance token cache for immediate cross-proxy reuse."""
+    try:
+        state = await lazy_browser._context.storage_state()
+        ua = await page.evaluate("() => navigator.userAgent")
+        cookies = state.get("cookies", [])
+        _save_instance_token(instance_hash, cookies, ua)
+        log.info("unauth_x.instance_token.saved", instance_hash=instance_hash, cookies=len(cookies))
+    except Exception as e:
+        log.warning("unauth_x.instance_token.save_failed", error=str(e)[:120])
+
+
+def _instances_warmed_first(instances: List[str]) -> List[str]:
+    """Reorder so instances that already hold a fresh cached token come first.
+    Without this, random ordering sends a request to an un-warmed instance (which
+    forces a browser solve) before it ever reaches a warmed one whose cheap path
+    would have served it. Order WITHIN each group is preserved (caller shuffles)."""
+    warmed, cold = [], []
+    for base in instances:
+        ih = hashlib.md5(base.encode("utf-8")).hexdigest()[:10]
+        cookie_str, _ = _load_instance_token(ih)
+        (warmed if cookie_str else cold).append(base)
+    return warmed + cold
+
+
 async def _attempt_direct_scrape(
     url: str,
     proxy_url: Optional[str],
@@ -278,31 +349,36 @@ async def _attempt_direct_scrape(
 ) -> tuple[Optional[str], str]:
     """Attempt to fetch page content directly via curl_cffi using saved stealth session cookies.
     Returns a tuple of (HTML text or None, status/reason string).
-    """
-    cookie_str, user_agent = _get_stealth_session_info(account_id)
-    if not cookie_str:
-        log.info("unauth_x.direct_scrape.no_saved_session")
-        return None, "NO_SESSION"
 
-    # Time-limit the cached session. The cookies/clearance token the browser
-    # obtained for this proxy+instance are short-lived; past the TTL, skip the
-    # (likely-stale) direct replay and return None so the caller falls back to the
-    # browser, which re-solves and re-persists a fresh session. Tune via
-    # X_SESSION_TTL_SECONDS (default 1500s = 25 min); set to 0 to disable.
-    try:
-        ttl = int(os.getenv("X_SESSION_TTL_SECONDS", "1500"))
-    except ValueError:
-        ttl = 1500
-    if ttl > 0:
-        age = session_age_seconds(active_profile_session_id(account_id))
-        if age is not None and age >= ttl:
-            log.info(
-                "unauth_x.direct_scrape.session_expired",
-                age_seconds=round(age, 1),
-                ttl_seconds=ttl,
-            )
-            return None, "SESSION_EXPIRED"
-        
+    Prefers the shared per-instance token (proxy-portable); falls back to the
+    legacy per-(proxy,instance) session when no instance token is cached.
+    """
+    # instance_hash is the last segment of account_id ("x_unauth_{proxy}_{instance}").
+    instance_hash = account_id.rsplit("_", 1)[-1]
+    cookie_str, user_agent = _load_instance_token(instance_hash)
+    used_instance_token = bool(cookie_str)
+
+    if not cookie_str:
+        cookie_str, user_agent = _get_stealth_session_info(account_id)
+        if not cookie_str:
+            log.info("unauth_x.direct_scrape.no_saved_session")
+            return None, "NO_SESSION"
+        # Legacy per-account TTL check. (The instance token is freshness-checked
+        # inside _load_instance_token, so it skips this.) Past the TTL, return None
+        # so the caller falls back to the browser to re-solve + re-cache.
+        ttl = _instance_token_ttl()
+        if ttl > 0:
+            age = session_age_seconds(active_profile_session_id(account_id))
+            if age is not None and age >= ttl:
+                log.info(
+                    "unauth_x.direct_scrape.session_expired",
+                    age_seconds=round(age, 1),
+                    ttl_seconds=ttl,
+                )
+                return None, "SESSION_EXPIRED"
+    else:
+        log.info("unauth_x.direct_scrape.using_instance_token", instance_hash=instance_hash)
+
     headers = {
         "User-Agent": user_agent,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -311,55 +387,102 @@ async def _attempt_direct_scrape(
         "Upgrade-Insecure-Requests": "1"
     }
     
-    curl_proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
-    
-    log.info("unauth_x.direct_scrape.attempting", url=url)
+    # Split timeout: a SHORT connect timeout reflects proxy responsiveness (a dead
+    # or stalled proxy never completes the CONNECT tunnel, so it fails in ~5s — in
+    # the same ballpark as the ping/healthcheck range, not a flat long wait), while
+    # a longer READ timeout lets a *working* proxy finish the ~77 KB page transfer
+    # (which is far heavier than the lightweight ping the pool filters on).
     try:
-        loop = asyncio.get_running_loop()
-        response = await loop.run_in_executor(
-            None,
-            lambda: cffi_requests.get(
-                url,
-                headers=headers,
-                impersonate="chrome120",
-                proxies=curl_proxies,
-                timeout=12
+        read_timeout = int(os.getenv("X_DIRECT_TIMEOUT_SECONDS", "8"))
+    except ValueError:
+        read_timeout = 8
+    try:
+        connect_timeout = int(os.getenv("X_DIRECT_CONNECT_TIMEOUT_SECONDS", "5"))
+    except ValueError:
+        connect_timeout = 5
+
+    # Proxy candidates. A cached instance token is proxy-PORTABLE (UA-bound, not
+    # IP-bound), so if the handed proxy is dead we retry the SAME token through a
+    # few other live pool proxies before giving up — turning a dead-proxy stall
+    # into a fast cheap-path success instead of a browser fallback. Without a
+    # token there is nothing to reuse, so only the handed proxy is tried.
+    proxies_to_try = [proxy_url]
+    if used_instance_token:
+        try:
+            gp = get_proxy_provider()
+            if gp.is_enabled():
+                retries = int(os.getenv("X_CHEAP_PROXY_RETRIES", "2"))
+                for _ in range(max(0, retries)):
+                    alt = gp.get_next()
+                    if alt and alt not in proxies_to_try:
+                        proxies_to_try.append(alt)
+        except Exception:
+            pass
+
+    loop = asyncio.get_running_loop()
+    last_reason = "CONNECTION_FAILED"
+    for px in proxies_to_try:
+        log.info("unauth_x.direct_scrape.attempting", url=url, proxy=(px[:24] if px else "direct"))
+        try:
+            response = await loop.run_in_executor(
+                None,
+                lambda p=px: cffi_requests.get(
+                    url,
+                    headers=headers,
+                    impersonate="chrome120",
+                    proxies=({"http": p, "https": p} if p else None),
+                    timeout=(connect_timeout, read_timeout),
+                ),
             )
-        )
-        
+        except Exception as e:
+            # Proxy/connection failure — cool it down and try the next proxy
+            # (the token works on any IP, so this is just bad-proxy luck).
+            log.warning("unauth_x.direct_scrape.error", error=str(e)[:120],
+                        proxy=(px[:24] if px else "direct"))
+            last_reason = "CONNECTION_FAILED"
+            if px and used_instance_token:
+                try:
+                    get_proxy_provider().cool_down(px)
+                except Exception:
+                    pass
+            continue
+
         html = response.text or ""
-        
-        # Check if the page is a block/challenge page
-        is_challenge = ("Just a moment..." in html or 
-                        "Attention Required!" in html or 
+        # Block/challenge page → token rejected; needs a browser re-solve, so
+        # retrying other proxies won't help.
+        is_challenge = ("Just a moment..." in html or
+                        "Attention Required!" in html or
                         "Verifying your request" in html or
                         "Making sure you're not a bot!" in html or
                         "challenges.cloudflare.com" in html)
-                        
         if is_challenge:
             log.warning("unauth_x.direct_scrape.blocked_by_challenge")
             return None, "CLOUDFLARE"
-            
+        # Instance-side error (e.g. 503) — not a proxy problem; stop retrying.
         if response.status_code != 200:
             log.warning("unauth_x.direct_scrape.failed_status", status=response.status_code)
             return None, f"HTTP_{response.status_code}"
-            
         log.info("unauth_x.direct_scrape.success", size=len(html))
         return html, "SUCCESS"
-        
-    except Exception as e:
-        log.warning("unauth_x.direct_scrape.error", error=str(e))
-        return None, "CONNECTION_FAILED"
+
+    return None, last_reason
 
 
 # List of public Nitter / X-proxy instances.
 # Twiiit.com can also be used, but direct instances are more predictable for scraping.
+# Only instances whose CHEAP (curl) path actually serves are kept here — the
+# request path is cheap-path-only (X_INLINE_BROWSER_SOLVE=false), so an instance
+# that can't be served without a browser just wastes an attempt.
+#   - tiekoetter: luna cookie gate; serves on TLS fingerprint (works cookieless).
+#   - kareem:     Cloudflare; cf_clearance token is curl-replayable once warmed.
+# Removed 2026-06-19 (re-add if they recover / change anti-bot):
+#   - nitter.poast.org  : 503 / down.
+#   - nuku.trabun.org   : Cloudflare hard-403, challenge fails to solve.
+#   - nitter.catsarch.com: Anubis proof-of-work — needs JS each request, so the
+#                          curl cheap path can never serve it (returns interstitial).
 DEFAULT_NITTER_INSTANCES = [
     "https://nitter.tiekoetter.com",
     "https://nitter.kareem.one",
-    "https://nitter.poast.org",
-    "https://nuku.trabun.org",
-    "https://nitter.catsarch.com",
 ]
 
 # JavaScript parsing code for profile timelines and search results.
@@ -484,15 +607,26 @@ async def _is_cloudflare_active(page: Page) -> bool:
 
 async def _solve_cloudflare_challenge(page: Page, log, timeout_seconds: int = 20) -> bool:
     """Detect and attempt to solve Cloudflare Turnstile challenges."""
-    # Wait up to 4 seconds to see if Cloudflare activates (handles slow loading/redirects)
+    # Poll briefly to see if Cloudflare activates (handles slow loading/redirects).
+    # Default 2 checks (~0.8s) instead of the old 5 (~3.2s): by this point the page
+    # already finished domcontentloaded + a 2-4s human delay, so a managed challenge
+    # is almost always already present or absent. A challenge that appears later is
+    # still caught downstream by _check_page_for_blocks, which fails the instance.
+    # Real logs showed has_cf_js=False on every poll for these instances, i.e. ~3s
+    # wasted per page. Tune via X_CF_DETECT_POLLS.
+    try:
+        detect_polls = max(1, int(os.getenv("X_CF_DETECT_POLLS", "2")))
+    except ValueError:
+        detect_polls = 2
     cloudflare_detected = False
-    for _ in range(5):
+    for i in range(detect_polls):
         if page.is_closed():
             return False
         if await _is_cloudflare_active(page):
             cloudflare_detected = True
             break
-        await asyncio.sleep(0.8)
+        if i < detect_polls - 1:
+            await asyncio.sleep(0.8)
 
     if not cloudflare_detected:
         return True
@@ -774,6 +908,7 @@ async def scrape_thread(
     if not instances:
         instances = list(DEFAULT_NITTER_INSTANCES)
         random.shuffle(instances)
+        instances = _instances_warmed_first(instances)
 
     def _collect(parsed: dict, main_holder: dict, replies: list, seen: set) -> int:
         """Merge a parsed page into the running thread; return # new replies."""
@@ -844,6 +979,9 @@ async def scrape_thread(
                 continue
 
         # 2. Browser fallback.
+        if not _inline_browser_solve_enabled():
+            log.info("unauth_x.thread.inline_solve_disabled", instance=base_url)
+            continue
         log.info("unauth_x.thread.fallback_to_browser", account_id=account_id)
         entry = await _x_browser_pool.acquire(account_id, proxy_url, headless)
         lazy_browser = entry.lazy
@@ -870,6 +1008,9 @@ async def scrape_thread(
                 log.warning("unauth_x.thread.instance_blocked", instance=base_url)
                 continue
 
+            # Bot-check cleared in the browser — cache this instance's token
+            # (cookies + UA) so every proxy's cheap path reuses it immediately.
+            await _persist_instance_token_from_browser(lazy_browser, page, instance_hash, log)
             html = await page.content()
             parsed = _parse_thread_html(html)
             if parsed.get("main_tweet") or parsed.get("replies"):
@@ -969,6 +1110,7 @@ async def scrape_profile(
     if not instances:
         instances = list(DEFAULT_NITTER_INSTANCES)
         random.shuffle(instances)
+        instances = _instances_warmed_first(instances)
 
     profile_data = {}
     all_tweets = []
@@ -1046,6 +1188,9 @@ async def scrape_profile(
                 continue
         
         # 3. Fallback to browser (Playwright)
+        if not _inline_browser_solve_enabled():
+            log.info("unauth_x.inline_solve_disabled", instance=base_url)
+            continue
         log.info("unauth_x.direct_scrape.fallback_to_browser", account_id=account_id)
         entry = await _x_browser_pool.acquire(account_id, proxy_url, headless)
         lazy_browser = entry.lazy
@@ -1071,7 +1216,10 @@ async def scrape_profile(
                     }
                 log.warning("unauth_x.instance_blocked_or_empty", instance=base_url)
                 continue
-                
+
+            # Bot-check cleared in the browser — cache this instance's token
+            # (cookies + UA) so every proxy's cheap path reuses it immediately.
+            await _persist_instance_token_from_browser(lazy_browser, page, instance_hash, log)
             parsed = await page.evaluate(PARSE_TIMELINE_SCRIPT)
             if parsed and parsed.get("tweets"):
                 if parsed.get("profile"):
@@ -1183,6 +1331,7 @@ async def scrape_search(
     if not instances:
         instances = list(DEFAULT_NITTER_INSTANCES)
         random.shuffle(instances)
+        instances = _instances_warmed_first(instances)
 
     all_tweets = []
     seen_links = set()
@@ -1256,6 +1405,9 @@ async def scrape_search(
                 continue
                 
         # 3. Fallback to browser (Playwright)
+        if not _inline_browser_solve_enabled():
+            log.info("unauth_x.search.inline_solve_disabled", instance=base_url)
+            continue
         log.info("unauth_x.search.direct_scrape.fallback_to_browser", account_id=account_id)
         entry = await _x_browser_pool.acquire(account_id, proxy_url, headless)
         lazy_browser = entry.lazy
@@ -1280,7 +1432,10 @@ async def scrape_search(
                     }
                 log.warning("unauth_x.search.instance_blocked", instance=base_url)
                 continue
-                
+
+            # Bot-check cleared in the browser — cache this instance's token
+            # (cookies + UA) so every proxy's cheap path reuses it immediately.
+            await _persist_instance_token_from_browser(lazy_browser, page, instance_hash, log)
             parsed = await page.evaluate(PARSE_TIMELINE_SCRIPT)
             if parsed and parsed.get("tweets"):
                 for t in parsed["tweets"]:
@@ -1368,3 +1523,68 @@ async def scrape_search(
         "source_instance": None,
         "error": "All public Nitter instances were blocked, rate-limited, or failed to respond."
     }
+
+
+# --- Out-of-band token warming -------------------------------------------------
+# Mint instance tokens the same way LinkedIn mints li_at: solve the bot-check once
+# in a browser OFF the request path, cache the token, and refresh before its TTL.
+# Then the request path uses the cheap curl path and (with X_INLINE_BROWSER_SOLVE
+# disabled) never launches a browser inline.
+
+def _inline_browser_solve_enabled() -> bool:
+    """Whether the REQUEST path may launch a browser to solve a challenge inline.
+    Set X_INLINE_BROWSER_SOLVE=false to rely solely on the background warmer +
+    cached tokens — requests then skip un-warmed instances instead of blocking on
+    an inline browser solve."""
+    return (os.getenv("X_INLINE_BROWSER_SOLVE", "true").strip().lower()
+            in ("1", "true", "yes", "on"))
+
+
+async def warm_instance(base_url: str, proxy_url: Optional[str] = None, headless: bool = True) -> bool:
+    """Solve one instance's bot-check in a browser OUT OF BAND and cache its token
+    (cookies + UA) so every proxy's cheap path can reuse it. Returns True when a
+    token was cached. Safe to call repeatedly (it just refreshes)."""
+    instance_hash = hashlib.md5(base_url.encode("utf-8")).hexdigest()[:10]
+    log = logger.bind(instance=base_url, action="WARM_X_INSTANCE")
+    if proxy_url is None:
+        try:
+            gp = get_proxy_provider()
+            if gp.is_enabled():
+                proxy_url = gp.get_next()
+        except Exception:
+            pass
+    proxy_hash = hashlib.md5(proxy_url.encode("utf-8")).hexdigest()[:10] if proxy_url else "warm"
+    account_id = f"x_unauth_{proxy_hash}_{instance_hash}"
+    entry = await _x_browser_pool.acquire(account_id, proxy_url, headless)
+    lazy_browser = entry.lazy
+    await entry.lock.acquire()
+    try:
+        page = await lazy_browser.get_page()
+        target = base_url.rstrip("/") + "/jack"
+        await page.goto(target, wait_until="domcontentloaded", timeout=45000)
+        await _delay("warm_x", 1.0, 2.0)
+        is_blocked, _ = await _handle_page_navigation_and_blocks(page, log, "warm", proxy_url)
+        if is_blocked:
+            log.warning("unauth_x.warm.blocked", instance=base_url)
+            return False
+        await _persist_instance_token_from_browser(lazy_browser, page, instance_hash, log)
+        log.info("unauth_x.warm.ok", instance=base_url)
+        return True
+    except Exception as e:
+        log.warning("unauth_x.warm.failed", instance=base_url, error=str(e)[:120])
+        return False
+    finally:
+        entry.lock.release()
+
+
+async def warm_all_instances(instances: Optional[List[str]] = None, headless: bool = True) -> dict:
+    """Warm every instance sequentially (background use). Returns {instance: ok}."""
+    insts = instances or list(DEFAULT_NITTER_INSTANCES)
+    results: dict = {}
+    for base in insts:
+        try:
+            results[base] = await warm_instance(base, headless=headless)
+        except Exception as e:
+            logger.warning("unauth_x.warm.exception", instance=base, error=str(e)[:120])
+            results[base] = False
+    return results
