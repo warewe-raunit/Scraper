@@ -28,7 +28,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Set, Any
 
 import structlog
 
@@ -63,6 +63,7 @@ class AccountState:
     total_successes: int = 0
     total_relogins: int = 0
     login_country: Optional[str] = None
+    ledger: Optional[Any] = None
 
     def snapshot(self) -> dict:
         return {
@@ -126,6 +127,18 @@ class LinkedInAccountPool:
         )
         self.relogin_headless = _relogin_headless.lower() in ("1", "true", "yes", "on")
 
+        # Ban state tracking configuration
+        self.ban_detection_enabled = os.getenv("ACCOUNT_BAN_DETECTION", "true").lower() in ("1", "true", "yes", "on")
+        self.ban_protect_enabled = os.getenv("ACCOUNT_BAN_PROTECT", "false").lower() in ("1", "true", "yes", "on")
+        self.ban_risk_warn = float(os.getenv("BAN_RISK_WARN", "6.0"))
+        self.ban_risk_suspect = float(os.getenv("BAN_RISK_SUSPECT", "10.0"))
+        self.ban_risk_decay = float(os.getenv("BAN_RISK_DECAY", "0.85"))
+        self.ban_forbidden_streak = int(os.getenv("BAN_FORBIDDEN_STREAK", "4"))
+        self.just_relogged_accounts = set()
+
+        from tools import ban_state_store
+        self.ledgers = ban_state_store.load() if self.ban_detection_enabled else {}
+
         self._load_accounts_from_env()
 
     # ----------------------------------------------------------- public API
@@ -172,7 +185,11 @@ class LinkedInAccountPool:
                 # We accept ALIVE or DYING, preferring ALIVE
                 candidates = []
                 for acc in self._accounts.values():
-                    if not acc.in_use and acc.status in (ALIVE, DYING):
+                    if acc.in_use:
+                        continue
+                    if self._protect_terminal(acc):
+                        continue
+                    if acc.status in (ALIVE, DYING):
                         candidates.append(acc)
 
                 if candidates:
@@ -182,9 +199,15 @@ class LinkedInAccountPool:
                         country = (acc.login_country or "UNKNOWN").strip().upper()
                         groups.setdefault(country, []).append(acc)
 
-                    # Sort candidates in each group so ALIVE accounts are preferred over DYING
+                    # Sort candidates in each group so ALIVE accounts are preferred over DYING,
+                    # and non-at-risk are preferred over at-risk
+                    def _sort_key(a: AccountState):
+                        status_val = 0 if a.status == ALIVE else 2
+                        risk_val = 1 if self._protect_at_risk(a) else 0
+                        return (status_val + risk_val, a.last_success_at)
+
                     for country in groups:
-                        groups[country].sort(key=lambda a: (0 if a.status == ALIVE else 1, a.last_success_at))
+                        groups[country].sort(key=_sort_key)
 
                     # Find the group with the most candidates
                     best_country = max(groups.keys(), key=lambda c: len(groups[c]))
@@ -227,11 +250,23 @@ class LinkedInAccountPool:
                 # Successful call → restore to ALIVE no matter what state
                 if acc.status not in (DISABLED, RELOGGING):
                     acc.status = ALIVE
+                
+                # Record signal "ok"
+                self.record_signal(account_id, "ok")
+                self.just_relogged_accounts.discard(account_id)
                 return
 
             acc.last_failure_at = now
             if session_redirected:
                 acc.consecutive_302 += 1
+                
+                # Record signals: challenge_after_relogin or forbidden
+                if account_id in self.just_relogged_accounts:
+                    self.record_signal(account_id, "challenge_after_relogin")
+                else:
+                    self.record_signal(account_id, "forbidden")
+                self.just_relogged_accounts.discard(account_id)
+
                 if acc.consecutive_302 >= self.session_death_threshold:
                     if acc.status not in (DEAD, RELOGGING, DISABLED):
                         acc.status = DEAD
@@ -240,6 +275,9 @@ class LinkedInAccountPool:
                     if acc.status == ALIVE:
                         acc.status = DYING
             elif proxies_exhausted:
+                # Record signal "inconclusive"
+                self.record_signal(account_id, "inconclusive")
+
                 # Session is probably fine — the account's pinned proxy just died.
                 # A relogin repins a fresh working _login_proxy. Mark DYING (still
                 # serves as a fallback) and schedule a repin after a couple of
@@ -286,6 +324,7 @@ class LinkedInAccountPool:
                 acc.consecutive_302 = 0
                 acc.consecutive_proxy_exhaust = 0
                 acc.last_success_at = time.time()
+                self.confirm_verdict(account_id, "clear")
             else:
                 acc.status = DEAD
                 acc.last_failure_at = time.time()
@@ -293,9 +332,131 @@ class LinkedInAccountPool:
         if relogin_needed:
             self._schedule_relogin(account_id)
 
+    def _protect_terminal(self, acc: AccountState) -> bool:
+        """In protect mode, True if this account is in a terminal ban state."""
+        return self.ban_protect_enabled and acc.ledger is not None and acc.ledger.is_terminal()
+
+    def _protect_at_risk(self, acc: AccountState) -> bool:
+        """In protect mode, True if this account is flagged at_risk."""
+        return self.ban_protect_enabled and acc.ledger is not None and acc.ledger.is_at_risk()
+
+    def record_signal(self, account_id: str, signal: str) -> None:
+        """Record a risk signal (e.g. ok, forbidden, soft_block, rate_limited).
+        Updates the account risk state and saves it to persistence.
+        """
+        if not self.ban_detection_enabled:
+            return
+
+        acc = self._accounts.get(account_id)
+        if acc is None or acc.ledger is None:
+            return
+
+        old_state = acc.ledger.ban_state
+        acc.ledger.record(signal)
+
+        # Save change
+        from tools import ban_state_store
+        ban_state_store.save(self.ledgers)
+
+        new_state = acc.ledger.ban_state
+        if old_state != new_state:
+            if new_state == "shadow_suspected":
+                logger.warning(
+                    "account.ban_suspected",
+                    platform="linkedin",
+                    account_id=account_id,
+                    risk_score=round(acc.ledger.risk_score, 1),
+                    recent_signals=acc.ledger.last_signals,
+                )
+            elif new_state in ("shadow_confirmed", "suspended", "restricted"):
+                logger.error(
+                    f"account.{new_state}",
+                    platform="linkedin",
+                    account_id=account_id,
+                    risk_score=round(acc.ledger.risk_score, 1),
+                )
+            elif new_state == "clear":
+                logger.info(
+                    "account.ban_cleared",
+                    platform="linkedin",
+                    account_id=account_id,
+                )
+
+    def confirm_verdict(self, account_id: str, verdict: str) -> None:
+        """Confirm a definitive verdict (clear, restricted, suspended, shadow_confirmed)
+        on the account ledger, and save the state.
+        """
+        if not self.ban_detection_enabled:
+            return
+
+        acc = self._accounts.get(account_id)
+        if acc is None or acc.ledger is None:
+            return
+
+        old_state = acc.ledger.ban_state
+        applied = acc.ledger.confirm(verdict)
+
+        if not applied and verdict == "clear" and acc.ledger.is_terminal():
+            remaining = max(
+                0.0,
+                float(os.getenv("BAN_CONFIRMED_COOLDOWN_SECONDS", "86400"))
+                - (time.time() - (acc.ledger.flagged_at or time.time())),
+            )
+            logger.info(
+                "account.clear_blocked_post_ban_cooldown",
+                platform="linkedin",
+                account_id=account_id,
+                ban_state=acc.ledger.ban_state,
+                cooldown_remaining_seconds=round(remaining, 1),
+            )
+
+        # Save change
+        from tools import ban_state_store
+        ban_state_store.save(self.ledgers)
+
+        new_state = acc.ledger.ban_state
+        if old_state != new_state:
+            if new_state == "clear":
+                logger.info(
+                    "account.ban_cleared",
+                    platform="linkedin",
+                    account_id=account_id,
+                )
+            elif new_state in ("shadow_confirmed", "suspended", "restricted"):
+                logger.error(
+                    f"account.{new_state}",
+                    platform="linkedin",
+                    account_id=account_id,
+                    risk_score=round(acc.ledger.risk_score, 1),
+                )
+
     def snapshot(self) -> dict:
+        accounts = []
+        flagged_list = []
+        for acc in self._accounts.values():
+            ban_state = "clear"
+            risk_score = 0.0
+            last_signal = None
+            flagged_at = None
+            if self.ban_detection_enabled and acc.ledger:
+                ban_state = acc.ledger.ban_state
+                risk_score = round(acc.ledger.risk_score, 1)
+                last_signal = acc.ledger.last_signals[-1][1] if acc.ledger.last_signals else None
+                flagged_at = acc.ledger.flagged_at
+                if ban_state != "clear":
+                    flagged_list.append(acc.account_id)
+
+            snap = acc.snapshot()
+            snap.update({
+                "ban_state": ban_state,
+                "risk_score": risk_score,
+                "last_signal": last_signal,
+                "flagged_at": flagged_at,
+            })
+            accounts.append(snap)
+
         return {
-            "accounts": [acc.snapshot() for acc in self._accounts.values()],
+            "accounts": accounts,
             "counters": {
                 "total": len(self._accounts),
                 "alive": sum(1 for a in self._accounts.values() if a.status == ALIVE),
@@ -305,6 +466,7 @@ class LinkedInAccountPool:
                 "disabled": sum(1 for a in self._accounts.values() if a.status == DISABLED),
                 "in_use": sum(1 for a in self._accounts.values() if a.in_use),
             },
+            "flagged": flagged_list,
         }
 
     # --------------------------------------------------------- selection logic
@@ -321,14 +483,21 @@ class LinkedInAccountPool:
         if not ids:
             return None
         n = len(ids)
-        # Pass 1: ALIVE only. Pass 2: accept DYING as a fallback.
-        for statuses in ((ALIVE,), (ALIVE, DYING)):
+
+        # Pass 1: ALIVE and not at_risk.
+        # Pass 2: ALIVE or DYING (excluding terminal).
+        pass1_condition = lambda acc: acc.status == ALIVE and not self._protect_at_risk(acc)
+        pass2_condition = lambda acc: acc.status in (ALIVE, DYING)
+
+        for cond in (pass1_condition, pass2_condition):
             for i in range(n):
                 idx = (self._index + i) % n
                 acc = self._accounts[ids[idx]]
                 if acc.in_use:
                     continue
-                if acc.status in statuses:
+                if self._protect_terminal(acc):
+                    continue
+                if cond(acc):
                     self._index = (idx + 1) % n
                     return acc
         return None
@@ -372,9 +541,10 @@ class LinkedInAccountPool:
 
             logger.info("account_pool.relogin_start", account_id=account_id)
             ok = False
+            reason = ""
             try:
                 from api.services.linkedin_login_runner import login_account_with_retries
-                ok = await login_account_with_retries(
+                ok, reason = await login_account_with_retries(
                     account_id=account_id,
                     username=username,
                     password=password,
@@ -383,6 +553,7 @@ class LinkedInAccountPool:
                 )
             except Exception as e:
                 logger.error("account_pool.relogin_exception", account_id=account_id, error=str(e)[:200])
+                reason = str(e)
 
             async with self._lock:
                 acc = self._accounts.get(account_id)
@@ -394,6 +565,8 @@ class LinkedInAccountPool:
                     acc.consecutive_relogin_failures = 0
                     acc.total_relogins += 1
                     acc.last_success_at = time.time()
+                    self.just_relogged_accounts.add(account_id)
+                    self.confirm_verdict(account_id, "clear")
 
                     for suffix in ("__mobile.json", "__desktop.json", ".json"):
                         p = SESSIONS_DIR / f"{account_id}{suffix}"
@@ -410,6 +583,12 @@ class LinkedInAccountPool:
                                 total_relogins=acc.total_relogins)
                 else:
                     acc.consecutive_relogin_failures += 1
+
+                    # Check for restriction keywords in failure reason
+                    reason_lower = (reason or "").lower()
+                    if any(kw in reason_lower for kw in ("quarantine", "restricted", "suspended", "challenge")):
+                        self.confirm_verdict(account_id, "restricted")
+
                     if acc.consecutive_relogin_failures >= self.disable_after_failures:
                         acc.status = DISABLED
                         acc.disabled_until = time.time() + self.disable_backoff_seconds
@@ -445,6 +624,20 @@ class LinkedInAccountPool:
                     except Exception:
                         pass
 
+            ledger = None
+            if self.ban_detection_enabled:
+                if account_id not in self.ledgers:
+                    from tools.account_risk import RiskLedger
+                    self.ledgers[account_id] = RiskLedger(
+                        account_id=account_id,
+                        platform="linkedin",
+                        decay=self.ban_risk_decay,
+                        warn_threshold=self.ban_risk_warn,
+                        suspect_threshold=self.ban_risk_suspect,
+                        consecutive_forbidden_threshold=self.ban_forbidden_streak,
+                    )
+                ledger = self.ledgers[account_id]
+
             self._accounts[account_id] = AccountState(
                 account_id=account_id,
                 username=acc["username"],
@@ -452,6 +645,7 @@ class LinkedInAccountPool:
                 static_proxy=acc["proxy_url"],
                 status=self._infer_initial_status(account_id),
                 login_country=country,
+                ledger=ledger,
             )
             loaded += 1
 

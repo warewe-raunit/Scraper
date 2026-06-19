@@ -44,6 +44,7 @@ class AccountState:
         self.lock = asyncio.Lock()  # Ensure only one login attempt happens at a time for this account
         self.ratelimit_remaining = 100
         self.ratelimit_reset_at: Optional[float] = None
+        self.ledger = None
 
     def _cooldown_active(self, now: float) -> bool:
         """Whether the shared pool still has this account resting."""
@@ -108,6 +109,19 @@ class AccountRegistry:
         self._relogin_sem = asyncio.Semaphore(int(os.getenv("REDDIT_RELOGIN_CONCURRENCY", "2")))
         self._relogin_tasks: Dict[str, asyncio.Task] = {}
 
+        # Ban state tracking configuration
+        self.ban_detection_enabled = os.getenv("ACCOUNT_BAN_DETECTION", "true").lower() in ("1", "true", "yes", "on")
+        self.ban_protect_enabled = os.getenv("ACCOUNT_BAN_PROTECT", "false").lower() in ("1", "true", "yes", "on")
+        self.ban_probe_interval = int(os.getenv("ACCOUNT_BAN_PROBE_INTERVAL", "3"))
+        self.ban_risk_warn = float(os.getenv("BAN_RISK_WARN", "6.0"))
+        self.ban_risk_suspect = float(os.getenv("BAN_RISK_SUSPECT", "10.0"))
+        self.ban_risk_decay = float(os.getenv("BAN_RISK_DECAY", "0.85"))
+        self.ban_forbidden_streak = int(os.getenv("BAN_FORBIDDEN_STREAK", "4"))
+        self._sweep_count = 0
+
+        from tools import ban_state_store
+        self.ledgers = ban_state_store.load() if self.ban_detection_enabled else {}
+
         self.initialize_registry()
 
     def initialize_registry(self):
@@ -126,6 +140,18 @@ class AccountRegistry:
                     proxy_url=acc.get("proxy_url"),
                     pool=self._pool,
                 )
+                if self.ban_detection_enabled:
+                    if account_id not in self.ledgers:
+                        from tools.account_risk import RiskLedger
+                        self.ledgers[account_id] = RiskLedger(
+                            account_id=account_id,
+                            platform="reddit",
+                            decay=self.ban_risk_decay,
+                            warn_threshold=self.ban_risk_warn,
+                            suspect_threshold=self.ban_risk_suspect,
+                            consecutive_forbidden_threshold=self.ban_forbidden_streak,
+                        )
+                    self.states[account_id].ledger = self.ledgers[account_id]
 
         # Register account ids with the shared pool (preserves existing
         # cooldown timers for accounts that survive a dynamic re-init).
@@ -207,6 +233,12 @@ class AccountRegistry:
                     if not state:
                         raise ValueError(f"Requested account '{requested_account_id}' is not configured or has no active session.")
                 
+                # Check ban quarantine in protect mode
+                if self.ban_detection_enabled and self.ban_protect_enabled:
+                    ledger = self.ledgers.get(requested_account_id)
+                    if ledger and ledger.is_terminal():
+                        raise RuntimeError(f"Requested account '{requested_account_id}' is quarantined due to ban/restriction.")
+
                 # Check proactive expiry first
                 self.check_proactive_expiry(requested_account_id)
 
@@ -234,6 +266,13 @@ class AccountRegistry:
             # because we trigger re-login right before executing the request in the scraper)
             healthy_ids = [aid for aid in available_ids if self.states[aid].is_healthy() or self.states[aid].status == "needs_relogin"]
             
+            # Exclude terminal ban states if ban protect is active
+            if self.ban_detection_enabled and self.ban_protect_enabled:
+                healthy_ids = [
+                    aid for aid in healthy_ids
+                    if not (self.ledgers.get(aid) and self.ledgers[aid].is_terminal())
+                ]
+
             if not healthy_ids:
                 # Fallback: find the account with the shortest cool down time
                 cooldowns = {aid: self.states[aid].time_remaining_cooldown() for aid in available_ids}
@@ -248,16 +287,26 @@ class AccountRegistry:
                 )
                 
                 raise RuntimeError(
-                    f"All Reddit accounts are rate-limited or blocked. "
+                    f"All Reddit accounts are rate-limited or blocked (or quarantined). "
                     f"Nearest account is '{best_account}', cooling down for {round(shortest_cooldown, 1)} seconds."
                 )
 
+            # Demote 'at_risk' accounts to fallback-only in rotation when protect is active
+            if self.ban_detection_enabled and self.ban_protect_enabled:
+                non_at_risk_ids = [
+                    aid for aid in healthy_ids
+                    if not (self.ledgers.get(aid) and self.ledgers[aid].is_at_risk())
+                ]
+                rotation_candidates = non_at_risk_ids if non_at_risk_ids else healthy_ids
+            else:
+                rotation_candidates = healthy_ids
+
             # Round-robin selection via the shared CooldownPool (restricted to the
-            # accounts we just deemed healthy; all are cooldown-clear by definition).
-            selected = self._pool.get_next(candidates=healthy_ids, fallback_to_shortest=False)
+            # candidates we just filtered; all are cooldown-clear by definition).
+            selected = self._pool.get_next(candidates=rotation_candidates, fallback_to_shortest=False)
             if selected is None:
-                # Defensive: healthy_ids is non-empty here, so fall back to its head.
-                selected = healthy_ids[0]
+                # Defensive: rotation_candidates is non-empty here, so fall back to its head.
+                selected = rotation_candidates[0]
             return selected
 
     def cool_down_account(self, account_id: str, duration_seconds: int = 300):
@@ -379,28 +428,35 @@ class AccountRegistry:
             sf = find_session_file(aid)
             session_age = round(now - sf.stat().st_mtime, 1) if sf else None
             relogging = aid in self._relogin_tasks and not self._relogin_tasks[aid].done()
-            if st:
-                accounts.append({
-                    "account_id": aid,
-                    "status": st.status,
-                    "healthy": st.is_healthy(),
-                    "cooldown_remaining": round(st.time_remaining_cooldown(), 1),
-                    "ratelimit_remaining": st.ratelimit_remaining,
-                    "has_session": sf is not None,
-                    "session_age_seconds": session_age,
-                    "relogging": relogging,
-                })
-            else:
-                accounts.append({
-                    "account_id": aid,
-                    "status": "no_session",
-                    "healthy": False,
-                    "cooldown_remaining": 0.0,
-                    "ratelimit_remaining": None,
-                    "has_session": False,
-                    "session_age_seconds": session_age,
-                    "relogging": relogging,
-                })
+
+            # Ban State metrics
+            ban_state = "clear"
+            risk_score = 0.0
+            last_signal = None
+            flagged_at = None
+            if self.ban_detection_enabled:
+                ledger = self.ledgers.get(aid)
+                if ledger:
+                    ban_state = ledger.ban_state
+                    risk_score = round(ledger.risk_score, 1)
+                    last_signal = ledger.last_signals[-1][1] if ledger.last_signals else None
+                    flagged_at = ledger.flagged_at
+
+            row = {
+                "account_id": aid,
+                "status": st.status if st else "no_session",
+                "healthy": st.is_healthy() if st else False,
+                "cooldown_remaining": round(st.time_remaining_cooldown(), 1) if st else 0.0,
+                "ratelimit_remaining": st.ratelimit_remaining if st else None,
+                "has_session": sf is not None if st else False,
+                "session_age_seconds": session_age,
+                "relogging": relogging,
+                "ban_state": ban_state,
+                "risk_score": risk_score,
+                "last_signal": last_signal,
+                "flagged_at": flagged_at,
+            }
+            accounts.append(row)
 
         counters = {
             "configured": len(configured),
@@ -411,7 +467,13 @@ class AccountRegistry:
             "no_session": sum(1 for a in accounts if a["status"] == "no_session"),
             "relogging": sum(1 for a in accounts if a["relogging"]),
         }
-        return {"accounts": accounts, "counters": counters}
+        flagged_list = []
+        if self.ban_detection_enabled:
+            for aid, ledger in self.ledgers.items():
+                if ledger.ban_state != "clear":
+                    flagged_list.append(aid)
+
+        return {"accounts": accounts, "counters": counters, "flagged": flagged_list}
 
     async def force_relogin(self, account_id: str) -> bool:
         """External trigger: flag an account for relogin and queue a background
@@ -504,6 +566,149 @@ class AccountRegistry:
         logger.warning("reddit_bg_relogin_failed", account_id=account_id)
         return False
 
+    def record_signal(self, account_id: str, signal: str):
+        """Record one risk signal for an account."""
+        if not self.ban_detection_enabled:
+            return
+
+        ledger = self.ledgers.get(account_id)
+        if not ledger:
+            # Create a new ledger if missing
+            from tools.account_risk import RiskLedger
+            ledger = RiskLedger(
+                account_id=account_id,
+                platform="reddit",
+                decay=self.ban_risk_decay,
+                warn_threshold=self.ban_risk_warn,
+                suspect_threshold=self.ban_risk_suspect,
+                consecutive_forbidden_threshold=self.ban_forbidden_streak,
+            )
+            self.ledgers[account_id] = ledger
+
+        old_state = ledger.ban_state
+        ledger.record(signal)
+        
+        # Save change
+        from tools import ban_state_store
+        ban_state_store.save(self.ledgers)
+
+        new_state = ledger.ban_state
+        if old_state != new_state:
+            if new_state == "shadow_suspected":
+                logger.warning(
+                    "account.ban_suspected",
+                    platform="reddit",
+                    account_id=account_id,
+                    risk_score=round(ledger.risk_score, 1),
+                    recent_signals=ledger.last_signals,
+                )
+            elif new_state in ("shadow_confirmed", "suspended", "restricted"):
+                logger.error(
+                    f"account.{new_state}",
+                    platform="reddit",
+                    account_id=account_id,
+                    risk_score=round(ledger.risk_score, 1),
+                )
+            elif new_state == "clear":
+                logger.info(
+                    "account.ban_cleared",
+                    platform="reddit",
+                    account_id=account_id,
+                )
+
+    async def probe_ban(self, account_id: str) -> str:
+        """
+        Probe Reddit account health. Returns one of:
+        "suspended" | "shadow_confirmed" | "clear" | "inconclusive"
+        """
+        if not self.ban_detection_enabled:
+            return "inconclusive"
+            
+        username = None
+        state = self.states.get(account_id)
+        if state:
+            username = state.username
+        
+        if not username:
+            # Fallback credentials lookup
+            from api.dependencies import parse_accounts_from_env
+            for acc in parse_accounts_from_env():
+                if acc["account_id"] == account_id:
+                    username = acc["username"]
+                    break
+                    
+        if not username:
+            logger.error("reddit_probe.username_not_found", account_id=account_id)
+            return "inconclusive"
+
+        logger.info("reddit_probe.start", account_id=account_id, username=username)
+
+        try:
+            # 1. Logged-in check: user about
+            from api.dependencies import create_stealth_client
+            session = await create_stealth_client(account_id)
+            
+            loop = asyncio.get_running_loop()
+            url_in = f"https://oauth.reddit.com/user/{username}/about"
+            
+            resp_in = await loop.run_in_executor(
+                None,
+                lambda: session.get(url_in, impersonate="chrome120", timeout=10)
+            )
+            
+            if resp_in.status_code != 200:
+                logger.warning("reddit_probe.logged_in_failed", account_id=account_id, status=resp_in.status_code)
+                return "inconclusive"
+                
+            data_in = resp_in.json()
+            is_suspended = data_in.get("data", {}).get("is_suspended")
+            if is_suspended is True:
+                logger.error("reddit_probe.suspended_detected", account_id=account_id)
+                return "suspended"
+                
+            # 2. Logged-out shadowban check
+            from tools.proxy_provider import get_proxy_provider
+            from curl_cffi import requests as cffi_requests
+            
+            gp = get_proxy_provider()
+            proxy = gp.get_next() if gp.is_enabled() else None
+            
+            unauth_session = cffi_requests.Session()
+            if proxy:
+                unauth_session.proxies = {"http": proxy, "https": proxy}
+                
+            url_out = f"https://www.reddit.com/user/{username}/about.json"
+            resp_out = await loop.run_in_executor(
+                None,
+                lambda: unauth_session.get(url_out, impersonate="chrome120", timeout=10)
+            )
+            
+            if resp_out.status_code == 404:
+                logger.error("reddit_probe.shadowban_confirmed", account_id=account_id)
+                return "shadow_confirmed"
+            elif resp_out.status_code == 200:
+                try:
+                    data_out = resp_out.json()
+                    if not data_out or "data" not in data_out:
+                        logger.error("reddit_probe.shadowban_confirmed_empty_data", account_id=account_id)
+                        return "shadow_confirmed"
+                except Exception:
+                    logger.error("reddit_probe.shadowban_confirmed_json_error", account_id=account_id)
+                    return "shadow_confirmed"
+                
+                logger.info("reddit_probe.clear", account_id=account_id)
+                return "clear"
+            elif resp_out.status_code == 429:
+                logger.warning("reddit_probe.logged_out_429", account_id=account_id)
+                return "inconclusive"
+            else:
+                logger.warning("reddit_probe.logged_out_failed", account_id=account_id, status=resp_out.status_code)
+                return "inconclusive"
+                
+        except Exception as e:
+            logger.warning("reddit_probe.exception", account_id=account_id, error=str(e))
+            return "inconclusive"
+
     async def sweep_and_relogin(self) -> dict:
         """One proactive health pass over ALL configured accounts: pick up new
         session files, flag expired/aged/missing sessions, and queue background
@@ -512,6 +717,55 @@ class AccountRegistry:
         self.initialize_registry()
 
         from api.dependencies import parse_accounts_from_env
+
+        # Out-of-band active ban probe for suspects/scheduled passes
+        if self.ban_detection_enabled:
+            self._sweep_count += 1
+            probe_tasks = []
+            for acc in parse_accounts_from_env():
+                aid = acc["account_id"]
+                ledger = self.ledgers.get(aid)
+                if not ledger:
+                    continue
+                should_probe = (
+                    ledger.ban_state == "shadow_suspected"
+                    or (self.ban_probe_interval > 0 and self._sweep_count % self.ban_probe_interval == 0)
+                )
+                if should_probe:
+                    async def _probe_task_wrapper(account_id=aid, risk_ledger=ledger):
+                        try:
+                            verdict = await self.probe_ban(account_id)
+                            old_state = risk_ledger.ban_state
+                            applied = risk_ledger.confirm(verdict)
+                            from tools import ban_state_store
+                            ban_state_store.save(self.ledgers)
+
+                            if not applied and verdict == "clear" and risk_ledger.is_terminal():
+                                import time as _t
+                                remaining = max(
+                                    0.0,
+                                    float(os.getenv("BAN_CONFIRMED_COOLDOWN_SECONDS", "86400"))
+                                    - (_t.time() - (risk_ledger.flagged_at or _t.time())),
+                                )
+                                logger.info(
+                                    "account.clear_blocked_post_ban_cooldown",
+                                    platform="reddit",
+                                    account_id=account_id,
+                                    ban_state=risk_ledger.ban_state,
+                                    cooldown_remaining_seconds=round(remaining, 1),
+                                )
+
+                            new_state = risk_ledger.ban_state
+                            if old_state != new_state:
+                                if new_state == "clear":
+                                    logger.info("account.ban_cleared", platform="reddit", account_id=account_id)
+                                elif new_state in ("shadow_confirmed", "suspended", "restricted"):
+                                    logger.error(f"account.{new_state}", platform="reddit", account_id=account_id, risk_score=risk_ledger.risk_score)
+                        except Exception as e:
+                            logger.error("reddit_probe_failed_internal", account_id=account_id, error=str(e))
+                    probe_tasks.append(_probe_task_wrapper())
+            if probe_tasks:
+                await asyncio.gather(*probe_tasks, return_exceptions=True)
 
         queued = 0
         for acc in parse_accounts_from_env():

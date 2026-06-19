@@ -107,7 +107,6 @@ _DEFAULT_SUPPRESS_EVENTS = ",".join([
     "voyager_fetch.attempt",
     "voyager_fetch.vet_batch",
     "voyager_fetch.success",
-    "proxy_pool_enriched",
     "using_proxy_for_x_profile",
     "using_proxy_for_x_search",
     "using_proxy_for_x_thread",

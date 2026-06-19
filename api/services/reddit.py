@@ -56,6 +56,7 @@ class RedditScraperService:
         current_account_id = requested_account_id
         backoff_base = config.REDDIT_BACKOFF_BASE
         backoff_cap = config.REDDIT_BACKOFF_CAP
+        just_relogged_accounts = set()
 
         for attempt in range(1, max_retries + 1):
             # 1. Resolve next healthy account ID
@@ -89,6 +90,7 @@ class RedditScraperService:
                     # If login failed, skip and select another account
                     current_account_id = None
                     continue
+                just_relogged_accounts.add(account_id)
 
             # 2. Build stealth client for the selected account
             try:
@@ -97,6 +99,7 @@ class RedditScraperService:
                 logger.error("failed_to_initialize_client", account_id=account_id, error=str(e))
                 # Put account in temporary cooldown and try another
                 self.registry.cool_down_account(account_id, duration_seconds=config.REDDIT_TRANSIENT_COOLDOWN_SECONDS)
+                self.registry.record_signal(account_id, "inconclusive")
                 current_account_id = None
                 continue
 
@@ -137,16 +140,23 @@ class RedditScraperService:
                 # Case A: Success (200 OK)
                 if response.status_code == 200:
                     try_update_limits(response)
+                    self.registry.record_signal(account_id, "ok")
+                    just_relogged_accounts.discard(account_id)
                     return response.json()
 
                 # Case B: Expired Token / Session (401 Unauthorized)
                 if response.status_code == 401:
                     log.warn("session_unauthorized_triggering_relogin", response_text=response.text[:200])
+                    if account_id in just_relogged_accounts:
+                        self.registry.record_signal(account_id, "challenge_after_relogin")
+                    else:
+                        self.registry.record_signal(account_id, "inconclusive")
                     self.registry.flag_relogin_needed(account_id)
                     # Trigger re-login immediately
                     relogin_success = await self.registry.trigger_relogin(account_id)
                     if relogin_success:
                         # Retry immediately with the same account
+                        just_relogged_accounts.add(account_id)
                         current_account_id = account_id
                         continue
                     else:
@@ -157,6 +167,7 @@ class RedditScraperService:
                 # Case C: Rate Limited (429 Too Many Requests)
                 if response.status_code == 429:
                     log.warn("rate_limit_encountered", response_text=response.text[:200])
+                    self.registry.record_signal(account_id, "rate_limited")
                     rl_reset = response.headers.get("x-ratelimit-reset")
                     cooldown_seconds = config.REDDIT_BLOCK_COOLDOWN_SECONDS # if reset header missing
                     if rl_reset:
@@ -171,6 +182,10 @@ class RedditScraperService:
                 # Case D: Access Forbidden / Blocked (403 Forbidden)
                 if response.status_code == 403:
                     log.warn("access_forbidden_ip_flagged", response_text=response.text[:200])
+                    if account_id in just_relogged_accounts:
+                        self.registry.record_signal(account_id, "challenge_after_relogin")
+                    else:
+                        self.registry.record_signal(account_id, "forbidden")
                     rl_reset = response.headers.get("x-ratelimit-reset")
                     cooldown_seconds = config.REDDIT_BLOCK_COOLDOWN_SECONDS # if reset header missing
                     if rl_reset:
@@ -185,12 +200,14 @@ class RedditScraperService:
                 # Case E: Other Status Errors
                 log.error("unhandled_error_status", status_code=response.status_code, text=response.text[:200])
                 try_update_limits(response)
+                self.registry.record_signal(account_id, "inconclusive")
                 self.registry.cool_down_account(account_id, duration_seconds=config.REDDIT_TRANSIENT_COOLDOWN_SECONDS) # Cooldown briefly
                 current_account_id = None
                 continue
 
             except requests.errors.RequestsError as e:
                 log.error("network_or_proxy_connection_failed", error=str(e))
+                self.registry.record_signal(account_id, "inconclusive")
                 try:
                     from tools.proxy_provider import get_proxy_provider
                     _prov = get_proxy_provider()
@@ -203,6 +220,7 @@ class RedditScraperService:
                 continue
             except Exception as e:
                 log.error("unexpected_request_exception", error=str(e))
+                self.registry.record_signal(account_id, "inconclusive")
                 self.registry.cool_down_account(account_id, duration_seconds=config.REDDIT_TRANSIENT_COOLDOWN_SECONDS)
                 current_account_id = None
                 continue
