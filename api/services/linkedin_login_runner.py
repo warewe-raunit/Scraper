@@ -84,8 +84,8 @@ def _mark_proxy_failed(proxy_url: Optional[str]) -> None:
     if not proxy_url:
         return
     try:
-        from tools.goodproxies import GoodProxiesProvider
-        GoodProxiesProvider().mark_failed(proxy_url)
+        from tools.proxy_provider import get_proxy_provider
+        get_proxy_provider().cool_down(proxy_url)
     except Exception:
         pass
 

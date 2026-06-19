@@ -732,7 +732,7 @@ async def _vet_rotating_proxy(gp: Any) -> Optional[str]:
         except Exception:
             pass
         try:
-            gp.mark_failed(p)
+            gp.cool_down(p)
         except Exception:
             pass
         return None
@@ -741,7 +741,7 @@ async def _vet_rotating_proxy(gp: Any) -> Optional[str]:
     while checked < max_total:
         batch = []
         for _ in range(batch_size):
-            p = await gp.get_proxy()
+            p = gp.get_next()
             if p:
                 batch.append(p)
         if not batch:
@@ -783,12 +783,12 @@ async def launch_browser(
     # so picking one blind triggers ERR_CONNECTION_RESET / ERR_TUNNEL on most
     # launches. Pre-vetting keeps the same Reddit-style "rotating pool" flow
     # but avoids the lottery.
-    from tools.goodproxies import GoodProxiesProvider
-    gp = GoodProxiesProvider()
+    from tools.proxy_provider import get_proxy_provider
+    gp = get_proxy_provider()
     resolved_proxy = proxy_url
     if resolved_proxy == "direct":
         resolved_proxy = None
-    elif use_rotating_proxy and gp.enabled and gp.api_key:
+    elif use_rotating_proxy and gp.is_enabled():
         resolved_proxy = await _vet_rotating_proxy(gp)
         if resolved_proxy:
             logger.info("browser_manager.launch_browser.using_rotating_proxy", proxy=resolved_proxy[:30] + "...")
