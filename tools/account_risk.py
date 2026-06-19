@@ -6,6 +6,7 @@ Python 3.10 compatible.
 from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
+import os
 import time
 
 BanState = Enum("BanState", {
@@ -101,21 +102,43 @@ class RiskLedger:
                 self.ban_state = BanState.CLEAR.value
                 self.flagged_at = None
 
-    def confirm(self, verdict: str) -> None:
+    def is_terminal(self) -> bool:
+        return self.ban_state in TERMINAL_STATES
+
+    def is_at_risk(self) -> bool:
+        return self.ban_state == BanState.AT_RISK.value
+
+    def is_in_post_ban_cooldown(self) -> bool:
+        """True if the account is in a confirmed terminal state and the
+        post-ban cooldown window has not yet elapsed. Read env at call time
+        so operators can tune BAN_CONFIRMED_COOLDOWN_SECONDS without restart."""
+        if not self.is_terminal() or self.flagged_at is None:
+            return False
+        cooldown = float(os.getenv("BAN_CONFIRMED_COOLDOWN_SECONDS", "86400"))
+        return (time.time() - self.flagged_at) < cooldown
+
+    def confirm(self, verdict: str) -> bool:
         """Apply a definitive probe verdict: 'suspended' | 'shadow_confirmed'
-        | 'restricted' | 'clear'. Sets the terminal ban_state."""
+        | 'restricted' | 'clear'. Returns True if applied, False if no-op.
+        A 'clear' verdict is refused while the account is still in the
+        post-ban cooldown window — the terminal state persists until the
+        cooldown elapses, after which a successful probe can recover it."""
         now = time.time()
         if verdict == "clear":
+            if self.is_in_post_ban_cooldown():
+                return False
             self.ban_state = BanState.CLEAR.value
             self.risk_score = 0.0
             self.consecutive_forbidden = 0
             self.flagged_at = None
+            return True
         elif verdict in (BanState.SUSPENDED.value, BanState.SHADOW_CONFIRMED.value, BanState.RESTRICTED.value):
             self.ban_state = verdict
             self.risk_score = 999.0
             if self.flagged_at is None:
                 self.flagged_at = now
-        # Verdict 'inconclusive' is a strict no-op
+            return True
+        return False
 
     def to_dict(self) -> dict:
         return {

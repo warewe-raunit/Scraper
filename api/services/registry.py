@@ -236,7 +236,7 @@ class AccountRegistry:
                 # Check ban quarantine in protect mode
                 if self.ban_detection_enabled and self.ban_protect_enabled:
                     ledger = self.ledgers.get(requested_account_id)
-                    if ledger and ledger.ban_state in ("shadow_confirmed", "suspended", "restricted"):
+                    if ledger and ledger.is_terminal():
                         raise RuntimeError(f"Requested account '{requested_account_id}' is quarantined due to ban/restriction.")
 
                 # Check proactive expiry first
@@ -270,7 +270,7 @@ class AccountRegistry:
             if self.ban_detection_enabled and self.ban_protect_enabled:
                 healthy_ids = [
                     aid for aid in healthy_ids
-                    if not (self.ledgers.get(aid) and self.ledgers[aid].ban_state in ("shadow_confirmed", "suspended", "restricted"))
+                    if not (self.ledgers.get(aid) and self.ledgers[aid].is_terminal())
                 ]
 
             if not healthy_ids:
@@ -295,7 +295,7 @@ class AccountRegistry:
             if self.ban_detection_enabled and self.ban_protect_enabled:
                 non_at_risk_ids = [
                     aid for aid in healthy_ids
-                    if not (self.ledgers.get(aid) and self.ledgers[aid].ban_state == "at_risk")
+                    if not (self.ledgers.get(aid) and self.ledgers[aid].is_at_risk())
                 ]
                 rotation_candidates = non_at_risk_ids if non_at_risk_ids else healthy_ids
             else:
@@ -442,36 +442,21 @@ class AccountRegistry:
                     last_signal = ledger.last_signals[-1][1] if ledger.last_signals else None
                     flagged_at = ledger.flagged_at
 
-            if st:
-                accounts.append({
-                    "account_id": aid,
-                    "status": st.status,
-                    "healthy": st.is_healthy(),
-                    "cooldown_remaining": round(st.time_remaining_cooldown(), 1),
-                    "ratelimit_remaining": st.ratelimit_remaining,
-                    "has_session": sf is not None,
-                    "session_age_seconds": session_age,
-                    "relogging": relogging,
-                    "ban_state": ban_state,
-                    "risk_score": risk_score,
-                    "last_signal": last_signal,
-                    "flagged_at": flagged_at,
-                })
-            else:
-                accounts.append({
-                    "account_id": aid,
-                    "status": "no_session",
-                    "healthy": False,
-                    "cooldown_remaining": 0.0,
-                    "ratelimit_remaining": None,
-                    "has_session": False,
-                    "session_age_seconds": session_age,
-                    "relogging": relogging,
-                    "ban_state": ban_state,
-                    "risk_score": risk_score,
-                    "last_signal": last_signal,
-                    "flagged_at": flagged_at,
-                })
+            row = {
+                "account_id": aid,
+                "status": st.status if st else "no_session",
+                "healthy": st.is_healthy() if st else False,
+                "cooldown_remaining": round(st.time_remaining_cooldown(), 1) if st else 0.0,
+                "ratelimit_remaining": st.ratelimit_remaining if st else None,
+                "has_session": sf is not None if st else False,
+                "session_age_seconds": session_age,
+                "relogging": relogging,
+                "ban_state": ban_state,
+                "risk_score": risk_score,
+                "last_signal": last_signal,
+                "flagged_at": flagged_at,
+            }
+            accounts.append(row)
 
         counters = {
             "configured": len(configured),
@@ -751,10 +736,25 @@ class AccountRegistry:
                         try:
                             verdict = await self.probe_ban(account_id)
                             old_state = risk_ledger.ban_state
-                            risk_ledger.confirm(verdict)
+                            applied = risk_ledger.confirm(verdict)
                             from tools import ban_state_store
                             ban_state_store.save(self.ledgers)
-                            
+
+                            if not applied and verdict == "clear" and risk_ledger.is_terminal():
+                                import time as _t
+                                remaining = max(
+                                    0.0,
+                                    float(os.getenv("BAN_CONFIRMED_COOLDOWN_SECONDS", "86400"))
+                                    - (_t.time() - (risk_ledger.flagged_at or _t.time())),
+                                )
+                                logger.info(
+                                    "account.clear_blocked_post_ban_cooldown",
+                                    platform="reddit",
+                                    account_id=account_id,
+                                    ban_state=risk_ledger.ban_state,
+                                    cooldown_remaining_seconds=round(remaining, 1),
+                                )
+
                             new_state = risk_ledger.ban_state
                             if old_state != new_state:
                                 if new_state == "clear":

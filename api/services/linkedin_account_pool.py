@@ -181,27 +181,13 @@ class LinkedInAccountPool:
                 # Reactivate disabled accounts whose backoff expired
                 self._reactivate_disabled_locked()
 
-                # Helper to check if an account is terminal
-                def _is_terminal(acc: AccountState) -> bool:
-                    if self.ban_detection_enabled and self.ban_protect_enabled:
-                        if acc.ledger and acc.ledger.ban_state in ("shadow_confirmed", "suspended", "restricted"):
-                            return True
-                    return False
-
-                # Helper to check if an account is at risk
-                def _is_at_risk(acc: AccountState) -> bool:
-                    if self.ban_detection_enabled and self.ban_protect_enabled:
-                        if acc.ledger and acc.ledger.ban_state == "at_risk":
-                            return True
-                    return False
-
                 # Group free healthy accounts by country
                 # We accept ALIVE or DYING, preferring ALIVE
                 candidates = []
                 for acc in self._accounts.values():
                     if acc.in_use:
                         continue
-                    if _is_terminal(acc):
+                    if self._protect_terminal(acc):
                         continue
                     if acc.status in (ALIVE, DYING):
                         candidates.append(acc)
@@ -217,7 +203,7 @@ class LinkedInAccountPool:
                     # and non-at-risk are preferred over at-risk
                     def _sort_key(a: AccountState):
                         status_val = 0 if a.status == ALIVE else 2
-                        risk_val = 1 if _is_at_risk(a) else 0
+                        risk_val = 1 if self._protect_at_risk(a) else 0
                         return (status_val + risk_val, a.last_success_at)
 
                     for country in groups:
@@ -346,6 +332,14 @@ class LinkedInAccountPool:
         if relogin_needed:
             self._schedule_relogin(account_id)
 
+    def _protect_terminal(self, acc: AccountState) -> bool:
+        """In protect mode, True if this account is in a terminal ban state."""
+        return self.ban_protect_enabled and acc.ledger is not None and acc.ledger.is_terminal()
+
+    def _protect_at_risk(self, acc: AccountState) -> bool:
+        """In protect mode, True if this account is flagged at_risk."""
+        return self.ban_protect_enabled and acc.ledger is not None and acc.ledger.is_at_risk()
+
     def record_signal(self, account_id: str, signal: str) -> None:
         """Record a risk signal (e.g. ok, forbidden, soft_block, rate_limited).
         Updates the account risk state and saves it to persistence.
@@ -400,7 +394,21 @@ class LinkedInAccountPool:
             return
 
         old_state = acc.ledger.ban_state
-        acc.ledger.confirm(verdict)
+        applied = acc.ledger.confirm(verdict)
+
+        if not applied and verdict == "clear" and acc.ledger.is_terminal():
+            remaining = max(
+                0.0,
+                float(os.getenv("BAN_CONFIRMED_COOLDOWN_SECONDS", "86400"))
+                - (time.time() - (acc.ledger.flagged_at or time.time())),
+            )
+            logger.info(
+                "account.clear_blocked_post_ban_cooldown",
+                platform="linkedin",
+                account_id=account_id,
+                ban_state=acc.ledger.ban_state,
+                cooldown_remaining_seconds=round(remaining, 1),
+            )
 
         # Save change
         from tools import ban_state_store
@@ -476,23 +484,9 @@ class LinkedInAccountPool:
             return None
         n = len(ids)
 
-        # Helper to check if an account is terminal
-        def _is_terminal(acc: AccountState) -> bool:
-            if self.ban_detection_enabled and self.ban_protect_enabled:
-                if acc.ledger and acc.ledger.ban_state in ("shadow_confirmed", "suspended", "restricted"):
-                    return True
-            return False
-
-        # Helper to check if an account is at risk
-        def _is_at_risk(acc: AccountState) -> bool:
-            if self.ban_detection_enabled and self.ban_protect_enabled:
-                if acc.ledger and acc.ledger.ban_state == "at_risk":
-                    return True
-            return False
-
         # Pass 1: ALIVE and not at_risk.
         # Pass 2: ALIVE or DYING (excluding terminal).
-        pass1_condition = lambda acc: acc.status == ALIVE and not _is_at_risk(acc)
+        pass1_condition = lambda acc: acc.status == ALIVE and not self._protect_at_risk(acc)
         pass2_condition = lambda acc: acc.status in (ALIVE, DYING)
 
         for cond in (pass1_condition, pass2_condition):
@@ -501,7 +495,7 @@ class LinkedInAccountPool:
                 acc = self._accounts[ids[idx]]
                 if acc.in_use:
                     continue
-                if _is_terminal(acc):
+                if self._protect_terminal(acc):
                     continue
                 if cond(acc):
                     self._index = (idx + 1) % n

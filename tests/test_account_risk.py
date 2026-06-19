@@ -85,20 +85,70 @@ def test_consecutive_forbidden_threshold():
     assert ledger.ban_state == BanState.SHADOW_SUSPECTED.value
     assert ledger.consecutive_forbidden == 4
 
-def test_confirm_suspended_latches():
+def test_confirm_suspended_latches(monkeypatch):
+    # Disable post-ban cooldown so confirm("clear") takes effect immediately
+    monkeypatch.setenv("BAN_CONFIRMED_COOLDOWN_SECONDS", "0")
     ledger = RiskLedger(account_id="test_acc", platform="reddit")
     ledger.confirm("suspended")
     assert ledger.ban_state == BanState.SUSPENDED.value
     assert ledger.risk_score == 999.0
-    
+
     # Ok does not clear terminal state
     ledger.record("ok")
     assert ledger.ban_state == BanState.SUSPENDED.value
-    
+
     # Only confirm clear resets it
     ledger.confirm("clear")
     assert ledger.ban_state == BanState.CLEAR.value
     assert ledger.risk_score == 0.0
+
+
+def test_post_ban_cooldown_blocks_clear():
+    """A confirmed terminal state cannot be cleared while the post-ban
+    cooldown window is active. Once the window elapses, clear takes effect."""
+    os.environ["BAN_CONFIRMED_COOLDOWN_SECONDS"] = "86400"  # 1 day
+    try:
+        ledger = RiskLedger(account_id="test_acc", platform="reddit")
+        ledger.confirm("suspended")
+        assert ledger.is_terminal()
+        assert ledger.is_in_post_ban_cooldown()
+
+        applied = ledger.confirm("clear")
+        assert applied is False
+        assert ledger.ban_state == BanState.SUSPENDED.value
+        assert ledger.flagged_at is not None
+
+        # Simulate cooldown elapsed by rewinding flagged_at past the window
+        ledger.flagged_at = time.time() - 86401
+        assert not ledger.is_in_post_ban_cooldown()
+
+        applied = ledger.confirm("clear")
+        assert applied is True
+        assert ledger.ban_state == BanState.CLEAR.value
+        assert ledger.flagged_at is None
+    finally:
+        os.environ.pop("BAN_CONFIRMED_COOLDOWN_SECONDS", None)
+
+
+def test_post_ban_cooldown_persists_across_restart(tmp_path):
+    """The cooldown anchor (flagged_at) survives save→load, so a server
+    restart honors the remaining cooldown rather than resetting it."""
+    os.environ["BAN_CONFIRMED_COOLDOWN_SECONDS"] = "86400"
+    os.environ["BAN_STATE_FILE"] = str(tmp_path / "ban_state.json")
+    try:
+        ledger = RiskLedger(account_id="test_acc", platform="reddit")
+        ledger.confirm("suspended")
+        ban_state_store.save({"test_acc": ledger})
+
+        reloaded = ban_state_store.load()["test_acc"]
+        assert reloaded.ban_state == BanState.SUSPENDED.value
+        assert reloaded.flagged_at is not None
+        assert reloaded.is_in_post_ban_cooldown()
+        assert reloaded.confirm("clear") is False
+        assert reloaded.ban_state == BanState.SUSPENDED.value
+    finally:
+        os.environ.pop("BAN_CONFIRMED_COOLDOWN_SECONDS", None)
+        os.environ.pop("BAN_STATE_FILE", None)
 
 def test_inconclusive_never_condemns():
     ledger = RiskLedger(account_id="test_acc", platform="reddit")
@@ -471,6 +521,8 @@ async def test_linkedin_protect_rotation_guarantees(monkeypatch, tmp_path):
     temp_file = tmp_path / "ban_state.json"
     monkeypatch.setenv("BAN_STATE_FILE", str(temp_file))
     monkeypatch.setenv("ACCOUNT_BAN_DETECTION", "true")
+    # Test exercises the suspended→clear→at_risk recovery path; cooldown bypass
+    monkeypatch.setenv("BAN_CONFIRMED_COOLDOWN_SECONDS", "0")
 
     import api.services.linkedin_account_pool as pool_mod
     import api.services.linkedin_env as env_mod
@@ -479,7 +531,7 @@ async def test_linkedin_protect_rotation_guarantees(monkeypatch, tmp_path):
         {"account_id": "acc_li_01", "username": "user01", "password": "pw", "proxy_url": None},
         {"account_id": "acc_li_02", "username": "user02", "password": "pw", "proxy_url": None}
     ])
-    
+
     # Phase 1: protect=false -> terminal ban status is ignored
     monkeypatch.setenv("ACCOUNT_BAN_PROTECT", "false")
     monkeypatch.setattr(pool_mod.LinkedInAccountPool, "_instance", None)
