@@ -40,6 +40,8 @@ async def get_subreddit_posts(
     try:
         results = await scraper.scrape_subreddit(subreddit, sort, time, limit, after, account_id=account_id)
         return csv_response(results, "reddit_subreddit_posts") if format == "csv" else results
+    except HTTPException:
+        raise  # graceful 503 (pool exhausted) — don't mask as 500
     except Exception as e:
         logger.error("subreddit_posts_scrape_failed", subreddit=subreddit, error=str(e))
         raise HTTPException(

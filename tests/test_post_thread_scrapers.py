@@ -204,6 +204,24 @@ def test_parse_voyager_comments_dash_shape(svc):
     assert out[0]["text"] == "Congrats team!"
 
 
+def test_extract_post_content_from_update(svc):
+    # The comments endpoint now also returns the post itself; the update object
+    # is parsed out of an UpdateV2 `included` entry, full body (no 500 truncation).
+    long_body = "x" * 900
+    out = svc._extract_posts_from_included([
+        {
+            "$type": "com.linkedin.voyager.feed.render.UpdateV2",
+            "entityUrn": "urn:li:fsd_update:(urn:li:activity:700,FEED,EMPTY)",
+            "actor": {"name": {"text": "Jane Smith"}},
+            "commentary": {"text": {"text": long_body}},
+        },
+    ], snippet_len=0)
+    assert len(out) == 1
+    assert out[0]["title"] == "Jane Smith"
+    assert out[0]["snippet"] == long_body  # not truncated to 500
+    assert out[0]["url"] == "https://www.linkedin.com/feed/update/urn:li:activity:700/"
+
+
 def test_parse_voyager_comments_dedup_and_empty(svc):
     # Comment objects with no resolvable text are dropped.
     assert svc._parse_voyager_comments({"included": [

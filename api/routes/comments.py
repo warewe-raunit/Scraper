@@ -71,6 +71,8 @@ async def get_post_comments(
     try:
         results = await scraper.scrape_post(post_id, sort=sort, depth=depth, limit=limit, account_id=account_id)
         return csv_response(results, "reddit_post_comments") if format == "csv" else results
+    except HTTPException:
+        raise  # graceful 503 (pool exhausted) — don't mask as 500
     except Exception as e:
         logger.error("get_post_comments_failed", url=url, post_id=post_id, error=str(e))
         raise HTTPException(

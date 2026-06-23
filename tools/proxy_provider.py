@@ -91,6 +91,30 @@ class GoodProxiesProvider:
         # until which we won't re-attempt an on-demand fetch (so a country with
         # zero available proxies upstream can't trigger a fetch storm).
         self._country_fetch_cooldown: Dict[str, float] = {}
+        # ---- Permanent dead-proxy blocklist (shared across workers) ----------
+        # A proxy that fails a real request (cool_down) or fails re-verification
+        # is recorded here and NEVER re-admitted to any pool — no cooldown-and-
+        # retry of a dead IP. Persisted to a file so every worker process honors
+        # one blocklist ("doesn't come back to any pool"). Resets on restart.
+        self.blocklist_enabled = _env_bool("GOODPROXIES_BLOCKLIST_DEAD", True)
+        # Whether a re-verify MISS (failed the cheap Google liveness probe N times)
+        # also permanently blocklists. Default False: a probe miss is not proof the
+        # proxy is dead for Reddit, and on a thin pool (MAX_PING-limited supply)
+        # permanently banning every flaky probe burns the candidate well until the
+        # pool starves. A real REQUEST failure still blocklists permanently
+        # (cool_down/mark_dead). Reverify misses just get evicted + re-fetchable.
+        self.blocklist_on_reverify = _env_bool("GOODPROXIES_BLOCKLIST_ON_REVERIFY", False)
+        self._dead_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "sessions", "proxy_dead.json",
+        )
+        self._dead: set = self._load_dead()
+        self._dead_loaded_at = 0.0
+        # Proxies PROVEN good on a real request (200). The homepage healthcheck
+        # admits proxies that then fail the authenticated API call; this set lets
+        # get_next PREFER proxies that actually completed a real Reddit request, so
+        # the hot path stops retrying through probe-passing-but-API-failing proxies.
+        self._known_good: set = set()
         if self.is_enabled():
             if self.continuous_health:
                 self.start_health_loop()
@@ -148,6 +172,17 @@ class GoodProxiesProvider:
         self.healthcheck_workers = int(
             os.getenv("GOODPROXIES_HEALTHCHECK_WORKERS") or "50"
         )
+        # Strict mode: validate against the REAL target (e.g. www.reddit.com) and
+        # admit only a clean 2xx/3xx — so "live" means "actually reaches Reddit",
+        # not "tunnels to Google". A Reddit-blocked proxy (403/429) is rejected.
+        # Uses impersonation so the probe looks like the real request path.
+        self.healthcheck_strict = _env_bool("GOODPROXIES_HEALTHCHECK_STRICT", False)
+        # Number of consecutive probes a NEW proxy must pass to be admitted. The
+        # double-probe (2) squares the death rate on flaky free proxies and was
+        # admitting ~0 from each fetch (added=0 in the logs). 1 = single probe,
+        # far higher yield; a one-off responder that sneaks in is evicted by the
+        # next re-verify wave anyway, so the gate isn't load-bearing on its own.
+        self.admit_probes = max(1, int(os.getenv("GOODPROXIES_ADMIT_PROBES") or "1"))
         # --- Continuous health daemon -------------------------------------
         # A background thread keeps the pool stocked with PRE-VERIFIED live
         # proxies so the request path never probes or blocks. Each tick it
@@ -297,10 +332,15 @@ class GoodProxiesProvider:
         min_works = self._as_float(self.min_works, 0.0) if self.min_works else 0.0
         rows = []  # (url, ping, works)
         seen = set()
+        dead = self._dead_set() if self.blocklist_enabled else set()
         dropped_geo = 0
+        dropped_dead = 0
         for entry in data or []:
             url = self._to_proxy_url(entry)
             if not url or url in seen:
+                continue
+            if url in dead:  # never re-admit a blocklisted (dead) proxy
+                dropped_dead += 1
                 continue
             country = str(entry.get("country") or "").strip().upper()
             if country:
@@ -330,6 +370,9 @@ class GoodProxiesProvider:
                 kept=len(rows),
                 allowed=sorted(self.allowed_countries),
             )
+        if dropped_dead:
+            logger.info("goodproxies_blocklist_filtered",
+                        dropped=dropped_dead, blocklist_size=len(dead), kept=len(rows))
         return [u for (u, _ping, _works) in rows]
 
     def _probe_one(self, proxy_url: str) -> bool:
@@ -346,12 +389,23 @@ class GoodProxiesProvider:
         gateway itself errored rather than the target responding.
         """
         try:
+            if self.healthcheck_strict:
+                # Representative probe: impersonate (matches the real request path)
+                # and require a clean 2xx/3xx — a Reddit-blocked proxy returns
+                # 403/429 and is correctly rejected.
+                resp = cffi_requests.get(
+                    self.healthcheck_url,
+                    proxies={"http": proxy_url, "https": proxy_url},
+                    timeout=self.healthcheck_timeout,
+                    impersonate="chrome120",
+                )
+                return 200 <= resp.status_code < 400
+            # Cheap liveness probe: any response < 500 proves the tunnel works. No
+            # impersonate (can trigger the curl_cffi unpack bug on some proxies).
             resp = cffi_requests.get(
                 self.healthcheck_url,
                 proxies={"http": proxy_url, "https": proxy_url},
                 timeout=self.healthcheck_timeout,
-                # No impersonate here: we want a cheap liveness probe, and
-                # impersonate can trigger the curl_cffi unpack bug on some proxies.
             )
             return resp.status_code < 500
         except Exception:
@@ -370,8 +424,16 @@ class GoodProxiesProvider:
         return results
 
     def _filter_live(self, urls: List[str]) -> List[str]:
-        """Concurrently probe proxies; return only those that respond."""
-        return [u for u, ok in self._probe_all(urls).items() if ok]
+        """Admit proxies that pass ``admit_probes`` consecutive probes (default 1).
+        Re-verification of *existing* members stays a single tolerant probe (see
+        _enrich_once); this is the ADMISSION gate. More passes = stricter but lower
+        yield — 2 was admitting ~0 from each fetch on this provider's flaky pool."""
+        live = urls
+        for _ in range(self.admit_probes):
+            live = [u for u, ok in self._probe_all(live).items() if ok]
+            if not live:
+                return []
+        return live
 
     # ------------------------------------------------- continuous health daemon
     def start_health_loop(self) -> None:
@@ -441,7 +503,12 @@ class GoodProxiesProvider:
                         self._reverify_strikes[p] = strikes
                         live_now.append(p)  # within tolerance — keep it
                     else:
-                        self._reverify_strikes.pop(p, None)  # confirmed dead — evict
+                        self._reverify_strikes.pop(p, None)  # confirmed dead (this pass)
+                        # Evict from the pool (not appended to live_now). Only
+                        # blocklist permanently if explicitly opted in — otherwise
+                        # it stays re-fetchable so the well doesn't dry up.
+                        if self.blocklist_enabled and self.blocklist_on_reverify:
+                            self._record_dead(p)
         else:
             live_now = list(current)
         live_set = set(live_now)
@@ -559,6 +626,16 @@ class GoodProxiesProvider:
             if not fallback_to_any:
                 return None
 
+        # Prefer proxies PROVEN good on a real request (and still live) — this is
+        # what cuts the retry-through-dead-proxies latency. Fall back to any live
+        # proxy when none are proven yet (cold start) or all are cooling.
+        if self._known_good:
+            good_live = [p for p in self.pool.items if p in self._known_good]
+            if good_live:
+                sel = self.pool.get_next(candidates=good_live)
+                if sel:
+                    return sel
+
         return self.pool.get_next()
 
     def ensure_country(self, country: str, want: int = 1) -> int:
@@ -605,9 +682,68 @@ class GoodProxiesProvider:
                     country=country, received=len(raw), live=len(live), added=added)
         return added
 
-    def cool_down(self, proxy: str, duration_seconds: Optional[float] = None) -> None:
-        """Rest a misbehaving proxy so it is skipped for a while."""
+    # ----------------------------------------------------- dead-proxy blocklist
+    def _load_dead(self) -> set:
+        try:
+            with open(self._dead_path, "r", encoding="utf-8") as f:
+                return set(json.load(f))
+        except (FileNotFoundError, json.JSONDecodeError, ValueError, OSError):
+            return set()
+
+    def _dead_set(self) -> set:
+        """The blocklist, refreshed from disk every ~5s so a proxy another worker
+        just killed is honored here too."""
+        now = time.time()
+        if now - self._dead_loaded_at > 5.0:
+            self._dead |= self._load_dead()
+            self._dead_loaded_at = now
+        return self._dead
+
+    def _record_dead(self, proxy: str) -> None:
+        """Add to the persistent blocklist (no pool mutation). Best-effort write
+        that merges concurrent worker additions; a dropped write is re-applied on
+        the next death, so the blocklist only ever grows."""
+        if not proxy or proxy in self._dead:
+            return
+        self._dead.add(proxy)
+        try:
+            os.makedirs(os.path.dirname(self._dead_path), exist_ok=True)
+            merged = self._dead | self._load_dead()
+            tmp = f"{self._dead_path}.{os.getpid()}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(sorted(merged), f)
+            os.replace(tmp, self._dead_path)
+            self._dead = merged
+        except OSError:
+            pass
+
+    def mark_good(self, proxy: str) -> None:
+        """Record that a proxy completed a REAL request (200). get_next prefers
+        these so the hot path stops retrying probe-only proxies."""
         if proxy:
+            self._known_good.add(proxy)
+
+    def mark_dead(self, proxy: str) -> None:
+        """Blocklist a proxy permanently AND drop it from the live pool now."""
+        if not proxy:
+            return
+        self._known_good.discard(proxy)
+        self._record_dead(proxy)
+        items = self.pool.items
+        if proxy in items:
+            self.pool.set_items([p for p in items if p != proxy])
+
+    def cool_down(self, proxy: str, duration_seconds: Optional[float] = None) -> None:
+        """A proxy failed a real request. Blocklist it permanently — a failed
+        public proxy is treated as dead and never re-admitted to any pool —
+        instead of the old cool-down-and-reuse. ``duration_seconds`` is accepted
+        for API compatibility and ignored. (Set GOODPROXIES_BLOCKLIST_DEAD=false
+        to restore the old temporary-cooldown behavior.)"""
+        if not proxy:
+            return
+        if self.blocklist_enabled:
+            self.mark_dead(proxy)
+        else:
             self.pool.cool_down(proxy, duration_seconds)
 
 

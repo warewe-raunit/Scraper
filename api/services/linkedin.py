@@ -781,6 +781,10 @@ class LinkedInScraperService:
                         pass
                 if _is_bare_400(status, resp):
                     bare_400_seen += 1
+                    # Per-proxy rejection — recoverable (we rotate to the next
+                    # proxy). NOT an account-health signal: the session stays
+                    # healthy. Only the storm (every reachable proxy rejected) is
+                    # request-level, logged at ERROR below.
                     logger.warning("voyager_fetch.bare_400_ip_reject",
                                    account_id=target_account_id, proxy=p,
                                    rejections=bare_400_seen)
@@ -1081,6 +1085,7 @@ class LinkedInScraperService:
         account_id: Optional[str],
         page_size: int,
         dedup_key,             # (item) -> hashable | None
+        single_account: bool = False,  # pin ONE pooled account for the whole walk
     ) -> Optional[List[Dict[str, Any]]]:
         """Walk Voyager result pages by advancing the `start` offset until `limit`
         is reached, an empty page ends the set, or a safety ceiling trips.
@@ -1169,6 +1174,23 @@ class LinkedInScraperService:
         # Caller pinned a specific account → walk it directly, no pool.
         if account_id is not None:
             out, ok, _redirected, _exhausted = await _walk_on(account_id)
+            return out[:target] if ok else None
+
+        # Consistency mode: pin ONE pooled account for the whole walk so every
+        # page describes a single coherent (per-account ranked) view. The
+        # multi-account path below mixes accounts across pages, which is fine for
+        # stable collections but produces an incoherent union for personalized
+        # RELEVANCE-sorted ones like comments — different result every call.
+        if single_account:
+            from api.services.linkedin_account_pool import LinkedInAccountPool
+            pool = await LinkedInAccountPool.instance()
+            acc = await pool.acquire()
+            out, ok, redirected, exhausted = [], False, False, False
+            try:
+                out, ok, redirected, exhausted = await _walk_on(acc.account_id)
+            finally:
+                await pool.release(acc.account_id, success=ok,
+                                   session_redirected=redirected, proxies_exhausted=exhausted)
             return out[:target] if ok else None
 
         # Pool: distribute requests in parallel waves across different accounts from the same region
@@ -1600,10 +1622,17 @@ class LinkedInScraperService:
                     f"&updateId={urn_enc}"
                 )
 
-        comments = await self._paginate_voyager(
-            build_path, self._parse_voyager_comments,
-            limit=limit, account_id=account_id, page_size=page_size,
-            dedup_key=lambda c: c.get("comment_urn") or (c.get("author") or "") + (c.get("text") or "")[:60],
+        # Fetch the post's own content alongside its comments — concurrently, so
+        # it adds no latency. Comments pin a single account (single_account=True)
+        # so paged offsets stay coherent; see _paginate_voyager.
+        comments, post = await asyncio.gather(
+            self._paginate_voyager(
+                build_path, self._parse_voyager_comments,
+                limit=limit, account_id=account_id, page_size=page_size,
+                dedup_key=lambda c: c.get("comment_urn") or (c.get("author") or "") + (c.get("text") or "")[:60],
+                single_account=(account_id is None),
+            ),
+            self._scrape_post_content(urn, account_id),
         )
         if comments is None:
             raise RuntimeError(f"Failed to fetch comments for post '{urn}' using Voyager API.")
@@ -1613,10 +1642,41 @@ class LinkedInScraperService:
             "post_urn": urn,
             "post_url": f"https://www.linkedin.com/feed/update/{urn}/",
             "sort": sort_order,
+            "post": post,
             "count": len(comments[:limit]),
             "scraped_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "data": comments[:limit],
         }
+
+    async def _scrape_post_content(self, urn: str, account_id: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Fetch the post's own content (author/body/url) for the comments
+        endpoint. REST default + LINKEDIN_VOYAGER_POST_PATH override ({urn}
+        placeholder) — same rotation escape-hatch as the other endpoints.
+        Non-fatal: returns None if the post can't be hydrated so comments still
+        return.
+        """
+        urn_enc = quote(urn, safe="")
+        override = os.getenv("LINKEDIN_VOYAGER_POST_PATH", "").strip()
+        path = (override.replace("{urn}", urn_enc) if override
+                else f"/voyager/api/feed/updatesV2/{urn_enc}?commentsCount=0&likesCount=0")
+        try:
+            data = await self._voyager_get(path, account_id=account_id)
+        except Exception as e:
+            logger.warning("voyager_post_content.failed", error=str(e)[:120])
+            return None
+        if not data:
+            return None
+        # The update object lands in `included` (REST) or at `data` (single-update
+        # envelope); _extract_posts_from_included handles UpdateV2/FeedUpdate shapes.
+        candidates = list(data.get("included") or [])
+        main = data.get("data")
+        if isinstance(main, dict):
+            candidates.append(main)
+        posts = self._extract_posts_from_included(candidates, snippet_len=0)
+        if not posts:
+            return None
+        p = posts[0]
+        return {"author": p.get("title"), "text": p.get("snippet"), "url": p.get("url") or f"https://www.linkedin.com/feed/update/{urn}/", "post_urn": urn}
 
     @staticmethod
     def _comment_text(node: Any, _depth: int = 0) -> str:
@@ -2184,7 +2244,7 @@ class LinkedInScraperService:
                 logger.warning("voyager_blended_posts_merge_failed", error=str(e)[:120])
         return _result(parsed)
 
-    def _extract_posts_from_included(self, included: List[dict]) -> List[Dict[str, Any]]:
+    def _extract_posts_from_included(self, included: List[dict], snippet_len: int = 500) -> List[Dict[str, Any]]:
         """Pull post/update results out of `included` feed-update objects.
 
         Content search hydrates posts as FeedUpdate/UpdateV2 objects (when a
@@ -2229,7 +2289,7 @@ class LinkedInScraperService:
             posts.append({
                 "title": author or "(post)",
                 "url": url,
-                "snippet": body.strip()[:500],
+                "snippet": body.strip()[:snippet_len] if snippet_len else body.strip(),
             })
         return posts
 

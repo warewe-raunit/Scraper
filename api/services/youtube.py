@@ -332,7 +332,7 @@ class YouTubeScraperService(ProxyRotatingService):
         """Extract fields from a comment renderer object."""
         comment_id = renderer.get("commentId", "")
         author = self.parse_runs(renderer.get("authorText"))
-        author_thumbnail = renderer.get("authorThumbnail", {}).get("thumbnails", [{}])[0].get("url", "")
+        author_thumbnail = (renderer.get("authorThumbnail", {}).get("thumbnails") or [{}])[0].get("url", "")
         text = self.parse_runs(renderer.get("contentText"))
         published_time = self.parse_runs(renderer.get("publishedTimeText"))
         like_count = self.parse_runs(renderer.get("likeCount")) or "0"
@@ -862,7 +862,7 @@ class YouTubeScraperService(ProxyRotatingService):
         }
         player_result, next_result = await asyncio.gather(
             self._fetch_player(video_id),
-            self._execute_post("next", next_payload),
+            self._execute_post("next", next_payload, force_direct=config.YOUTUBE_NEXT_DIRECT_FIRST),
             return_exceptions=True,
         )
 

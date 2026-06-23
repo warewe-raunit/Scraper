@@ -44,9 +44,38 @@ logger = structlog.get_logger("api_gateway")
 async def lifespan(app: FastAPI):
     """Startup/shutdown hooks (modern replacement for @app.on_event)."""
     # --- startup ---
+    # Size the shared thread pool that runs blocking curl_cffi / yt-dlp calls off
+    # the event loop. Must happen before the first request so HTTP-scraper
+    # concurrency isn't capped at asyncio's tiny default executor (~8-16). See
+    # config.API_THREAD_POOL_SIZE.
+    from concurrent.futures import ThreadPoolExecutor
+    from api import config as _cfg
+    asyncio.get_running_loop().set_default_executor(
+        ThreadPoolExecutor(
+            max_workers=_cfg.API_THREAD_POOL_SIZE,
+            thread_name_prefix="scraper-io",
+        )
+    )
+    logger.info("thread_pool_sized", max_workers=_cfg.API_THREAD_POOL_SIZE)
+
+    # Under `uvicorn --workers N` every worker runs this lifespan. Only ONE worker
+    # may run the warmup/relogin/token-warm loops, or we multiply login attempts
+    # against the same accounts (ban risk) and duplicate headful Chromium. Elect a
+    # single leader; non-leaders just serve requests.
+    from api.worker_leader import is_warmup_leader
+    _leader = is_warmup_leader()
+    if not _leader:
+        logger.info("warmup_loops_skipped_non_leader")
+
     # Start the continuous proxy-health daemon so the pool is already stocked
     # with verified-live proxies before the first request. Non-blocking; the
     # daemon runs in its own thread and self-heals.
+    # The proxy pool is PER-PROCESS in-memory state consumed by every request, so
+    # every worker must run its own health loop — NOT leader-only — or non-leader
+    # workers serve requests with an empty pool. The cost is N× good-proxies API
+    # calls under --workers N.
+    # ponytail: per-worker pools, accepted on a single box; share via Redis only if
+    # the N× provider-API load becomes a problem.
     try:
         from tools.proxy_provider import get_proxy_provider
         provider = get_proxy_provider()
@@ -56,15 +85,18 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("proxy_pool_warmup_failed", error=str(e))
 
-    # Trigger background relogin for any LinkedIn accounts that start DEAD.
-    # Doesn't block — the AccountPool dispatches asyncio tasks.
-    try:
-        from api.services.linkedin_account_pool import LinkedInAccountPool
-        pool = await LinkedInAccountPool.instance()
-        await pool.warmup()
-        logger.info("linkedin_pool_warmup_dispatched", **pool.snapshot()["counters"])
-    except Exception as e:
-        logger.warning("linkedin_pool_warmup_failed", error=str(e))
+    if _leader:
+        # Trigger background relogin for any LinkedIn accounts that start DEAD.
+        # Doesn't block — the AccountPool dispatches asyncio tasks. Leader-only:
+        # relogin mutates shared account login state, so N workers must not each
+        # hammer the same accounts (ban risk).
+        try:
+            from api.services.linkedin_account_pool import LinkedInAccountPool
+            pool = await LinkedInAccountPool.instance()
+            await pool.warmup()
+            logger.info("linkedin_pool_warmup_dispatched", **pool.snapshot()["counters"])
+        except Exception as e:
+            logger.warning("linkedin_pool_warmup_failed", error=str(e))
 
     # Health-validate every LinkedIn account so only sessions that ACTUALLY work
     # serve traffic — a saved session file (li_at present) can still be dead
@@ -72,7 +104,7 @@ async def lifespan(app: FastAPI):
     # Dispatched as a task so server startup isn't blocked by the probes; the
     # pool also self-heals on real-request signals while this runs. If
     # LINKEDIN_HEALTH_CHECK_INTERVAL > 0, the sweep repeats on that interval.
-    if os.getenv("LINKEDIN_VALIDATE_ON_STARTUP", "true").lower() in ("1", "true", "yes", "on"):
+    if _leader and os.getenv("LINKEDIN_VALIDATE_ON_STARTUP", "true").lower() in ("1", "true", "yes", "on"):
         async def _account_health_sweep():
             try:
                 from api.services.linkedin import LinkedInScraperService
@@ -92,7 +124,7 @@ async def lifespan(app: FastAPI):
     # interval, relogging any whose session is missing, aged out, or whose token
     # is expiring — in the background, bounded by REDDIT_RELOGIN_CONCURRENCY.
     # Gated by REDDIT_AUTO_RELOGIN (the actual relogin) + REDDIT_VALIDATE_ON_STARTUP.
-    if os.getenv("REDDIT_VALIDATE_ON_STARTUP", "true").lower() in ("1", "true", "yes", "on"):
+    if _leader and os.getenv("REDDIT_VALIDATE_ON_STARTUP", "true").lower() in ("1", "true", "yes", "on"):
         async def _reddit_account_health_loop():
             try:
                 from api.dependencies import get_registry
@@ -105,7 +137,7 @@ async def lifespan(app: FastAPI):
     # Warm the YouTube InnerTube API key in the background so the FIRST video
     # request doesn't pay the (potentially Playwright-backed) key-extraction
     # cost inline. Non-blocking; falls back to lazy extraction if it fails.
-    if os.getenv("YOUTUBE_WARMUP_ON_STARTUP", "true").lower() in ("1", "true", "yes", "on"):
+    if _leader and os.getenv("YOUTUBE_WARMUP_ON_STARTUP", "true").lower() in ("1", "true", "yes", "on"):
         async def _warm_youtube_key():
             try:
                 from api.dependencies import get_youtube_scraper_service, get_database_service
@@ -123,7 +155,7 @@ async def lifespan(app: FastAPI):
     # requests use the cheap curl path and (with X_INLINE_BROWSER_SOLVE=false)
     # never launch a browser inline. Waits briefly first so the proxy pool is
     # stocked before the solves run.
-    if os.getenv("X_WARMUP_ON_STARTUP", "true").lower() in ("1", "true", "yes", "on"):
+    if _leader and os.getenv("X_WARMUP_ON_STARTUP", "true").lower() in ("1", "true", "yes", "on"):
         async def _x_token_warmer():
             try:
                 from tools.unauth_x_scraper import warm_all_instances
@@ -289,20 +321,28 @@ if __name__ == "__main__":
 
     host = os.getenv("API_HOST", "127.0.0.1")
     port = int(os.getenv("API_PORT", "8000"))
+    workers = int(os.getenv("API_WORKERS", "1"))
     reload = os.getenv("API_RELOAD", "true").strip().lower() in ("1", "true", "yes", "on")
 
-    # Go through uvicorn.run so the auto-reload supervisor is active. (The old
-    # Windows branch built a Server and called server.serve() directly, which
-    # silently disabled --reload — the reloader lives in the supervisor layer.)
-    # On Windows we MUST force the Proactor loop via a custom loop factory,
-    # because under --reload uvicorn would otherwise pick SelectorEventLoop in
-    # the worker and break Playwright. Watch only source dirs so reloads aren't
-    # triggered by sessions/, downloads/, or logs.
+    # reload and workers are mutually exclusive in uvicorn — the reloader runs a
+    # single worker. So `python api/main.py` with API_WORKERS>1 previously gave a
+    # SILENT single reload-worker (the request you sent it). Honor workers: when
+    # >1, force reload off and run the real multi-process server.
+    if workers > 1:
+        reload = False
+
+    # Go through uvicorn.run so the auto-reload supervisor is active in dev. On
+    # Windows we MUST force the Proactor loop via a custom loop factory, because
+    # uvicorn would otherwise pick SelectorEventLoop in the worker and break
+    # Playwright. Watch only source dirs so reloads aren't triggered by
+    # sessions/, downloads/, or logs.
     loop = "api.main:proactor_loop_factory" if sys.platform == "win32" else "auto"
+    logger.info("server_starting", host=host, port=port, workers=workers, reload=reload)
     uvicorn.run(
         "api.main:app",
         host=host,
         port=port,
+        workers=workers if not reload else None,
         reload=reload,
         reload_dirs=[str(ROOT / "api"), str(ROOT / "tools")] if reload else None,
         loop=loop,

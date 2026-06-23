@@ -29,6 +29,8 @@ async def get_user_about(
     try:
         results = await scraper.scrape_user_about(username, account_id=account_id)
         return csv_response(results, "reddit_user_about") if format == "csv" else results
+    except HTTPException:
+        raise  # graceful 503 (pool exhausted) — don't mask as 500
     except Exception as e:
         logger.error("get_user_about_failed", username=username, error=str(e))
         raise HTTPException(
@@ -54,6 +56,8 @@ async def get_user_posts(
     try:
         results = await scraper.scrape_user_posts(username, sort, time, limit, after, account_id=account_id)
         return csv_response(results, "reddit_user_posts") if format == "csv" else results
+    except HTTPException:
+        raise  # graceful 503 (pool exhausted) — don't mask as 500
     except Exception as e:
         logger.error("get_user_posts_failed", username=username, error=str(e))
         raise HTTPException(
@@ -79,6 +83,8 @@ async def get_user_comments(
     try:
         results = await scraper.scrape_user_comments(username, sort, time, limit, after, account_id=account_id)
         return csv_response(results, "reddit_user_comments") if format == "csv" else results
+    except HTTPException:
+        raise  # graceful 503 (pool exhausted) — don't mask as 500
     except Exception as e:
         logger.error("get_user_comments_failed", username=username, error=str(e))
         raise HTTPException(

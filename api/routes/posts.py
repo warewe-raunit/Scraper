@@ -34,6 +34,8 @@ async def search_posts(
     try:
         results = await scraper.search_posts(q, subreddit, sort, time, limit, after, account_id=account_id)
         return csv_response(results, "reddit_post_search") if format == "csv" else results
+    except HTTPException:
+        raise  # graceful 503 (pool exhausted) — don't mask as 500
     except Exception as e:
         logger.error("search_posts_failed", q=q, subreddit=subreddit, error=str(e))
         raise HTTPException(
@@ -55,6 +57,8 @@ async def scrape_by_url(
     try:
         results = await scraper.scrape_by_url(url, account_id=account_id)
         return csv_response(results, "reddit_by_url") if format == "csv" else results
+    except HTTPException:
+        raise  # graceful 503 (pool exhausted) — don't mask as 500
     except ValueError as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -81,6 +85,8 @@ async def get_post_details(
     try:
         res = await scraper.scrape_post(post_id, limit=0, account_id=account_id)
         return csv_response(res["post"], "reddit_post_details") if format == "csv" else res["post"]
+    except HTTPException:
+        raise  # graceful 503 (pool exhausted) — don't mask as 500
     except Exception as e:
         logger.error("get_post_details_failed", post_id=post_id, error=str(e))
         raise HTTPException(
