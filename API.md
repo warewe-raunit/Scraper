@@ -431,6 +431,36 @@ env = { SCRAPER_BASE_URL = "http://127.0.0.1:8000", API_KEY = "your-key" }
 The agent now sees tools like `search_youtube`, `get_subreddit_posts`,
 `get_linkedin_profile`, `search_x_tweets`, etc. — same params as the REST endpoints.
 
+### Hosted (remote) MCP — zero setup for users
+
+The snippets above spawn the MCP locally on each user's machine (needs `python` +
+`pip install`). To let people connect with **just a URL and nothing installed**,
+run the MCP once on the server, next to the API:
+
+```bash
+# on the server, alongside the running API
+MCP_TRANSPORT=http MCP_PORT=9000 \
+  SCRAPER_BASE_URL=http://127.0.0.1:18080 API_KEY="<key>" \
+  python mcp_server.py
+# serves http://<server>:9000/mcp/
+```
+
+The hosted server holds `API_KEY` server-side, so connecting agents don't need it:
+
+```bash
+# Claude Code
+claude mcp add --transport http scraper http://<server>:9000/mcp/
+```
+```toml
+# Codex ~/.codex/config.toml
+[mcp_servers.scraper]
+url = "http://<server>:9000/mcp/"
+```
+
+> The HTTP endpoint has no auth of its own — keep it on a private network or
+> behind a reverse proxy / bearer token. Anyone who can reach the URL can call
+> the tools (and thus your scraper).
+
 ---
 
 ## Install as a plugin (Claude Code, Codex, any agent)

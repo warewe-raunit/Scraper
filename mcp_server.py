@@ -7,12 +7,17 @@ call them directly. It is a THIN client: it mirrors the live OpenAPI spec, so
 new endpoints become tools automatically with no code changes here.
 
 Run:
-    python mcp_server.py                      # talks to $SCRAPER_BASE_URL
+    python mcp_server.py                      # stdio — each agent spawns its own
+    MCP_TRANSPORT=http python mcp_server.py   # one shared HTTP server for everyone
 
 Env:
     SCRAPER_BASE_URL  Base URL of the running API. Default http://127.0.0.1:8000
     API_KEY           Same key the API validates (sent as X-API-Key). Required
                       unless the server has no key configured.
+    MCP_TRANSPORT     "stdio" (default) or "http". http = host once on the server;
+                      agents connect by URL with no local python/key needed.
+    MCP_HOST          HTTP bind host. Default 0.0.0.0.
+    MCP_PORT          HTTP bind port. Default 9000. Endpoint: http://host:port/mcp/
 
 Wire it into an agent — see mcp_server config snippets in API.md / README.
 """
@@ -51,4 +56,16 @@ def _build() -> FastMCP:
 mcp = _build()
 
 if __name__ == "__main__":
-    mcp.run()  # stdio transport — what Claude Code / Codex spawn
+    transport = (os.getenv("MCP_TRANSPORT") or "stdio").strip().lower()
+    if transport == "http":
+        # One shared server co-located with the API. It holds API_KEY server-side,
+        # so connecting agents only need the URL (no python, no key).
+        # ponytail: no auth on the MCP endpoint itself — keep it behind the same
+        # network/reverse-proxy as the API; add a bearer token here if exposed.
+        mcp.run(
+            transport="http",
+            host=os.getenv("MCP_HOST", "0.0.0.0"),
+            port=int(os.getenv("MCP_PORT", "9000")),
+        )
+    else:
+        mcp.run()  # stdio — what Claude Code / Codex spawn locally
