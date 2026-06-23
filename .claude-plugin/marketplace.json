@@ -1,0 +1,24 @@
+{
+  "name": "stealth-scraper-marketplace",
+  "owner": {
+    "name": "Manav",
+    "url": "https://github.com/warewe-raunit"
+  },
+  "metadata": {
+    "description": "Marketplace hosting the Stealth Scraper plugin (Reddit / YouTube / X / LinkedIn)."
+  },
+  "plugins": [
+    {
+      "name": "stealth-scraper",
+      "description": "Search and research across Reddit, YouTube, X (Twitter), and LinkedIn from any AI agent. MCP tools + social-research skill over a stealth scraping API.",
+      "version": "1.0.0",
+      "author": {
+        "name": "Manav",
+        "url": "https://github.com/warewe-raunit"
+      },
+      "source": "./",
+      "category": "productivity",
+      "homepage": "https://github.com/warewe-raunit/Scraper"
+    }
+  ]
+}
