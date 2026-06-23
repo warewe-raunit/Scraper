@@ -25,10 +25,17 @@ if str(ROOT) not in sys.path:
 load_dotenv(override=True)
 
 import asyncio
-# On Windows the Proactor event loop (required for Playwright subprocesses) has
-# been the default since Python 3.8, so we no longer set a policy explicitly —
-# asyncio.set_event_loop_policy / WindowsProactorEventLoopPolicy are deprecated
-# in Python 3.14+. The __main__ block below pins the Proactor loop directly.
+# On Windows, set the global event loop policy to SelectorEventLoop. This prevents
+# the Uvicorn reloader/parent process from running a Proactor loop and registering
+# the listener socket with IOCP, which would otherwise raise WinError 87 when the
+# child worker tries to register it. The child worker itself is still forced to use
+# the ProactorEventLoop via the custom loop factory `proactor_loop_factory` below,
+# which is required for Playwright/subprocesses.
+if sys.platform == "win32":
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    except Exception:
+        pass
 
 
 # 1. Configure logging — structlog stays the API, Loguru is the sink/renderer.
@@ -330,6 +337,20 @@ if __name__ == "__main__":
     # >1, force reload off and run the real multi-process server.
     if workers > 1:
         reload = False
+
+    # Windows can't run uvicorn multi-worker with the Proactor loop: the parent
+    # binds the listener socket and shares it to child processes, but the Proactor
+    # loop fails to register that inherited socket with IOCP — every accept() then
+    # raises WinError 87 ("The parameter is incorrect") and the server accepts zero
+    # connections. Multi-worker is a Linux-only path (the deploy target); on Windows
+    # (dev) force a single worker, which the Proactor loop handles fine for Playwright.
+    if sys.platform == "win32" and workers > 1:
+        logger.warning(
+            "forcing_single_worker_on_windows",
+            requested_workers=workers,
+            reason="proactor loop can't share a listener socket across workers (WinError 87)",
+        )
+        workers = 1
 
     # Go through uvicorn.run so the auto-reload supervisor is active in dev. On
     # Windows we MUST force the Proactor loop via a custom loop factory, because
