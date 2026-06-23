@@ -23,6 +23,7 @@ Selection semantics (identical to the original three implementations):
 
 from __future__ import annotations
 
+import random
 import time
 import threading
 from typing import Callable, Dict, Iterable, List, Optional
@@ -72,7 +73,12 @@ class CooldownPool:
         self._redact = redact or _default_redact
         # item -> unix timestamp until which it is resting (0.0 == available now)
         self._cooldowns: Dict[str, float] = {}
-        self._index = 0
+        # Random start so sibling uvicorn workers don't all begin round-robin at
+        # index 0 and march in lockstep onto the same account/proxy under a
+        # synchronized burst. Each forked process gets a different phase.
+        # ponytail: random phase, not a shared cursor — no broker needed; the
+        # rate limiter (not exclusivity) is what bounds per-account load.
+        self._index = random.randrange(1 << 30)
         self._lock = threading.Lock()
         if items:
             self.set_items(items)

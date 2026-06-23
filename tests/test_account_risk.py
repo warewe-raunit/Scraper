@@ -523,6 +523,9 @@ async def test_linkedin_protect_rotation_guarantees(monkeypatch, tmp_path):
     monkeypatch.setenv("ACCOUNT_BAN_DETECTION", "true")
     # Test exercises the suspended→clear→at_risk recovery path; cooldown bypass
     monkeypatch.setenv("BAN_CONFIRMED_COOLDOWN_SECONDS", "0")
+    # Isolate protect-rotation semantics from the per-account rate cap (which
+    # would otherwise consume tokens and skip a still-healthy account here).
+    monkeypatch.setenv("LINKEDIN_RATE_LIMIT_ENABLED", "false")
 
     import api.services.linkedin_account_pool as pool_mod
     import api.services.linkedin_env as env_mod

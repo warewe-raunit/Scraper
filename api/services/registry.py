@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+import random
 import asyncio
 from pathlib import Path
 from typing import Optional, Dict, Any, List
@@ -121,8 +122,11 @@ class AccountRegistry:
             from api.services.rate_limiter import AccountRateLimiter
             workers = int(os.getenv("API_WORKERS", "1"))
             self._rate_limiter = AccountRateLimiter(rpm=config.REDDIT_ACCOUNT_RPM, workers=workers)
-        # Round-robin cursor used when token-gating account selection.
-        self._rr_index = 0
+        # Round-robin cursor used when token-gating account selection. Seeded
+        # randomly so each uvicorn worker starts on a DIFFERENT account instead
+        # of all 4 beginning at index 0 and bursting onto the same one in
+        # lockstep (the cross-worker collision that risks a per-account ban).
+        self._rr_index = random.randrange(1 << 30)
         # account_id -> (session_file_mtime, token_v2_expires). Avoids re-reading +
         # JSON-parsing every account's session file on every request (it ran for
         # all N accounts under the selection lock, on the event loop).

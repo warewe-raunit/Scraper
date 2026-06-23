@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import random
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -99,7 +100,12 @@ class LinkedInAccountPool:
         self._initialized = True
 
         self._accounts: Dict[str, AccountState] = {}
-        self._index = 0
+        # Random start so sibling uvicorn workers don't all begin the round-robin
+        # at index 0 and hand the SAME account to concurrent callers across
+        # processes (in_use is per-process, so it can't stop cross-worker
+        # collisions — desyncing the phase does). ponytail: phase shift, not a
+        # shared lease; keeps multi-account concurrency that a global lock kills.
+        self._index = random.randrange(1 << 30)
         self._lock = asyncio.Lock()
 
         # Bounded background relogin workers — each relogin spins a Playwright
@@ -108,6 +114,21 @@ class LinkedInAccountPool:
             int(os.getenv("LINKEDIN_RELOGIN_CONCURRENCY", "3"))
         )
         self._relogin_tasks: Dict[str, asyncio.Task] = {}
+
+        # Cross-worker per-account rate cap. in_use only serializes one account
+        # WITHIN a process, so under `--workers N` up to N workers can hit the
+        # same li_at at once — and LinkedIn is far more ban-fragile than Reddit.
+        # Same token-bucket mechanism Reddit uses: each worker enforces
+        # LINKEDIN_ACCOUNT_RPM / API_WORKERS per account, so the sum across
+        # workers stays within the real per-account budget. No broker needed.
+        # ponytail: rate (not exclusivity) is the ban lever; reuse the existing
+        # limiter rather than a distributed lease that would cap concurrency.
+        self._rate_limiter = None
+        if os.getenv("LINKEDIN_RATE_LIMIT_ENABLED", "true").lower() in ("1", "true", "yes", "on"):
+            from api.services.rate_limiter import AccountRateLimiter
+            workers = int(os.getenv("API_WORKERS", "1"))
+            rpm = float(os.getenv("LINKEDIN_ACCOUNT_RPM", "20"))
+            self._rate_limiter = AccountRateLimiter(rpm=rpm, workers=workers)
 
         # Tunables
         self.session_death_threshold = int(os.getenv("LINKEDIN_SESSION_DEATH_AFTER_302", "2"))
@@ -213,11 +234,19 @@ class LinkedInAccountPool:
                     best_country = max(groups.keys(), key=lambda c: len(groups[c]))
                     chosen_group = groups[best_country]
 
-                    # Acquire up to `count` accounts from this group
-                    acquired = chosen_group[:count]
-                    for acc in acquired:
+                    # Acquire up to `count` accounts from this group, skipping any
+                    # over its cross-worker per-minute budget (consume one token
+                    # per account actually taken).
+                    acquired = []
+                    for acc in chosen_group:
+                        if len(acquired) >= count:
+                            break
+                        if self._rate_limiter is not None and not self._rate_limiter.try_consume(acc.account_id):
+                            continue
                         acc.in_use = True
-                    return acquired
+                        acquired.append(acc)
+                    if acquired:
+                        return acquired
 
             if time.time() >= deadline:
                 raise NoAccountAvailable("No LinkedIn accounts available in the same region.")
@@ -502,6 +531,11 @@ class LinkedInAccountPool:
                 if self._protect_terminal(acc):
                     continue
                 if cond(acc):
+                    # Over its cross-worker per-minute budget → skip to the next
+                    # account instead of piling another concurrent call on it.
+                    # Consumes the token only for the account we actually return.
+                    if self._rate_limiter is not None and not self._rate_limiter.try_consume(acc.account_id):
+                        continue
                     self._index = (idx + 1) % n
                     return acc
         return None
