@@ -130,6 +130,16 @@ class LinkedInAccountPool:
             rpm = float(os.getenv("LINKEDIN_ACCOUNT_RPM", "20"))
             self._rate_limiter = AccountRateLimiter(rpm=rpm, workers=workers)
 
+        # Cross-worker EXCLUSIVE leasing: in_use only excludes coroutines WITHIN
+        # this process; under --workers N a sibling worker could still hand out
+        # the same li_at concurrently. The lease makes "in use" fleet-wide — at
+        # most one worker holds an account at a time. Tied to the in_use
+        # lifecycle: leased on acquire, released on release().
+        self._lease = None
+        if os.getenv("LINKEDIN_EXCLUSIVE_ACCOUNTS", "true").lower() in ("1", "true", "yes", "on"):
+            from api.services.account_lease import get_account_lease_store
+            self._lease = get_account_lease_store("linkedin")
+
         # Tunables
         self.session_death_threshold = int(os.getenv("LINKEDIN_SESSION_DEATH_AFTER_302", "2"))
         self.proxy_exhaust_relogin_threshold = int(
@@ -241,7 +251,11 @@ class LinkedInAccountPool:
                     for acc in chosen_group:
                         if len(acquired) >= count:
                             break
+                        if self._lease is not None and not self._lease.try_acquire(acc.account_id):
+                            continue
                         if self._rate_limiter is not None and not self._rate_limiter.try_consume(acc.account_id):
+                            if self._lease is not None:
+                                self._lease.release(acc.account_id)
                             continue
                         acc.in_use = True
                         acquired.append(acc)
@@ -268,6 +282,10 @@ class LinkedInAccountPool:
             if acc is None:
                 return
             acc.in_use = False
+            # Hand the exclusive cross-worker lease back so other workers can use
+            # this account now that the request is done.
+            if self._lease is not None:
+                self._lease.release(account_id)
             acc.total_requests += 1
             now = time.time()
 
@@ -531,10 +549,14 @@ class LinkedInAccountPool:
                 if self._protect_terminal(acc):
                     continue
                 if cond(acc):
-                    # Over its cross-worker per-minute budget → skip to the next
-                    # account instead of piling another concurrent call on it.
-                    # Consumes the token only for the account we actually return.
+                    # Exclusive cross-worker lease FIRST: skip an account a sibling
+                    # worker is already using. Then the per-minute rate token
+                    # (release the lease if it's at budget so we don't pin it).
+                    if self._lease is not None and not self._lease.try_acquire(acc.account_id):
+                        continue
                     if self._rate_limiter is not None and not self._rate_limiter.try_consume(acc.account_id):
+                        if self._lease is not None:
+                            self._lease.release(acc.account_id)
                         continue
                     self._index = (idx + 1) % n
                     return acc

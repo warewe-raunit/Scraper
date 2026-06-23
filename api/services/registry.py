@@ -127,6 +127,16 @@ class AccountRegistry:
         # of all 4 beginning at index 0 and bursting onto the same one in
         # lockstep (the cross-worker collision that risks a per-account ban).
         self._rr_index = random.randrange(1 << 30)
+
+        # Cross-worker EXCLUSIVE leasing: at most one worker may hold a given
+        # account at any instant, fleet-wide. Two concurrent requests on the same
+        # account (even from different proxy IPs) is a ban trigger, so a worker
+        # must win the lease before using an account and releases it when the
+        # request finishes. Gated so it can be turned off (REDDIT_EXCLUSIVE_ACCOUNTS).
+        self._lease = None
+        if os.getenv("REDDIT_EXCLUSIVE_ACCOUNTS", "true").lower() in ("1", "true", "yes", "on"):
+            from api.services.account_lease import get_account_lease_store
+            self._lease = get_account_lease_store("reddit")
         # account_id -> (session_file_mtime, token_v2_expires). Avoids re-reading +
         # JSON-parsing every account's session file on every request (it ran for
         # all N accounts under the selection lock, on the event loop).
@@ -323,7 +333,15 @@ class AccountRegistry:
                         raise RuntimeError(f"Account '{requested_account_id}' is cooling down for another {round(remaining, 1)} seconds.")
                     else:
                         state.status = "healthy"
-                
+
+                # Exclusive lease: if another worker is using this exact account,
+                # it can't be handed out concurrently. Surface as exhaustion so
+                # the failover loop waits for it to free (queue behavior).
+                if self._lease is not None and not self._lease.try_acquire(requested_account_id):
+                    raise RuntimeError(
+                        f"Account '{requested_account_id}' is currently in use by another worker."
+                    )
+
                 return requested_account_id
 
             # 2. Dynamic Selection (Rotation over healthy accounts)
@@ -379,6 +397,30 @@ class AccountRegistry:
             else:
                 rotation_candidates = healthy_ids
 
+            # Exclusive-lease round-robin: walk candidates in rotation order and
+            # return the first this worker can EXCLUSIVELY lease across all
+            # workers. An account another worker is using is skipped; if none can
+            # be leased, raise exhaustion so the failover loop waits for one to
+            # free (the "wait in line, then reuse" the queue model wants). The
+            # rate limiter still applies as defense-in-depth but rarely binds
+            # once each account is single-use.
+            if self._lease is not None:
+                n = len(rotation_candidates)
+                start = self._rr_index % n
+                self._rr_index += 1
+                for i in range(n):
+                    aid = rotation_candidates[(start + i) % n]
+                    if not self._lease.try_acquire(aid):
+                        continue  # held by another worker (or another coroutine here)
+                    if self._rate_limiter is not None and not self._rate_limiter.try_consume(aid):
+                        self._lease.release(aid)
+                        continue
+                    return aid
+                raise RuntimeError(
+                    f"All {n} healthy Reddit accounts are currently in use by other "
+                    f"workers; waiting for one to free."
+                )
+
             # Token-gated round-robin: walk candidates in rotation order and pick
             # the first one that still has rate budget. This paces each account to
             # its per-minute limit so a burst doesn't trip 429s. If EVERY healthy
@@ -405,6 +447,12 @@ class AccountRegistry:
                 # Defensive: rotation_candidates is non-empty here, so fall back to its head.
                 selected = rotation_candidates[0]
             return selected
+
+    def release_account(self, account_id: str) -> None:
+        """Release this worker's exclusive lease on an account so another worker
+        can use it. Safe to call for an account we don't hold (no-op)."""
+        if self._lease is not None and account_id is not None:
+            self._lease.release(account_id)
 
     def cool_down_account(self, account_id: str, duration_seconds: int = 300):
         """Put an account on cool-down (e.g. on 429 or 403 errors)."""

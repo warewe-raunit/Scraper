@@ -18,6 +18,7 @@ def _bare_pool(accounts, rate_limiter):
     pool._index = 0
     pool.ban_protect_enabled = False
     pool._rate_limiter = rate_limiter
+    pool._lease = None  # isolate the rate gate from exclusive leasing
     return pool
 
 

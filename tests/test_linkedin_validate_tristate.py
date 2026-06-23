@@ -97,8 +97,13 @@ def test_inconclusive_verdict_does_not_report_health():
     assert reported == [("acc_li_01", True)], reported
 
 
-def test_pool_acquire_multi_same_region():
+def test_pool_acquire_multi_same_region(monkeypatch):
     from api.services.linkedin_account_pool import LinkedInAccountPool, AccountState, ALIVE, DYING, DEAD
+
+    # This test manually releases via in_use=False (not pool.release()), so isolate
+    # it from exclusive leasing and the rate cap — it checks region grouping only.
+    monkeypatch.setenv("LINKEDIN_EXCLUSIVE_ACCOUNTS", "false")
+    monkeypatch.setenv("LINKEDIN_RATE_LIMIT_ENABLED", "false")
 
     # Create a clean pool instance and manually populate _accounts to avoid loading from env/sessions
     pool = LinkedInAccountPool()

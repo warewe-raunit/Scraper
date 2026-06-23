@@ -156,11 +156,23 @@ class RedditScraperService:
         exhaustion_budget = config.REDDIT_EXHAUSTION_WAIT_BUDGET
         exhaustion_waited = 0.0
         just_relogged_accounts = set()
+        # The account currently held under an exclusive cross-worker lease. Each
+        # iteration releases the previous one (so failover frees an account the
+        # instant we move off it) and the final/exception paths release too.
+        leased_id: Optional[str] = None
 
-        for attempt in range(1, max_retries + 1):
+        try:
+          for attempt in range(1, max_retries + 1):
+            # Release the lease from the previous attempt before grabbing another
+            # account — a 429/relogin/failover must hand the account back so other
+            # workers can use it while this request retries on a different one.
+            if leased_id is not None:
+                self.registry.release_account(leased_id)
+                leased_id = None
             # 1. Resolve next healthy account ID
             try:
                 account_id = await self.registry.get_next_healthy_account(current_account_id)
+                leased_id = account_id
             except Exception as e:
                 # Pool exhausted / all accounts cooling down. Waiting is the only
                 # thing that helps — but wait EXACTLY until the soonest account
@@ -366,7 +378,12 @@ class RedditScraperService:
                 self.registry.cool_down_account(account_id, duration_seconds=config.REDDIT_TRANSIENT_COOLDOWN_SECONDS)
                 current_account_id = None
                 continue
-        
+        finally:
+            # Release on every exit: the success `return`, the exhaustion `raise`
+            # below, or any propagating exception — never leak a held lease.
+            if leased_id is not None:
+                self.registry.release_account(leased_id)
+
         raise _pool_exhausted(
             f"Reddit API unavailable after {max_retries} attempts spanning proxy-pool "
             f"refreshes (url={url}). All attempts were rate-limited, blocked, or failed "

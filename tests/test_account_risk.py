@@ -411,6 +411,9 @@ async def test_reddit_protect_rotation_guarantees(monkeypatch, tmp_path):
     temp_file = tmp_path / "ban_state.json"
     monkeypatch.setenv("BAN_STATE_FILE", str(temp_file))
     monkeypatch.setenv("ACCOUNT_BAN_DETECTION", "true")
+    # Isolate protect-rotation from exclusive leasing (this test inspects
+    # selection without going through the acquire/release lifecycle).
+    monkeypatch.setenv("REDDIT_EXCLUSIVE_ACCOUNTS", "false")
 
     from api.services.registry import AccountRegistry
     import api.dependencies as deps
@@ -452,6 +455,56 @@ async def test_reddit_protect_rotation_guarantees(monkeypatch, tmp_path):
     for _ in range(5):
         selected_rot = await registry_protect.get_next_healthy_account()
         assert selected_rot == "acc_02"
+
+
+@pytest.mark.anyio
+async def test_reddit_exclusive_account_leasing(monkeypatch, tmp_path):
+    """A leased account is not handed out again until released — so two workers
+    (here, two sequential acquisitions) never hold the same account at once."""
+    monkeypatch.setenv("BAN_STATE_FILE", str(tmp_path / "ban_state.json"))
+    monkeypatch.setenv("ACCOUNT_BAN_DETECTION", "false")
+    monkeypatch.setenv("ACCOUNT_BAN_PROTECT", "false")
+    monkeypatch.setenv("REDDIT_EXCLUSIVE_ACCOUNTS", "true")
+    monkeypatch.setenv("REDDIT_RATE_LIMIT_ENABLED", "false")
+    # Isolate from the shared-cooldown file singleton (a prior test may have cooled
+    # an account in it), so both accounts are genuinely free here.
+    monkeypatch.setenv("REDDIT_SHARED_COOLDOWN", "false")
+
+    from api.services.registry import AccountRegistry
+    from api.services.account_lease import get_account_lease_store
+    import api.dependencies as deps
+
+    sess1 = tmp_path / "acc_01.json"; sess1.write_text("{}")
+    sess2 = tmp_path / "acc_02.json"; sess2.write_text("{}")
+    monkeypatch.setattr(deps, "parse_accounts_from_env", lambda: [
+        {"account_id": "acc_01", "username": "u1", "password": "pw", "proxy_url": None},
+        {"account_id": "acc_02", "username": "u2", "password": "pw", "proxy_url": None},
+    ])
+    monkeypatch.setattr(deps, "get_available_session_accounts", lambda: ["acc_01", "acc_02"])
+    monkeypatch.setattr(deps, "find_session_file", lambda aid: sess1 if aid == "acc_01" else sess2)
+
+    # Start from a clean lease store so a prior test's holds don't leak in.
+    store = get_account_lease_store("reddit")
+    for aid in ("acc_01", "acc_02"):
+        store.release(aid)
+
+    registry = AccountRegistry()
+
+    first = await registry.get_next_healthy_account()
+    second = await registry.get_next_healthy_account()
+    assert {first, second} == {"acc_01", "acc_02"}, "two acquisitions get the two distinct accounts"
+
+    # Both now leased → a third acquisition has nothing free and raises.
+    with pytest.raises(Exception):
+        await registry.get_next_healthy_account()
+
+    # Release one → it becomes acquirable again (the queue hands it back).
+    registry.release_account(first)
+    third = await registry.get_next_healthy_account()
+    assert third == first, "released account is reused, not the still-held one"
+
+    registry.release_account(second)
+    registry.release_account(third)
 
 
 @pytest.mark.anyio
@@ -524,8 +577,10 @@ async def test_linkedin_protect_rotation_guarantees(monkeypatch, tmp_path):
     # Test exercises the suspended→clear→at_risk recovery path; cooldown bypass
     monkeypatch.setenv("BAN_CONFIRMED_COOLDOWN_SECONDS", "0")
     # Isolate protect-rotation semantics from the per-account rate cap (which
-    # would otherwise consume tokens and skip a still-healthy account here).
+    # would otherwise consume tokens and skip a still-healthy account here) and
+    # from exclusive leasing (this test picks without the release lifecycle).
     monkeypatch.setenv("LINKEDIN_RATE_LIMIT_ENABLED", "false")
+    monkeypatch.setenv("LINKEDIN_EXCLUSIVE_ACCOUNTS", "false")
 
     import api.services.linkedin_account_pool as pool_mod
     import api.services.linkedin_env as env_mod
