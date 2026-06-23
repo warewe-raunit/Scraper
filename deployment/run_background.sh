@@ -48,13 +48,20 @@ echo -e "${GREEN}==> Starting API server in background using ${PYTHON_CMD}...${N
 # display so headful Chromium has somewhere to render. Falls back to a direct
 # launch (works on a desktop with a real display) if xvfb-run is missing.
 export LINKEDIN_RELOGIN_HEADLESS=${LINKEDIN_RELOGIN_HEADLESS:-false}
+# Multiple workers for 100-concurrent throughput. Only the leader worker runs the
+# warmup/relogin loops (api/worker_leader.py), so this doesn't multiply logins.
+# Read the count from .env (the app's source of truth via load_dotenv(override=True))
+# so uvicorn's --workers can't diverge from the per-worker rate-limit partition the
+# app computes from the same API_WORKERS. Falls back to the shell env, then 4.
+WORKERS=$(grep -E '^API_WORKERS=' .env 2>/dev/null | tail -1 | cut -d= -f2 | cut -d'#' -f1 | tr -d ' "')
+WORKERS=${WORKERS:-${API_WORKERS:-4}}
 if command -v xvfb-run >/dev/null 2>&1; then
     echo -e "${GREEN}==> Wrapping in xvfb-run (virtual display for headful browser)...${NC}"
     nohup xvfb-run -a --server-args="-screen 0 1920x1080x24 -ac -nolisten tcp" \
-        ${PYTHON_CMD} -m uvicorn api.main:app --host 0.0.0.0 --port 18080 > "${LOG_FILE}" 2>&1 &
+        ${PYTHON_CMD} -m uvicorn api.main:app --host 0.0.0.0 --port 18080 --workers ${WORKERS} > "${LOG_FILE}" 2>&1 &
 else
     echo -e "${RED}==> xvfb-run not found; launching directly. Install it for headful on a server: sudo apt-get install -y xvfb xauth${NC}"
-    nohup ${PYTHON_CMD} -m uvicorn api.main:app --host 0.0.0.0 --port 18080 > "${LOG_FILE}" 2>&1 &
+    nohup ${PYTHON_CMD} -m uvicorn api.main:app --host 0.0.0.0 --port 18080 --workers ${WORKERS} > "${LOG_FILE}" 2>&1 &
 fi
 
 # Save PID

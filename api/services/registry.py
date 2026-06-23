@@ -101,6 +101,33 @@ class AccountRegistry:
         self._pool = CooldownPool(label="reddit_account", default_cooldown=300, redact=str)
         self._sync_lock = asyncio.Lock()
 
+        # Cross-worker cooldown sharing: under --workers N each worker has its own
+        # registry, so without this a 429 cooldown here is invisible to the other
+        # workers and they keep hammering the same throttled account. The shared
+        # file lets all workers see each other's cooldowns. Gated so it can be
+        # disabled if running single-process.
+        self._shared_cd = None
+        if os.getenv("REDDIT_SHARED_COOLDOWN", "true").lower() in ("1", "true", "yes", "on"):
+            from api.services.shared_cooldown import get_shared_cooldown_store
+            self._shared_cd = get_shared_cooldown_store()
+
+        # Proactive per-account rate limiting (token bucket): pace requests to each
+        # account's per-minute budget so a burst doesn't trip 429s. Budget is
+        # partitioned across workers (RPM / API_WORKERS) so the per-account total
+        # stays within Reddit's limit. See api/services/rate_limiter.py.
+        from api import config
+        self._rate_limiter = None
+        if config.REDDIT_RATE_LIMIT_ENABLED:
+            from api.services.rate_limiter import AccountRateLimiter
+            workers = int(os.getenv("API_WORKERS", "1"))
+            self._rate_limiter = AccountRateLimiter(rpm=config.REDDIT_ACCOUNT_RPM, workers=workers)
+        # Round-robin cursor used when token-gating account selection.
+        self._rr_index = 0
+        # account_id -> (session_file_mtime, token_v2_expires). Avoids re-reading +
+        # JSON-parsing every account's session file on every request (it ran for
+        # all N accounts under the selection lock, on the event loop).
+        self._expiry_cache: Dict[str, tuple] = {}
+
         # Background relogin orchestration (mirrors the LinkedIn account pool):
         # a bounded set of workers keeps every account's session ALIVE
         # proactively — independent of user traffic — so a request never has to
@@ -167,12 +194,34 @@ class AccountRegistry:
     def get_account_state(self, account_id: str) -> Optional[AccountState]:
         return self.states.get(account_id)
 
-    def check_proactive_expiry(self, account_id: str):
-        """Mark sessions for relogin when token expiry or saved-session age requires it."""
+    def _cooldown_for(self, account_id: str) -> float:
+        """Remaining cooldown for one account: the later of this worker's own
+        timer and any cross-worker cooldown from the shared store."""
         state = self.states.get(account_id)
-        if not state or state.status == "needs_relogin":
+        local = state.time_remaining_cooldown() if state else 0.0
+        shared = self._shared_cd.remaining(account_id) if self._shared_cd is not None else 0.0
+        return max(local, shared)
+
+    def shortest_cooldown_seconds(self) -> float:
+        """Seconds until the soonest account frees (0.0 if one is free now).
+
+        Lets the failover loop wait EXACTLY as long as needed on pool exhaustion
+        instead of a blind exponential backoff that oversleeps short Reddit
+        rate-limit windows (the difference between a ~2s wait and a ~60s one)."""
+        remaining = [self._cooldown_for(aid) for aid in self.states]
+        return min(remaining) if remaining else 0.0
+
+    def check_proactive_expiry(self, account_id: str):
+        """Mark sessions for relogin when token expiry or saved-session age requires
+        it — and RECOVER an account stuck in needs_relogin when its on-disk session
+        is fresh again. A non-leader worker can't relogin (leader-only), so on a 401
+        it parks the account in needs_relogin and the request path skips it forever;
+        once the leader (or a human) rewrites the session file, this flips it back to
+        healthy instead of bleeding accounts out of the pool until a restart."""
+        state = self.states.get(account_id)
+        if not state:
             return
-            
+
         from api.dependencies import find_session_file
         session_file = find_session_file(account_id)
         if not session_file:
@@ -182,7 +231,8 @@ class AccountRegistry:
             
         try:
             now = time.time()
-            session_age_seconds = max(0.0, now - session_file.stat().st_mtime)
+            st = session_file.stat()
+            session_age_seconds = max(0.0, now - st.st_mtime)
             if session_age_seconds >= SESSION_MAX_AGE_SECONDS:
                 state.status = "needs_relogin"
                 logger.info(
@@ -191,23 +241,42 @@ class AccountRegistry:
                     session_file=str(session_file),
                     age_seconds=round(session_age_seconds, 1),
                     max_age_seconds=SESSION_MAX_AGE_SECONDS,
-                    saved_at=time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(session_file.stat().st_mtime))
+                    saved_at=time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime))
                 )
                 return
 
-            with open(session_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            for cookie in data.get("cookies", []):
-                if cookie.get("name") == "token_v2":
-                    expires = cookie.get("expires", 0)
-                    # If expired or expiring within 5 minutes (300 seconds)
-                    if expires and now >= expires - 300:
-                        logger.info(
-                            "proactive_token_expiry_detected",
-                            account_id=account_id,
-                            expires=time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(expires))
-                        )
-                        state.status = "needs_relogin"
+            # Parse token_v2 expiry only when the session file actually changed;
+            # otherwise reuse the cached value. The clock-based checks below still
+            # run every call (cheap), so an expiry that trips purely by time
+            # passing is still caught — we just skip the expensive open()+json.load.
+            cached = self._expiry_cache.get(account_id)
+            if cached and cached[0] == st.st_mtime:
+                token_expires = cached[1]
+            else:
+                token_expires = 0
+                with open(session_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                for cookie in data.get("cookies", []):
+                    if cookie.get("name") == "token_v2":
+                        token_expires = cookie.get("expires", 0) or 0
+                        break
+                self._expiry_cache[account_id] = (st.st_mtime, token_expires)
+
+            # If expired or expiring within 5 minutes (300 seconds)
+            if token_expires and now >= token_expires - 300:
+                logger.info(
+                    "proactive_token_expiry_detected",
+                    account_id=account_id,
+                    expires=time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(token_expires))
+                )
+                state.status = "needs_relogin"
+                return
+
+            # Session present, not aged, token healthy: recover an account a prior
+            # 401 parked in needs_relogin (see docstring) so it re-enters rotation.
+            if state.status == "needs_relogin":
+                state.status = "healthy"
+                logger.info("session_recovered_from_disk", account_id=account_id)
         except Exception as e:
             logger.error("error_checking_proactive_expiry", account_id=account_id, error=str(e))
 
@@ -265,7 +334,11 @@ class AccountRegistry:
             # Filter healthy ones (needs_relogin accounts are considered healthy here
             # because we trigger re-login right before executing the request in the scraper)
             healthy_ids = [aid for aid in available_ids if self.states[aid].is_healthy() or self.states[aid].status == "needs_relogin"]
-            
+
+            # Cross-worker: also skip accounts another worker has cooled down.
+            if self._shared_cd is not None:
+                healthy_ids = [aid for aid in healthy_ids if self._shared_cd.remaining(aid) <= 0]
+
             # Exclude terminal ban states if ban protect is active
             if self.ban_detection_enabled and self.ban_protect_enabled:
                 healthy_ids = [
@@ -275,7 +348,8 @@ class AccountRegistry:
 
             if not healthy_ids:
                 # Fallback: find the account with the shortest cool down time
-                cooldowns = {aid: self.states[aid].time_remaining_cooldown() for aid in available_ids}
+                # (counting any cross-worker cooldown too).
+                cooldowns = {aid: self._cooldown_for(aid) for aid in available_ids}
                 best_account = min(cooldowns, key=cooldowns.get) # type: ignore
                 shortest_cooldown = cooldowns[best_account]
                 
@@ -301,8 +375,27 @@ class AccountRegistry:
             else:
                 rotation_candidates = healthy_ids
 
-            # Round-robin selection via the shared CooldownPool (restricted to the
-            # candidates we just filtered; all are cooldown-clear by definition).
+            # Token-gated round-robin: walk candidates in rotation order and pick
+            # the first one that still has rate budget. This paces each account to
+            # its per-minute limit so a burst doesn't trip 429s. If EVERY healthy
+            # account is at budget, raise the same exhaustion signal so the failover
+            # loop waits briefly (tokens refill in ~sub-second) and sheds with 503 if
+            # the burst outlasts the budget — "smooth then shed".
+            if self._rate_limiter is not None:
+                n = len(rotation_candidates)
+                start = self._rr_index % n
+                self._rr_index += 1
+                for i in range(n):
+                    aid = rotation_candidates[(start + i) % n]
+                    if self._rate_limiter.try_consume(aid):
+                        return aid
+                wait = self._rate_limiter.soonest_token_seconds(rotation_candidates)
+                raise RuntimeError(
+                    f"All {n} healthy Reddit accounts are at their per-minute rate "
+                    f"budget (next token in ~{round(wait, 2)}s); throttling to avoid 429s."
+                )
+
+            # Rate limiting disabled: original round-robin via the CooldownPool.
             selected = self._pool.get_next(candidates=rotation_candidates, fallback_to_shortest=False)
             if selected is None:
                 # Defensive: rotation_candidates is non-empty here, so fall back to its head.
@@ -315,6 +408,8 @@ class AccountRegistry:
         if state:
             state.status = "cool_down"
             self._pool.cool_down(account_id, duration_seconds)
+            if self._shared_cd is not None:
+                self._shared_cd.cool_down(account_id, time.time() + duration_seconds)
             logger.warn(
                 "account_cooldown_activated",
                 account_id=account_id,
@@ -344,7 +439,15 @@ class AccountRegistry:
             logger.warn("account_flagged_for_relogin", account_id=account_id)
 
     async def trigger_relogin(self, account_id: str) -> bool:
-        """Trigger Playwright automated re-login flow to refresh token_v2."""
+        """Trigger Playwright automated re-login flow to refresh token_v2.
+
+        Gated by REDDIT_AUTO_RELOGIN: when off, no relogin is attempted on any
+        path (request 401, background sweep, or force) — the session is left as-is
+        and the account is skipped. Stops the relogin churn (and the headful
+        Chromium launches) under load."""
+        if os.getenv("REDDIT_AUTO_RELOGIN", "false").lower() not in ("1", "true", "yes", "on"):
+            logger.info("relogin_disabled_skipping", account_id=account_id)
+            return False
         state = self.states.get(account_id)
         if not state:
             return False
@@ -486,11 +589,11 @@ class AccountRegistry:
     def _schedule_relogin(self, account_id: str) -> bool:
         """Queue a deduplicated background relogin worker for one account.
 
-        Gated by REDDIT_AUTO_RELOGIN (default on); when off the pool never
+        Gated by REDDIT_AUTO_RELOGIN (default off); when off the pool never
         launches a browser to re-login (saved-sessions-only mode). Returns
         whether a worker is queued/running for this account.
         """
-        if os.getenv("REDDIT_AUTO_RELOGIN", "true").lower() not in ("1", "true", "yes", "on"):
+        if os.getenv("REDDIT_AUTO_RELOGIN", "false").lower() not in ("1", "true", "yes", "on"):
             logger.info("reddit_relogin_skipped_disabled", account_id=account_id)
             return False
         existing = self._relogin_tasks.get(account_id)
@@ -587,13 +690,16 @@ class AccountRegistry:
 
         old_state = ledger.ban_state
         ledger.record(signal)
-        
-        # Save change
-        from tools import ban_state_store
-        ban_state_store.save(self.ledgers)
-
         new_state = ledger.ban_state
+
+        # Persist ONLY on a ban-state transition. Saving on every signal meant a
+        # full-file JSON write (under a lock) on the request hot path for every
+        # "ok" success — a serialization point that capped throughput. The durable
+        # thing is ban_state (drives quarantine); risk_score drift between
+        # transitions rebuilds itself and isn't worth a per-request disk write.
         if old_state != new_state:
+            from tools import ban_state_store
+            ban_state_store.save(self.ledgers)
             if new_state == "shadow_suspected":
                 logger.warning(
                     "account.ban_suspected",

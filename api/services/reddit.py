@@ -21,11 +21,78 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from fastapi import HTTPException, status
+
 from api.dependencies import create_stealth_client
 from api.services.registry import AccountRegistry
 from api import config
 
 logger = structlog.get_logger(__name__)
+
+
+# Background DB writes: persisting to Supabase must NOT block the scrape response
+# (the upsert is a ~200ms network call that also consumes a shared-threadpool slot
+# per request — under concurrency it halves effective capacity). Fire-and-forget,
+# tracked in a set so the task isn't garbage-collected mid-flight.
+_bg_tasks: set = set()
+
+
+def _bg_save_done(task) -> None:
+    _bg_tasks.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        # Fire-and-forget, but a dropped Supabase write should not be invisible.
+        logger.warning("reddit_bg_db_save_failed", error=str(task.exception()))
+
+
+def _save_bg(coro) -> None:
+    try:
+        t = asyncio.get_running_loop().create_task(coro)
+        _bg_tasks.add(t)
+        t.add_done_callback(_bg_save_done)
+    except RuntimeError:
+        coro.close()  # no running loop — drop the coroutine cleanly
+
+
+class _ConcurrencyCap:
+    """Per-worker cap on in-flight Reddit requests. Single-threaded asyncio, so
+    the check-and-increment is atomic (no lock needed). Over the cap → caller
+    sheds 503 immediately instead of queuing (queuing is what made the old token
+    bucket pile up and collapse throughput)."""
+
+    def __init__(self, max_inflight: int):
+        self.max = max_inflight
+        self.inflight = 0
+
+    def try_enter(self) -> bool:
+        if self.max <= 0:
+            return True  # disabled
+        if self.inflight >= self.max:
+            return False
+        self.inflight += 1
+        return True
+
+    def leave(self) -> None:
+        if self.max > 0:
+            self.inflight = max(0, self.inflight - 1)
+
+
+# Process-wide cap (one per worker). Sized from config; total ≈ cap × workers.
+_inflight_cap = _ConcurrencyCap(config.REDDIT_MAX_INFLIGHT)
+
+
+def _pool_exhausted(detail: str, retry_after: int = 5) -> HTTPException:
+    """Build the graceful 503 for a temporarily exhausted account/proxy pool.
+
+    Under high concurrency (e.g. 100 simultaneous requests against 9 accounts)
+    every account can be rate-limited at once. That is transient and retryable —
+    NOT a server fault — so we surface 503 + Retry-After, never a 500. ponytail:
+    routes just need `except HTTPException: raise` to let this through.
+    """
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail=detail,
+        headers={"Retry-After": str(retry_after)},
+    )
 
 class RedditScraperService:
     def __init__(self, registry: AccountRegistry, db: Optional[Any] = None):
@@ -39,6 +106,37 @@ class RedditScraperService:
         requested_account_id: Optional[str] = None,
         max_retries: int = config.REDDIT_MAX_RETRIES
     ) -> Dict[str, Any]:
+        """Global concurrency gate around the failover loop: cap in-flight Reddit
+        requests per worker and shed 503 IMMEDIATELY above the cap (no queuing).
+        This is what prevents the high-concurrency 429 collapse without strangling
+        the safe zone the way the per-minute token bucket did."""
+        if not _inflight_cap.try_enter():
+            raise _pool_exhausted(
+                f"Reddit at capacity ({_inflight_cap.max} concurrent/worker). Retry shortly.",
+                retry_after=3,
+            )
+        # holding[0] tracks whether we currently own a concurrency slot. The loop
+        # releases it while it merely SLEEPS on pool exhaustion (so a burst of
+        # sleepers can't occupy all the slots doing no work) and re-acquires before
+        # resuming — keeping the count balanced against this single finally.
+        holding = [True]
+        try:
+            return await self._execute_with_failover_inner(
+                url, params=params, requested_account_id=requested_account_id,
+                max_retries=max_retries, holding=holding,
+            )
+        finally:
+            if holding[0]:
+                _inflight_cap.leave()
+
+    async def _execute_with_failover_inner(
+        self,
+        url: str,
+        params: Optional[Dict[str, Any]] = None,
+        requested_account_id: Optional[str] = None,
+        max_retries: int = config.REDDIT_MAX_RETRIES,
+        holding: Optional[List[bool]] = None,
+    ) -> Dict[str, Any]:
         """
         Execute a GET request with structured failover, cooldowns, and re-login retries.
 
@@ -49,13 +147,14 @@ class RedditScraperService:
         ONLY when the entire account pool is exhausted (every account cooling
         down): there, waiting is the one thing that helps, so we sleep and retry
         instead of failing instantly. The cap (``max_retries``) keeps a
-        genuinely-down target from hanging forever. On exhaustion this raises
-        RuntimeError; the public scrape_* methods translate that into a structured
-        empty result so the caller always receives output.
+        genuinely-down target from hanging forever. On exhaustion this raises a
+        503 HTTPException (Retry-After set); it propagates through the scrape_*
+        methods to the client unchanged — a transient, retryable signal, not a 500.
         """
         current_account_id = requested_account_id
-        backoff_base = config.REDDIT_BACKOFF_BASE
         backoff_cap = config.REDDIT_BACKOFF_CAP
+        exhaustion_budget = config.REDDIT_EXHAUSTION_WAIT_BUDGET
+        exhaustion_waited = 0.0
         just_relogged_accounts = set()
 
         for attempt in range(1, max_retries + 1):
@@ -63,21 +162,44 @@ class RedditScraperService:
             try:
                 account_id = await self.registry.get_next_healthy_account(current_account_id)
             except Exception as e:
-                # Pool exhausted / all accounts cooling down. This is the only
-                # case where waiting helps — back off so cooldowns and the
-                # rotating proxy pool can recover, then retry until the budget
-                # runs out (instead of failing on the first exhausted check).
-                if attempt < max_retries:
-                    delay = min(backoff_cap, backoff_base * (2 ** (attempt - 1)))
+                # Pool exhausted / all accounts cooling down. Waiting is the only
+                # thing that helps — but wait EXACTLY until the soonest account
+                # frees, not a blind exponential backoff. Reddit's rate-limit
+                # windows are short (often ~0s), so the old 2,4,8,12... schedule
+                # oversleeps to ~60s when a ~1s wait would do. A wall-clock budget
+                # bounds the tail: short windows are caught fast, a genuine hard
+                # block 503s in ~budget seconds instead of grinding all retries.
+                if exhaustion_waited < exhaustion_budget:
+                    cooldown = self.registry.shortest_cooldown_seconds()
+                    delay = min(backoff_cap, exhaustion_budget - exhaustion_waited,
+                                max(0.25, cooldown + 0.1))
                     logger.warning(
                         "reddit_account_pool_exhausted_backing_off",
-                        attempt=attempt, delay_seconds=round(delay, 1), error=str(e)
+                        attempt=attempt, delay_seconds=round(delay, 1),
+                        nearest_cooldown=round(cooldown, 1),
+                        waited=round(exhaustion_waited, 1), error=str(e)
                     )
+                    # Don't hold a concurrency slot while only waiting for the pool
+                    # to free — release it so other requests can use it, re-acquire
+                    # before resuming (shed 503 if the pool is now full of workers).
+                    if holding is not None and holding[0]:
+                        _inflight_cap.leave()
+                        holding[0] = False
                     await asyncio.sleep(delay)
+                    if holding is not None and not _inflight_cap.try_enter():
+                        raise _pool_exhausted(
+                            f"Reddit at capacity ({_inflight_cap.max} concurrent/worker) "
+                            f"after waiting on pool exhaustion. Retry shortly.",
+                            retry_after=3,
+                        )
+                    if holding is not None:
+                        holding[0] = True
+                    exhaustion_waited += delay
                     current_account_id = None
                     continue
-                logger.error("failover_failed_no_healthy_accounts", error=str(e), url=url)
-                raise RuntimeError(f"Scrape request failed: {e}")
+                logger.error("failover_failed_no_healthy_accounts",
+                             waited=round(exhaustion_waited, 1), error=str(e), url=url)
+                raise _pool_exhausted(f"All accounts are temporarily rate-limited. {e}")
 
             # Get state object to inspect cookie expiry
             state = self.registry.get_account_state(account_id)
@@ -118,7 +240,11 @@ class RedditScraperService:
                 loop = asyncio.get_running_loop()
                 response = await loop.run_in_executor(
                     None,
-                    lambda: session.get(url, params=params, impersonate=config.HTTP_IMPERSONATE, timeout=config.REDDIT_REQUEST_TIMEOUT)
+                    lambda: session.get(
+                        url, params=params, impersonate=config.HTTP_IMPERSONATE,
+                        # (connect, read): dead proxy fails connect fast and rotates.
+                        timeout=(config.REDDIT_CONNECT_TIMEOUT, config.REDDIT_REQUEST_TIMEOUT),
+                    )
                 )
                 
                 log.info("reddit_api_response_received", status_code=response.status_code)
@@ -142,6 +268,13 @@ class RedditScraperService:
                     try_update_limits(response)
                     self.registry.record_signal(account_id, "ok")
                     just_relogged_accounts.discard(account_id)
+                    # Proxy proven good on a REAL request — prefer it next time.
+                    try:
+                        if getattr(session, "proxy_url", None):
+                            from tools.proxy_provider import get_proxy_provider
+                            get_proxy_provider().mark_good(session.proxy_url)
+                    except Exception:
+                        pass
                     return response.json()
 
                 # Case B: Expired Token / Session (401 Unauthorized)
@@ -208,14 +341,23 @@ class RedditScraperService:
             except requests.errors.RequestsError as e:
                 log.error("network_or_proxy_connection_failed", error=str(e))
                 self.registry.record_signal(account_id, "inconclusive")
+                proxy_failed = False
                 try:
                     from tools.proxy_provider import get_proxy_provider
                     _prov = get_proxy_provider()
                     if _prov.is_enabled() and getattr(session, "proxy_url", None):
                         _prov.cool_down(session.proxy_url)
+                        proxy_failed = True
                 except Exception:
                     pass
-                self.registry.cool_down_account(account_id, duration_seconds=config.REDDIT_NETWORK_COOLDOWN_SECONDS)
+                # A dead ROTATING PROXY is not the account's fault — cool the proxy
+                # (done above) and rotate to the next account+proxy, but DON'T
+                # quarantine a healthy account for 180s. Quarantining on proxy
+                # failures is what collapsed sustained throughput: a handful of dead
+                # proxies took every account out of rotation. Only a direct (no-proxy)
+                # connection failure cools the account.
+                if not proxy_failed:
+                    self.registry.cool_down_account(account_id, duration_seconds=config.REDDIT_NETWORK_COOLDOWN_SECONDS)
                 current_account_id = None
                 continue
             except Exception as e:
@@ -225,10 +367,10 @@ class RedditScraperService:
                 current_account_id = None
                 continue
         
-        raise RuntimeError(
-            f"Failed to fetch data from Reddit API after {max_retries} attempts "
-            f"spanning proxy-pool refreshes (url={url}). All attempts were rate-"
-            f"limited, blocked, or failed to connect."
+        raise _pool_exhausted(
+            f"Reddit API unavailable after {max_retries} attempts spanning proxy-pool "
+            f"refreshes (url={url}). All attempts were rate-limited, blocked, or failed "
+            f"to connect. Retry shortly."
         )
 
     def _published_at(self, created_utc: Any) -> Optional[str]:
@@ -384,7 +526,7 @@ class RedditScraperService:
                 posts_list.append(self.clean_post_data(child))
                 
         if self.db:
-            await self.db.save_reddit_posts(posts_list)
+            _save_bg(self.db.save_reddit_posts(posts_list))
             
         return {
             "subreddit": subreddit,
@@ -446,9 +588,9 @@ class RedditScraperService:
         
         if self.db:
             if post_details:
-                await self.db.save_reddit_posts([post_details])
+                _save_bg(self.db.save_reddit_posts([post_details]))
             if comments:
-                await self.db.save_reddit_comments(comments)
+                _save_bg(self.db.save_reddit_comments(comments))
         
         return {
             "post": post_details,
@@ -497,7 +639,7 @@ class RedditScraperService:
                 posts_list.append(self.clean_post_data(child))
                 
         if self.db:
-            await self.db.save_reddit_posts(posts_list)
+            _save_bg(self.db.save_reddit_posts(posts_list))
             
         return {
             "query": query,
@@ -545,7 +687,7 @@ class RedditScraperService:
             "url": f"https://www.reddit.com/user/{username}/"
         }
         if self.db:
-            await self.db.save_reddit_user(user_profile)
+            _save_bg(self.db.save_reddit_user(user_profile))
         return user_profile
 
     async def scrape_user_posts(
@@ -574,7 +716,7 @@ class RedditScraperService:
                 posts_list.append(self.clean_post_data(child))
                 
         if self.db:
-            await self.db.save_reddit_posts(posts_list)
+            _save_bg(self.db.save_reddit_posts(posts_list))
             
         return {
             "username": username,
@@ -613,7 +755,7 @@ class RedditScraperService:
                 comments_list.append(self.clean_comment_data(child))
                 
         if self.db:
-            await self.db.save_reddit_comments(comments_list)
+            _save_bg(self.db.save_reddit_comments(comments_list))
             
         return {
             "username": username,
