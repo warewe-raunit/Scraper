@@ -1,0 +1,14 @@
+{
+  "name": "stealth-scraper",
+  "version": "1.0.0",
+  "description": "Search and research across Reddit, YouTube, X (Twitter), and LinkedIn from any AI agent. Stealth session scraping behind one API, exposed as MCP tools plus a social-research skill.",
+  "author": {
+    "name": "Manav",
+    "email": "manavsarna04@gmail.com",
+    "url": "https://github.com/warewe-raunit"
+  },
+  "homepage": "https://github.com/warewe-raunit/Scraper",
+  "repository": "https://github.com/warewe-raunit/Scraper",
+  "license": "MIT",
+  "keywords": ["research", "reddit", "twitter", "x", "youtube", "linkedin", "scraper", "mcp", "social", "trends"]
+}

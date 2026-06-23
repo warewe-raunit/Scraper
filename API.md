@@ -385,3 +385,109 @@ curl -H "X-API-Key: $API_KEY" \
 ```
 
 For the full live, try-it-in-browser reference, open **`{BASE_URL}/docs`**.
+
+---
+
+## MCP server (Claude Code, Codex, other agents)
+
+`mcp_server.py` exposes every endpoint above as MCP tools over stdio. It is a thin
+client to a **running** API instance — it mirrors `{BASE_URL}/openapi.json`, so new
+endpoints become tools automatically. Start the API first, then point an agent at it.
+
+```bash
+pip install -r requirements.txt          # pulls fastmcp
+export SCRAPER_BASE_URL="http://127.0.0.1:8000"   # or your prod host:18080
+export API_KEY="<your-key>"
+```
+
+**Claude Code** — one command:
+```bash
+claude mcp add scraper \
+  -e SCRAPER_BASE_URL=http://127.0.0.1:8000 -e API_KEY=$API_KEY \
+  -- python /abs/path/to/reddit_stealth_scraper/mcp_server.py
+```
+
+**Codex** — `~/.codex/config.toml`:
+```toml
+[mcp_servers.scraper]
+command = "python"
+args = ["/abs/path/to/reddit_stealth_scraper/mcp_server.py"]
+env = { SCRAPER_BASE_URL = "http://127.0.0.1:8000", API_KEY = "your-key" }
+```
+
+**Generic MCP host** — `mcp.json` / `.mcp.json`:
+```json
+{
+  "mcpServers": {
+    "scraper": {
+      "command": "python",
+      "args": ["/abs/path/to/reddit_stealth_scraper/mcp_server.py"],
+      "env": { "SCRAPER_BASE_URL": "http://127.0.0.1:8000", "API_KEY": "your-key" }
+    }
+  }
+}
+```
+
+The agent now sees tools like `search_youtube`, `get_subreddit_posts`,
+`get_linkedin_profile`, `search_x_tweets`, etc. — same params as the REST endpoints.
+
+### Hosted (remote) MCP — zero setup for users
+
+The snippets above spawn the MCP locally on each user's machine (needs `python` +
+`pip install`). To let people connect with **just a URL and nothing installed**,
+run the MCP once on the server, next to the API:
+
+```bash
+# on the server, alongside the running API
+MCP_TRANSPORT=http MCP_PORT=9000 \
+  SCRAPER_BASE_URL=http://127.0.0.1:18080 API_KEY="<key>" \
+  python mcp_server.py
+# serves http://<server>:9000/mcp/
+```
+
+The hosted server holds `API_KEY` server-side, so connecting agents don't need it:
+
+```bash
+# Claude Code
+claude mcp add --transport http scraper http://<server>:9000/mcp/
+```
+```toml
+# Codex ~/.codex/config.toml
+[mcp_servers.scraper]
+url = "http://<server>:9000/mcp/"
+```
+
+> The HTTP endpoint has no auth of its own — keep it on a private network or
+> behind a reverse proxy / bearer token. Anyone who can reach the URL can call
+> the tools (and thus your scraper).
+
+---
+
+## Install as a plugin (Claude Code, Codex, any agent)
+
+This repo is also a **Claude Code plugin** (`.claude-plugin/`) that bundles the
+MCP server above plus a `social-research` skill — research a topic/person across
+all four sources and get a cited briefing ranked by engagement.
+
+**Prereqs (every method):** the API must be running, and the agent's environment
+needs `SCRAPER_BASE_URL` + `API_KEY` set, plus `pip install -r requirements.txt`
+(for the `fastmcp` MCP) and `python` on PATH.
+
+**Claude Code** — install the plugin (registers the MCP server + skill):
+```
+/plugin marketplace add warewe-raunit/Scraper
+/plugin install stealth-scraper
+```
+Then `/social-research <topic>`, or just ask "what are people saying about X".
+
+**Codex / Cursor / Copilot / Gemini / Windsurf** — the skill is portable via the
+Agent Skills CLI:
+```bash
+npx skills add warewe-raunit/Scraper -g
+```
+Add the MCP server from the "MCP server" section above for the underlying tools.
+
+**Manual (dev):** symlink the skill into your agent's skills dir, e.g.
+```bash
+ln -s "$(pwd)/skills/social-research" ~/.claude/skills/social-research
+```
