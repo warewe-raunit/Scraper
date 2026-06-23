@@ -166,6 +166,17 @@ class GoodProxiesProvider:
             os.getenv("GOODPROXIES_HEALTHCHECK_URL")
             or "https://www.google.com/generate_204"
         ).strip()
+        # Multi-target liveness: validate each proxy against EVERY URL here — a
+        # proxy is "live" only if it reaches all of them. Set this to e.g.
+        # "https://www.reddit.com/,https://www.linkedin.com/robots.txt" so every
+        # admitted proxy works for BOTH Reddit and LinkedIn, not just the first
+        # service — a LinkedIn fetch then never burns time on a Reddit-only proxy.
+        # Comma-separated; falls back to the single healthcheck_url above.
+        _urls_raw = (os.getenv("GOODPROXIES_HEALTHCHECK_URLS") or "").strip()
+        self.healthcheck_urls = (
+            [u.strip() for u in _urls_raw.split(",") if u.strip()]
+            if _urls_raw else [self.healthcheck_url]
+        )
         self.healthcheck_timeout = float(
             os.getenv("GOODPROXIES_HEALTHCHECK_TIMEOUT") or "6"
         )
@@ -376,7 +387,20 @@ class GoodProxiesProvider:
         return [u for (u, _ping, _works) in rows]
 
     def _probe_one(self, proxy_url: str) -> bool:
-        """Return True if the proxy returns ANY HTTP response for the healthcheck URL.
+        """Alive only if the proxy reaches EVERY configured healthcheck target.
+
+        Probing multiple targets (e.g. Reddit + LinkedIn) keeps the live pool
+        usable for every service instead of just the first — so a LinkedIn fetch
+        never lands on a proxy that only ever reached Reddit. Short-circuits on the
+        first miss to keep the common (dead-proxy) case cheap.
+        """
+        for url in self.healthcheck_urls:
+            if not self._probe_url(proxy_url, url):
+                return False
+        return True
+
+    def _probe_url(self, proxy_url: str, target_url: str) -> bool:
+        """Return True if the proxy returns a usable HTTP response for one target.
 
         This is a *liveness* probe, not a content check: getting any response back
         proves the proxy connected and tunneled (HTTPS CONNECT succeeded). The
@@ -391,10 +415,10 @@ class GoodProxiesProvider:
         try:
             if self.healthcheck_strict:
                 # Representative probe: impersonate (matches the real request path)
-                # and require a clean 2xx/3xx — a Reddit-blocked proxy returns
-                # 403/429 and is correctly rejected.
+                # and require a clean 2xx/3xx — a blocked proxy returns 403/429 and
+                # is correctly rejected.
                 resp = cffi_requests.get(
-                    self.healthcheck_url,
+                    target_url,
                     proxies={"http": proxy_url, "https": proxy_url},
                     timeout=self.healthcheck_timeout,
                     impersonate="chrome120",
@@ -403,7 +427,7 @@ class GoodProxiesProvider:
             # Cheap liveness probe: any response < 500 proves the tunnel works. No
             # impersonate (can trigger the curl_cffi unpack bug on some proxies).
             resp = cffi_requests.get(
-                self.healthcheck_url,
+                target_url,
                 proxies={"http": proxy_url, "https": proxy_url},
                 timeout=self.healthcheck_timeout,
             )

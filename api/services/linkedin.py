@@ -1205,7 +1205,18 @@ class LinkedInScraperService:
         offsets_to_fetch = [i * page_size for i in range(max_pages)]
         offset_ptr = 0
 
+        # Bound the walk: a degraded proxy pool makes every page fail, and the
+        # unbounded requeue below otherwise grinds until target is met (~400s seen
+        # in prod). A wall-clock budget + per-offset retry cap returns partial
+        # results fast instead. Tune via LINKEDIN_PAGINATION_BUDGET_SECONDS.
+        deadline = time.monotonic() + float(os.getenv("LINKEDIN_PAGINATION_BUDGET_SECONDS", "60"))
+        requeues: Dict[int, int] = {}
+
         while offset_ptr < len(offsets_to_fetch) and len(out) < target:
+            if time.monotonic() > deadline:
+                logger.warning("voyager_paginate.budget_exhausted",
+                               collected=len(out), target=target)
+                break
             remaining_needed = -(-(target - len(out)) // page_size)
             wave_size = min(parallel, remaining_needed, len(offsets_to_fetch) - offset_ptr)
             if wave_size <= 0:
@@ -1268,8 +1279,12 @@ class LinkedInScraperService:
                         wave_stop = True
                 else:
                     logger.warning("voyager_paginate.page_failed", start=start, account=acc.account_id)
-                    # Requeue this start offset to be retried in a future wave with a different account
-                    offsets_to_fetch.append(start)
+                    # Requeue this offset for a different account, but cap retries
+                    # per offset (account_tries) so a dead pool can't requeue the
+                    # same page forever.
+                    requeues[start] = requeues.get(start, 0) + 1
+                    if requeues[start] < account_tries:
+                        offsets_to_fetch.append(start)
 
                 # Release each account independently with its health status
                 await pool.release(

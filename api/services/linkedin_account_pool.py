@@ -278,16 +278,20 @@ class LinkedInAccountPool:
                 # Record signal "inconclusive"
                 self.record_signal(account_id, "inconclusive")
 
-                # Session is probably fine — the account's pinned proxy just died.
-                # A relogin repins a fresh working _login_proxy. Mark DYING (still
-                # serves as a fallback) and schedule a repin after a couple of
-                # consecutive exhaustions so a one-off network blip doesn't relogin.
+                # Proxy exhaustion is an INFRA problem (the rotating pool had no live
+                # proxy this account could reach), NOT a session problem. We used to
+                # relogin here to repin a fresh _login_proxy — but a headful browser
+                # relogin repins from the SAME dead pool, fixes nothing, costs
+                # ~10-15s, and pulls the account out of rotation. Under a degraded
+                # pool that turned one search into a 400s+ relogin storm. So just
+                # demote to DYING (still a fallback) and let the paginator swap
+                # accounts; genuine session death (302 storm / 401 / 403, handled
+                # above) and the background sweep still relogin when warranted.
+                # ponytail: re-pinning the login proxy without a browser would be the
+                # real fix, but it needs no relogin — drop the misfire and move on.
                 acc.consecutive_proxy_exhaust += 1
                 if acc.status == ALIVE:
                     acc.status = DYING
-                if (acc.consecutive_proxy_exhaust >= self.proxy_exhaust_relogin_threshold
-                        and acc.status not in (RELOGGING, DISABLED)):
-                    relogin_needed = True
         if relogin_needed:
             self._schedule_relogin(account_id)
 
