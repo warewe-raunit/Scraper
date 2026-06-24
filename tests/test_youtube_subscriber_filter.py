@@ -186,6 +186,49 @@ def test_extract_subscriber_count_legacy_field():
     assert svc.extract_subscriber_count(data) == "29.9M subscribers"
 
 
+def test_extract_subscriber_count_ignores_featured_channels():
+    """A channel browse page embeds OTHER channels (featured-channels shelf)
+    whose subscriberCountText appears earlier in tree order than the owner's
+    header. Extraction must return the OWNER's count, not the featured one."""
+    svc = yt.YouTubeScraperService()
+    data = {
+        # Featured-channels shelf comes first in tree order — a small channel.
+        "featuredChannels": {
+            "gridChannelRenderer": {
+                "subscriberCountText": {"simpleText": "451 subscribers"},
+            }
+        },
+        # The page owner's real header.
+        "header": {
+            "c4TabbedHeaderRenderer": {
+                "subscriberCountText": {"simpleText": "176K subscribers"},
+            }
+        },
+    }
+    text = svc.extract_subscriber_count(data)
+    assert svc.parse_subscriber_text(text) == 176_000
+
+
+def test_fetch_player_falls_back_to_android_vr_when_web_bot_gated(monkeypatch):
+    """WEB client is bot-gated (no videoDetails); ANDROID_VR returns them.
+    _fetch_player must try ANDROID_VR and return the populated response."""
+    svc = yt.YouTubeScraperService()
+    seen = []
+
+    async def _exec(endpoint, payload, **kw):
+        client = payload["context"]["client"]["clientName"]
+        seen.append(client)
+        if client == "WEB":
+            return {"playabilityStatus": {"status": "LOGIN_REQUIRED"}}  # stripped
+        return {"videoDetails": {"viewCount": "4484751"}}              # ANDROID_VR OK
+
+    monkeypatch.setattr(svc, "_execute_post", _exec)
+
+    out = asyncio.run(svc._fetch_player("vid123"))
+    assert out["videoDetails"]["viewCount"] == "4484751"
+    assert "ANDROID_VR" in seen        # fell through to the android_vr client
+
+
 def test_lockup_extracts_channel_id():
     svc = yt.YouTubeScraperService()
     vm = {

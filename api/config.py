@@ -132,6 +132,14 @@ YOUTUBE_SUBFILTER_DIRECT_ONLY = _env_bool("YOUTUBE_SUBFILTER_DIRECT_ONLY", True)
 YOUTUBE_SUBFILTER_CONCURRENCY = _env_int("YOUTUBE_SUBFILTER_CONCURRENCY", 8)
 YOUTUBE_WEB_CLIENT_VERSION = _env_str("YOUTUBE_WEB_CLIENT_VERSION", "2.20240101.01.00")
 YOUTUBE_ANDROID_CLIENT_VERSION = _env_str("YOUTUBE_ANDROID_CLIENT_VERSION", "19.01.35")
+# ANDROID_VR is the InnerTube client that still returns videoDetails (views,
+# length) without a poToken/attestation, so it's the fallback when the WEB
+# client is bot-gated. Plain ANDROID/IOS now 400 with FAILED_PRECONDITION.
+YOUTUBE_ANDROID_VR_CLIENT_VERSION = _env_str("YOUTUBE_ANDROID_VR_CLIENT_VERSION", "1.57.29")
+YOUTUBE_ANDROID_VR_USER_AGENT = _env_str(
+    "YOUTUBE_ANDROID_VR_USER_AGENT",
+    "com.google.android.apps.youtube.vr.oculus/1.57.29 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
+)
 YOUTUBE_DEFAULT_USER_AGENT = _env_str(
     "YOUTUBE_DEFAULT_USER_AGENT",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "

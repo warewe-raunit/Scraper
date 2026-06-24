@@ -146,15 +146,22 @@ class YouTubeScraperService(ProxyRotatingService):
         """
         gl = country.strip().upper() if country else "US"
         hl = hl_for_country(country)
-        if client_name == "ANDROID":
+        if client_name == "ANDROID_VR":
+            # Returns videoDetails without a poToken/attestation, unlike plain
+            # ANDROID/IOS which now 400 with FAILED_PRECONDITION. Used as the
+            # fallback when the WEB client is bot-gated.
             return {
                 "client": {
-                    "clientName": "ANDROID",
-                    "clientVersion": config.YOUTUBE_ANDROID_CLIENT_VERSION,
+                    "clientName": "ANDROID_VR",
+                    "clientVersion": config.YOUTUBE_ANDROID_VR_CLIENT_VERSION,
                     "hl": hl,
                     "gl": gl,
                     "platform": "MOBILE",
-                    "osName": "ANDROID"
+                    "osName": "Android",
+                    "osVersion": "12L",
+                    "androidSdkVersion": 32,
+                    # Header UA must match the client or InnerTube may reject it.
+                    "userAgent": config.YOUTUBE_ANDROID_VR_USER_AGENT,
                 }
             }
         else:
@@ -465,18 +472,29 @@ class YouTubeScraperService(ProxyRotatingService):
         channel ``pageHeaderRenderer`` format, where the count is just a string
         like "860K subscribers" buried in a ``content``/``accessibilityLabel``
         field (no dedicated subscriber key)."""
-        # 1. Legacy field (watch page, older channel headers).
-        sub_texts = self.find_nested_keys(next_data, "subscriberCountText")
-        for text in sub_texts:
-            val = self.parse_runs(text)
-            if val:
-                return val
-        # 2. Modern channel page: scan content/label strings for "... subscribers".
+        # A channel browse page also embeds OTHER channels (featured-channels
+        # shelf, related-channels rails), each with its own subscriberCountText.
+        # A whole-tree scan returns whichever comes first in tree order — usually
+        # one of those small featured channels, not the page owner — which made
+        # search-side sub counts wildly low. So when a channel header is present,
+        # scope extraction to the owner's header subtree; only fall back to the
+        # whole document (watch page, which has no channel header) otherwise.
         pattern = re.compile(r"[\d][\d.,]*\s*[KMB]?\s+subscribers?\b", re.IGNORECASE)
-        for key in ("content", "accessibilityLabel", "simpleText"):
-            for s in self.find_nested_keys(next_data, key):
-                if isinstance(s, str) and pattern.search(s):
-                    return s
+        scopes: List[Any] = []
+        for hdr in ("c4TabbedHeaderRenderer", "pageHeaderRenderer"):
+            scopes.extend(self.find_nested_keys(next_data, hdr))
+        scopes.append(next_data)  # watch page / no-header fallback
+        for scope in scopes:
+            # 1. Legacy field (watch page, older channel headers).
+            for text in self.find_nested_keys(scope, "subscriberCountText"):
+                val = self.parse_runs(text)
+                if val:
+                    return val
+            # 2. Modern channel page: scan content/label strings for "... subscribers".
+            for key in ("content", "accessibilityLabel", "simpleText"):
+                for s in self.find_nested_keys(scope, key):
+                    if isinstance(s, str) and pattern.search(s):
+                        return s
         return ""
 
     @staticmethod
@@ -682,29 +700,43 @@ class YouTubeScraperService(ProxyRotatingService):
         only fall back to the rotating pool if direct fails outright. Streaming
         URLs still require a poToken and won't appear here — use the yt-dlp-backed
         /download route for those.
+
+        When the WEB client is bot-gated ("Sign in to confirm you're not a bot")
+        it returns NO videoDetails even from a clean IP, so viewCount comes back
+        as 0. The ANDROID_VR InnerTube client isn't subject to that gate and
+        still returns videoDetails (views/length) without a poToken, so it's the
+        last fallback before giving up.
         """
-        payload = {
-            "context": self._get_client_context("WEB"),
-            "videoId": video_id,
-            # Ask for age/racy-gated details too, so videoDetails aren't withheld.
-            "contentCheckOk": True,
-            "racyCheckOk": True,
-        }
-        # 1. Direct first (clean IP → full videoDetails).
-        try:
-            data = await self._execute_post("player", payload, max_retries=2, force_direct=True)
-            if data.get("videoDetails"):
-                return data
-        except Exception as e:
-            logger.warn("player_direct_failed", video_id=video_id, error=str(e))
-            data = {}
-        # 2. Fall back to the proxy pool (last resort; may return stripped data).
-        try:
-            pooled = await self._execute_post("player", payload)
-            if pooled.get("videoDetails") or not data:
-                return pooled
-        except Exception as e:
-            logger.warn("player_pool_failed", video_id=video_id, error=str(e))
+        def _payload(client: str) -> dict:
+            return {
+                "context": self._get_client_context(client),
+                "videoId": video_id,
+                # Ask for age/racy-gated details too, so videoDetails aren't withheld.
+                "contentCheckOk": True,
+                "racyCheckOk": True,
+            }
+
+        # WEB direct (clean IP) → WEB pool → ANDROID_VR direct → ANDROID_VR pool.
+        # Each later step only matters if the prior returned no videoDetails (the
+        # bot gate strips them). force_direct=True on the direct legs.
+        # ponytail: ANDROID_VR reuses the WEB innertube key — works on the player
+        # endpoint today; if it starts 400-ing, add a client-specific key.
+        attempts = [("WEB", True), ("WEB", False), ("ANDROID_VR", True), ("ANDROID_VR", False)]
+        data: dict = {}
+        for client, direct in attempts:
+            try:
+                resp = await self._execute_post(
+                    "player", _payload(client),
+                    max_retries=2 if direct else config.YOUTUBE_MAX_RETRIES,
+                    force_direct=direct,
+                )
+            except Exception as e:
+                logger.warn("player_attempt_failed", video_id=video_id,
+                            client=client, direct=direct, error=str(e))
+                continue
+            if resp.get("videoDetails"):
+                return resp
+            data = data or resp  # keep first stripped response as a last resort
         return data
 
     async def search(self, query: str, sort: str = "relevance", timeframe: str = "all", limit: int = 20, location: Optional[str] = None, max_subscribers: Optional[int] = None) -> Dict[str, Any]:
