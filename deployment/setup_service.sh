@@ -26,7 +26,9 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 SERVICE_NAME="reddit_scraper.service"
+MCP_SERVICE_NAME="reddit_scraper_mcp.service"
 SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}"
+MCP_SERVICE_PATH="/etc/systemd/system/${MCP_SERVICE_NAME}"
 DEPLOY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 PROJECT_ROOT="$(dirname "${DEPLOY_DIR}")"
 
@@ -49,14 +51,30 @@ else
     echo -e "${GREEN}==> Xvfb already installed.${NC}"
 fi
 
-# 1. Copy the service template
+# 0b. Ensure Python deps (incl. fastmcp for the MCP server) are installed in the
+#     venv the units use. Idempotent — pip skips what's already present.
+PY=""
+if [ -f "${PROJECT_ROOT}/venv/bin/python" ]; then PY="${PROJECT_ROOT}/venv/bin/python";
+elif [ -f "${PROJECT_ROOT}/myenv312/bin/python" ]; then PY="${PROJECT_ROOT}/myenv312/bin/python"; fi
+if [ -n "${PY}" ]; then
+    echo -e "${GREEN}==> Installing/updating Python deps in venv (fastmcp, etc.)...${NC}"
+    "${PY}" -m pip install -q -r "${PROJECT_ROOT}/requirements.txt" || \
+        echo -e "${RED}pip install failed — install requirements.txt manually before starting.${NC}"
+else
+    echo -e "${RED}No venv found (venv/ or myenv312/). Create one and pip install -r requirements.txt, or the MCP unit will fail on 'No module named fastmcp'.${NC}"
+fi
+
+# 1. Copy the service templates (API + MCP)
 echo -e "${GREEN}==> Copying service configuration to ${SERVICE_PATH}...${NC}"
 cp "${DEPLOY_DIR}/${SERVICE_NAME}" "${SERVICE_PATH}"
+echo -e "${GREEN}==> Copying MCP service configuration to ${MCP_SERVICE_PATH}...${NC}"
+cp "${DEPLOY_DIR}/${MCP_SERVICE_NAME}" "${MCP_SERVICE_PATH}"
 
 # Update WorkingDirectory in case project root is not default /root/Scraper
 if [ "${PROJECT_ROOT}" != "/root/Scraper" ]; then
-    echo -e "${GREEN}==> Updating WorkDirectory in service file to ${PROJECT_ROOT}...${NC}"
+    echo -e "${GREEN}==> Updating WorkDirectory in service files to ${PROJECT_ROOT}...${NC}"
     sed -i "s|WorkingDirectory=/root/Scraper|WorkingDirectory=${PROJECT_ROOT}|g" "${SERVICE_PATH}"
+    sed -i "s|WorkingDirectory=/root/Scraper|WorkingDirectory=${PROJECT_ROOT}|g" "${MCP_SERVICE_PATH}"
 fi
 
 # 2. Reload systemd to load the new service

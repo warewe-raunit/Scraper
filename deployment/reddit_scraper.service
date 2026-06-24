@@ -1,6 +1,10 @@
 [Unit]
 Description=Reddit Stealth Scraper FastAPI Gateway
 After=network.target
+# Pull the MCP server up alongside the API: `systemctl start reddit_scraper.service`
+# also starts reddit_scraper_mcp.service (which is PartOf= this unit, so it also
+# stops/restarts with it). Wants= (not Requires=) so a failed MCP never blocks the API.
+Wants=reddit_scraper_mcp.service
 
 [Service]
 Type=simple

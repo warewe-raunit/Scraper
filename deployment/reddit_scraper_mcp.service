@@ -1,0 +1,35 @@
+[Unit]
+Description=Reddit Stealth Scraper — MCP server (HTTP transport)
+# Start after the API and tie our lifecycle to it: PartOf means stop/restart of
+# reddit_scraper.service propagates here, and the API unit's Wants= pulls us in
+# on start. So `systemctl start reddit_scraper.service` brings up both.
+After=network.target reddit_scraper.service
+PartOf=reddit_scraper.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/Scraper
+Environment=PYTHONUNBUFFERED=1
+# Hosted HTTP MCP, co-located with the API. API_KEY is read from .env by
+# mcp_server.py (load_dotenv), so it stays out of this unit file.
+Environment=MCP_TRANSPORT=http
+Environment=MCP_PORT=9000
+Environment=SCRAPER_BASE_URL=http://127.0.0.1:18080
+
+# No xvfb / no browser here — the MCP is a thin HTTP client to the API. It fetches
+# the API's OpenAPI on boot; if the API isn't ready yet it exits non-zero and
+# systemd retries (Restart) until /openapi.json is up.
+ExecStart=/bin/bash -c '\
+  if [ -f venv/bin/python ]; then PY=venv/bin/python; \
+  elif [ -f myenv312/bin/python ]; then PY=myenv312/bin/python; \
+  else PY=python3; fi; \
+  exec "$PY" mcp_server.py'
+
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
