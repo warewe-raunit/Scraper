@@ -461,6 +461,14 @@ url = "http://<server>:9000/mcp/"
 > behind a reverse proxy / bearer token. Anyone who can reach the URL can call
 > the tools (and thus your scraper).
 
+#### HTTPS via nginx (required for Claude Desktop)
+
+Claude Desktop connectors need HTTPS, and plain http on a public IP is
+unencrypted. Put nginx + Let's Encrypt in front — config and steps in
+[`deployment/nginx-scraper-mcp.conf`](deployment/nginx-scraper-mcp.conf).
+Needs a domain pointed at the server (certs aren't issued for bare IPs).
+Result: `https://<your-domain>/mcp/`, which works in Desktop, Code, and Codex.
+
 ---
 
 ## Install as a plugin (Claude Code, Codex, any agent)
