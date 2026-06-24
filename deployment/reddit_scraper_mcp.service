@@ -19,12 +19,9 @@ Environment=SCRAPER_BASE_URL=http://127.0.0.1:18080
 
 # No xvfb / no browser here — the MCP is a thin HTTP client to the API. It fetches
 # the API's OpenAPI on boot; if the API isn't ready yet it exits non-zero and
-# systemd retries (Restart) until /openapi.json is up.
-ExecStart=/bin/bash -c '\
-  if [ -f venv/bin/python ]; then PY=venv/bin/python; \
-  elif [ -f myenv312/bin/python ]; then PY=myenv312/bin/python; \
-  else PY=python3; fi; \
-  exec "$PY" mcp_server.py'
+# systemd retries (Restart) until /openapi.json is up. Launch via script so
+# systemd never parses shell quoting; it prefers the isolated mcp-venv.
+ExecStart=/bin/bash deployment/start_mcp.sh
 
 Restart=always
 RestartSec=5

@@ -51,17 +51,18 @@ else
     echo -e "${GREEN}==> Xvfb already installed.${NC}"
 fi
 
-# 0b. Ensure Python deps (incl. fastmcp for the MCP server) are installed in the
-#     venv the units use. Idempotent — pip skips what's already present.
-PY=""
-if [ -f "${PROJECT_ROOT}/venv/bin/python" ]; then PY="${PROJECT_ROOT}/venv/bin/python";
-elif [ -f "${PROJECT_ROOT}/myenv312/bin/python" ]; then PY="${PROJECT_ROOT}/myenv312/bin/python"; fi
-if [ -n "${PY}" ]; then
-    echo -e "${GREEN}==> Installing/updating Python deps in venv (fastmcp, etc.)...${NC}"
-    "${PY}" -m pip install -q -r "${PROJECT_ROOT}/requirements.txt" || \
-        echo -e "${RED}pip install failed — install requirements.txt manually before starting.${NC}"
-else
-    echo -e "${RED}No venv found (venv/ or myenv312/). Create one and pip install -r requirements.txt, or the MCP unit will fail on 'No module named fastmcp'.${NC}"
+# 0b. Build an ISOLATED venv for the MCP server. fastmcp pins starlette/anyio
+#     versions that conflict with the API's, so it must NOT share the API venv
+#     (installing it there crash-loops the API). The MCP unit prefers mcp-venv.
+MCP_VENV="${PROJECT_ROOT}/mcp-venv"
+echo -e "${GREEN}==> Setting up isolated MCP venv at ${MCP_VENV}...${NC}"
+if [ ! -d "${MCP_VENV}" ]; then
+    python3 -m venv "${MCP_VENV}" || echo -e "${RED}Failed to create mcp-venv — is python3-venv installed?${NC}"
+fi
+if [ -x "${MCP_VENV}/bin/pip" ]; then
+    "${MCP_VENV}/bin/pip" install -q --upgrade pip
+    "${MCP_VENV}/bin/pip" install -q "fastmcp>=2,<3" "python-dotenv>=1.0.0" || \
+        echo -e "${RED}Failed to install fastmcp into mcp-venv — the MCP unit will fail until fixed.${NC}"
 fi
 
 # 1. Copy the service templates (API + MCP)

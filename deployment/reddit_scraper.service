@@ -16,21 +16,12 @@ Environment=PYTHONUNBUFFERED=1
 # so it can't be flipped to headless by a stale .env value.
 Environment=LINKEDIN_RELOGIN_HEADLESS=false
 
-# Launch the whole app under a virtual X display (Xvfb) via xvfb-run, so any
-# headful Chromium the relogin launches has a display to render into. xvfb-run -a
-# auto-picks a free display number and exports DISPLAY for the process. Requires
-# the `xvfb` package (setup_service.sh installs it).
-# Auto-detect the venv (venv/ or myenv312/) and exec uvicorn under xvfb.
-# Worker count comes from .env (the app's source of truth via load_dotenv) so
-# uvicorn's --workers and the app's per-worker rate-limit partition stay in lockstep.
-ExecStart=/bin/bash -c '\
-  if [ -f venv/bin/uvicorn ]; then PY=venv/bin/python; \
-  elif [ -f myenv312/bin/uvicorn ]; then PY=myenv312/bin/python; \
-  else PY=python3; fi; \
-  W=$(grep -E "^API_WORKERS=" .env 2>/dev/null | tail -1 | cut -d= -f2 | cut -d"#" -f1 | tr -d " \""); \
-  W=${W:-${API_WORKERS:-4}}; \
-  exec xvfb-run -a --server-args="-screen 0 1920x1080x24 -ac -nolisten tcp" \
-    "$PY" -m uvicorn api.main:app --host 0.0.0.0 --port 18080 --workers ${W}'
+# Launch via a script (deployment/start_api.sh) rather than an inline command:
+# the script detects the venv, reads API_WORKERS from .env, and wraps uvicorn in
+# xvfb-run for the headful relogin browser. Inlining this broke because systemd
+# mangled the nested quotes in the worker-count grep. Relative path resolves
+# against WorkingDirectory, so no per-host path rewriting is needed.
+ExecStart=/bin/bash deployment/start_api.sh
 
 Restart=always
 RestartSec=5
