@@ -466,19 +466,23 @@ url = "http://<server>:9000/mcp/"
 ## Install as a plugin (Claude Code, Codex, any agent)
 
 This repo is also a **Claude Code plugin** (`.claude-plugin/`) that bundles the
-MCP server above plus a `social-research` skill — research a topic/person across
-all four sources and get a cited briefing ranked by engagement.
+`social-research` skill plus an MCP connection to the **hosted** server — research
+a topic/person across all four sources and get a cited briefing ranked by
+engagement.
 
-**Prereqs (every method):** the API must be running, and the agent's environment
-needs `SCRAPER_BASE_URL` + `API_KEY` set, plus `pip install -r requirements.txt`
-(for the `fastmcp` MCP) and `python` on PATH.
+The plugin's `.mcp.json` points at the hosted HTTP MCP
+(`http://107.174.35.26:9000/mcp/`), so installing it needs **nothing local** —
+no python, no `pip`, no API key (the server holds it). Just:
 
-**Claude Code** — install the plugin (registers the MCP server + skill):
+**Claude Code** — install the plugin (skill + hosted MCP, zero setup):
 ```
 /plugin marketplace add warewe-raunit/Scraper
 /plugin install stealth-scraper
 ```
 Then `/social-research <topic>`, or just ask "what are people saying about X".
+
+> Self-hosting your own instance? Edit `.mcp.json` to your own MCP URL (or revert
+> it to the local-spawn config in git history that uses `${CLAUDE_PLUGIN_ROOT}/mcp_server.py`).
 
 **Codex / Cursor / Copilot / Gemini / Windsurf** — the skill is portable via the
 Agent Skills CLI:

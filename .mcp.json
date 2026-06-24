@@ -1,12 +1,8 @@
 {
   "mcpServers": {
     "scraper": {
-      "command": "python",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/mcp_server.py"],
-      "env": {
-        "SCRAPER_BASE_URL": "${SCRAPER_BASE_URL:-http://127.0.0.1:8000}",
-        "API_KEY": "${API_KEY}"
-      }
+      "type": "http",
+      "url": "http://107.174.35.26:9000/mcp/"
     }
   }
 }
