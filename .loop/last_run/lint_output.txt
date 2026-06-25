@@ -1,1 +1,1 @@
-no ruff/flake8 config in repo; single-assert change, no lint gate to regress
+no ruff/flake8 config in repo; no lint gate to regress

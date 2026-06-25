@@ -1,1 +1,1 @@
-PASS — invariant assertion added; 106 tests pass, build/import OK, DoD met.
+PASS — background DB persistence unified off the response path (youtube/x/linkedin); 109 tests pass.
