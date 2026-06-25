@@ -786,11 +786,15 @@ class YouTubeScraperService(ProxyRotatingService):
         # Per-request channel sub-count cache: channel_id -> (text, count|None).
         sub_cache: Dict[str, tuple] = {}
         lookups_done = 0
+        scanned = 0            # total videos examined across all pages
+        dropped_over_cap = 0   # resolved but over max_subscribers
+        dropped_unresolved = 0 # channel lookup returned None (hidden OR failed)
 
         async def _passing(new_videos: List[dict]) -> List[dict]:
             """Resolve sub counts for new videos' channels and return only those
             at/under the cap (strict: hidden/unresolvable channels are dropped)."""
-            nonlocal lookups_done
+            nonlocal lookups_done, scanned, dropped_over_cap, dropped_unresolved
+            scanned += len(new_videos)
             # Unique channel ids we haven't resolved yet, bounded by the lookup ceiling.
             need = list(dict.fromkeys(
                 v.get("channel_id") for v in new_videos
@@ -816,18 +820,30 @@ class YouTubeScraperService(ProxyRotatingService):
             for v in new_videos:
                 cid = v.get("channel_id")
                 if not cid or cid not in sub_cache:
+                    dropped_unresolved += 1  # not looked up (ceiling) or no channel id
                     continue  # unresolved channel -> drop (strict)
                 text, count = sub_cache[cid]
-                if count is None or count > max_subscribers:
-                    continue  # hidden or over the cap -> drop
+                if count is None:
+                    dropped_unresolved += 1  # hidden OR lookup failed
+                    continue
+                if count > max_subscribers:
+                    dropped_over_cap += 1
+                    continue
                 kept.append({**v, "subscribers": text, "subscriber_count": count})
             return kept
 
         first = self.extract_videos(data)
         videos = (await _passing(first)) if filtering else first
 
+        # Why the scan stopped — so a caller can tell a trustworthy "0 results"
+        # (we scanned every available result) from a truncated one (we hit a
+        # ceiling and gave up). "limit_reached" / "results_exhausted" are
+        # complete; "lookup_ceiling" / "page_ceiling" are partial.
+        stop_reason = "results_exhausted"
         # Paginate until we have `limit` videos (passing, when filtering).
-        if len(videos) < limit:
+        if len(videos) >= limit:
+            stop_reason = "limit_reached"
+        else:
             tokens = self.find_nested_keys(data, "continuationItemRenderer")
             current_token = None
             if tokens:
@@ -838,6 +854,7 @@ class YouTubeScraperService(ProxyRotatingService):
             try:
                 while current_token and len(videos) < limit and pages < max_pages:
                     if filtering and lookups_done >= config.YOUTUBE_SUBFILTER_MAX_CHANNEL_LOOKUPS:
+                        stop_reason = "lookup_ceiling"
                         break  # lookup ceiling hit
                     pages += 1
                     next_payload = {
@@ -854,6 +871,7 @@ class YouTubeScraperService(ProxyRotatingService):
                         if not any(x["id"] == v["id"] for x in videos):
                             videos.append(v)
                             if len(videos) >= limit:
+                                stop_reason = "limit_reached"
                                 break
 
                     # Extract next continuation token
@@ -862,8 +880,13 @@ class YouTubeScraperService(ProxyRotatingService):
                         current_token = next_tokens[0].get("continuationEndpoint", {}).get("continuationCommand", {}).get("token")
                     else:
                         current_token = None
+                # Loop fell through without hitting a ceiling or the limit:
+                # either we ran out of pages to fetch or exhausted continuations.
+                if stop_reason == "results_exhausted" and pages >= max_pages and current_token:
+                    stop_reason = "page_ceiling"
             except Exception as e:
                 logger.warn("youtube_search_pagination_failed", query=query, error=str(e))
+                stop_reason = "error"
 
         # Slice results to requested limit
         videos = videos[:limit]
@@ -871,13 +894,28 @@ class YouTubeScraperService(ProxyRotatingService):
         if self.db:
             await self.db.save_youtube_videos(videos)
             
-        return {
+        result = {
             "query": query,
             "sort": sort,
             "timeframe": timeframe,
             "results_count": len(videos),
             "videos": videos
         }
+        # When filtering, tell the caller HOW complete this answer is, so a "0
+        # results" from a fully-scanned query is distinguishable from one that
+        # hit a ceiling and stopped early. `complete=False` means "there may be
+        # more matches I didn't scan" — not "no more matches exist".
+        if filtering:
+            result["filter"] = {
+                "max_subscribers": max_subscribers,
+                "complete": stop_reason in ("results_exhausted", "limit_reached"),
+                "stop_reason": stop_reason,
+                "scanned": scanned,
+                "channels_resolved": lookups_done,
+                "dropped_over_cap": dropped_over_cap,
+                "dropped_unresolved": dropped_unresolved,
+            }
+        return result
 
     async def get_video_details(self, url_or_id: str, comments_limit: int = 20, include_raw: bool = False) -> Dict[str, Any]:
         """Retrieve video details, stream formats, and comments using player and next APIs."""
