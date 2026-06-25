@@ -1,30 +1,31 @@
-# Self-critique — repo audit + background-save fix
+# Self-critique — youtube whole-data fix
 
-## Hostile-reviewer questions on the change
-- **Ordering**: youtube `get_video_details` previously awaited channel-save
-  before video-save. Now both are fire-and-forget — could a video FK reference a
-  not-yet-saved channel? Checked: saves are independent upserts on separate
-  tables, no in-request FK dependency; Supabase upserts are idempotent. Safe.
-- **Lost errors**: a failed write no longer fails the response. By design — the
-  scrape already succeeded; persistence is best-effort. Failures now log
-  `<svc>_bg_db_save_failed` instead of being awaited, so they're still visible.
-- **Task GC**: bg tasks held in a module-level set + discarded in the done
-  callback — the documented asyncio weak-ref pitfall is handled. Tested.
-- **No-loop path**: `save_bg` closes the coro when there's no running loop, so
-  sync callers (tests) don't leak. Tested.
+## Hostile-reviewer questions
+- **Type change on view_count/like_count** (str -> int in get_video_details):
+  the requested correctness fix. Raw kept under `view_count_text`/`like_count_text`,
+  and DB `save_youtube_videos` runs values through `_parse_int`, which accepts
+  ints. Risk = a consumer that string-matched `view_count`; mitigated by the
+  preserved `*_text` keys.
+- **`or 0` masks unknown views**: `parse_count_text(views) or 0` turns a None
+  (unparseable) into 0, indistinguishable from a true 0-view video. Accepted for
+  the watch endpoint — the player almost always returns viewCount; a numeric 0 is
+  safer for callers than null. Search videos keep `view_count: None` (no `or 0`)
+  so genuinely-unknown stays explicit.
+- **Lockup channel_name heuristic** ("first row that isn't views/time/duration"):
+  best-effort, never worse than the previous hard-coded "". Could pick a wrong
+  row if YouTube reorders metadata, but it's strictly additive. Test covers the
+  "New York Times" case that broke the old `"new"` substring check.
+- **`extract_subscriber_count(data)` in get_channel_videos**: already scopes to
+  the channel header (c4TabbedHeaderRenderer/pageHeaderRenderer) and ignores
+  featured-channel shelves — covered by existing tests. Reused, not reinvented.
 
-## What I did NOT change (deliberately, to avoid behavior drift)
-- `api/main.py:36` deprecated `asyncio.set_event_loop_policy` (Python 3.16
-  removal) — touching the Windows event-loop policy risks behavior change; queued.
-- Deep per-method review of `linkedin.py` (2435 lines) and the `tools/stealth/*`
-  fingerprint modules — not network hot paths; queued for the loop.
-
-## Coverage honesty
-This was a high-signal pattern sweep (blocking I/O, mutable defaults, N+1
-awaits, inline persistence), not a literal line-by-line read of all 25k lines.
-The sweep found the codebase already does the hard things right; the one real
-systemic latency issue (inline DB await in 3 of 4 services) is fixed. Remaining
-files are queued in backlog.md rather than rushed.
+## Not done (out of scope / lower value)
+- Comment `like_count` left as text — low value, and the entity payload already
+  pre-formats it; can add a numeric later if asked.
+- Live end-to-end verification against real YouTube — unit tests use synthetic
+  payloads mirroring the known shapes; a real call would confirm field paths but
+  needs proxies and is flaky in CI.
 
 ## Verdict
-No defect in the change. 109 tests pass. DoD met.
+133 tests pass; every endpoint now exposes numeric counts with raw text
+preserved. DoD met. No existing key removed or retyped without a `*_text` shadow.

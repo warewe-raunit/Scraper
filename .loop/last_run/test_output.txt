@@ -1,5 +1,5 @@
-........................................................................ [ 61%]
-..............................................                           [100%]
+........................................................................ [ 54%]
+.............................................................            [100%]
 ============================== warnings summary ===============================
 api\main.py:36
   C:\Users\aman\reddit_stealth_scraper\api\main.py:36: DeprecationWarning: 'asyncio.WindowsSelectorEventLoopPolicy' is deprecated and slated for removal in Python 3.16
@@ -10,4 +10,26 @@ api\main.py:36
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
-118 passed, 2 warnings in 17.12s
+133 passed, 2 warnings in 29.29s
+--- Logging error in Loguru Handler #1 ---
+Record was: {'elapsed': datetime.timedelta(seconds=5, microseconds=476593), 'exception': None, 'extra': {'logger_name': 'tools.proxy_provider', 'dropped': 149, 'blocklist_size': 350, 'kept': 1241, 'short': 'proxy_provider', 'ctx': 'dropped=149 blocklist_size=350 kept=1241', 'ctx_sep': '  '}, 'file': (name='logging_config.py', path='C:\\Users\\aman\\reddit_stealth_scraper\\tools\\logging_config.py'), 'function': '__call__', 'level': (name='INFO', no=20, icon='\u2139\ufe0f'), 'line': 66, 'message': 'goodproxies_blocklist_filtered', 'module': 'logging_config', 'name': 'tools.logging_config', 'process': (id=3392, name='MainProcess'), 'thread': (id=26032, name='proxy-health'), 'time': datetime(2026, 6, 25, 16, 18, 59, 283248, tzinfo=datetime.timezone(datetime.timedelta(seconds=19800), 'India Standard Time'))}
+Traceback (most recent call last):
+  File "C:\Users\aman\AppData\Roaming\Python\Python314\site-packages\loguru\_handler.py", line 315, in _queued_writer
+    self._sink.write(message)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^
+  File "C:\Users\aman\AppData\Roaming\Python\Python314\site-packages\loguru\_simple_sinks.py", line 16, in write
+    self._stream.write(message)
+    ~~~~~~~~~~~~~~~~~~^^^^^^^^^
+ValueError: I/O operation on closed file.
+--- End of logging error ---
+--- Logging error in Loguru Handler #1 ---
+Record was: {'elapsed': datetime.timedelta(seconds=5, microseconds=477742), 'exception': None, 'extra': {'logger_name': 'tools.proxy_provider', 'error': 'cannot schedule new futures after interpreter shutdown', 'short': 'proxy_provider', 'ctx': 'error=cannot schedule new futures after interpreter shutdown', 'ctx_sep': '  '}, 'file': (name='logging_config.py', path='C:\\Users\\aman\\reddit_stealth_scraper\\tools\\logging_config.py'), 'function': '__call__', 'level': (name='WARNING', no=30, icon='\u26a0\ufe0f'), 'line': 66, 'message': 'proxy_health_loop_error', 'module': 'logging_config', 'name': 'tools.logging_config', 'process': (id=3392, name='MainProcess'), 'thread': (id=26032, name='proxy-health'), 'time': datetime(2026, 6, 25, 16, 18, 59, 284397, tzinfo=datetime.timezone(datetime.timedelta(seconds=19800), 'India Standard Time'))}
+Traceback (most recent call last):
+  File "C:\Users\aman\AppData\Roaming\Python\Python314\site-packages\loguru\_handler.py", line 315, in _queued_writer
+    self._sink.write(message)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^
+  File "C:\Users\aman\AppData\Roaming\Python\Python314\site-packages\loguru\_simple_sinks.py", line 16, in write
+    self._stream.write(message)
+    ~~~~~~~~~~~~~~~~~~^^^^^^^^^
+ValueError: I/O operation on closed file.
+--- End of logging error ---
