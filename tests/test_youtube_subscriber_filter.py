@@ -86,6 +86,39 @@ def test_filter_keeps_under_cap_drops_over_and_hidden(monkeypatch):
     assert out["videos"][0]["subscribers"] == "5K subscribers"
 
 
+def test_filter_reports_completeness_and_drop_breakdown(monkeypatch):
+    """A filtered search must report whether the scan was complete and why it
+    stopped, so a '0 results' that exhausted the pool is distinguishable from
+    one truncated by a ceiling. Single page, no continuation -> complete."""
+    svc = _svc(monkeypatch)
+
+    counts = {"UCsmall": ("5K subscribers", 5_000), "UCbig": ("2M", 2_000_000),
+              "UChidden": ("", None)}
+
+    async def _resolve(cid):
+        return counts[cid]
+    monkeypatch.setattr(svc, "get_channel_subscriber_count", _resolve)
+
+    page = [_video("a", "UCsmall"), _video("b", "UCbig"), _video("c", "UChidden")]
+    monkeypatch.setattr(svc, "extract_videos", lambda data: page)
+
+    async def _exec(endpoint, payload, **kw):
+        return {}  # no continuation -> exhausted in one page
+    monkeypatch.setattr(svc, "_execute_post", _exec)
+
+    out = asyncio.run(svc.search("q", limit=10, max_subscribers=10_000))
+    f = out["filter"]
+    assert f["complete"] is True
+    assert f["stop_reason"] == "results_exhausted"
+    assert f["scanned"] == 3
+    assert f["dropped_over_cap"] == 1      # UCbig
+    assert f["dropped_unresolved"] == 1    # UChidden
+    assert out["results_count"] == 1       # UCsmall kept
+    # Invariant: every scanned video lands in exactly one bucket. If this breaks,
+    # the completeness counters are lying and a "0 results" answer can't be trusted.
+    assert out["results_count"] + f["dropped_over_cap"] + f["dropped_unresolved"] == f["scanned"]
+
+
 def test_none_is_noop_no_channel_lookups(monkeypatch):
     svc = _svc(monkeypatch)
 

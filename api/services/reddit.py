@@ -32,25 +32,13 @@ logger = structlog.get_logger(__name__)
 
 # Background DB writes: persisting to Supabase must NOT block the scrape response
 # (the upsert is a ~200ms network call that also consumes a shared-threadpool slot
-# per request — under concurrency it halves effective capacity). Fire-and-forget,
-# tracked in a set so the task isn't garbage-collected mid-flight.
-_bg_tasks: set = set()
-
-
-def _bg_save_done(task) -> None:
-    _bg_tasks.discard(task)
-    if not task.cancelled() and task.exception() is not None:
-        # Fire-and-forget, but a dropped Supabase write should not be invisible.
-        logger.warning("reddit_bg_db_save_failed", error=str(task.exception()))
+# per request — under concurrency it halves effective capacity). Shared helper so
+# reddit/youtube/x stay consistent; keep the local name for existing call sites.
+from api.services.bg_save import save_bg
 
 
 def _save_bg(coro) -> None:
-    try:
-        t = asyncio.get_running_loop().create_task(coro)
-        _bg_tasks.add(t)
-        t.add_done_callback(_bg_save_done)
-    except RuntimeError:
-        coro.close()  # no running loop — drop the coroutine cleanly
+    save_bg(coro, log_event="reddit_bg_db_save_failed")
 
 
 class _ConcurrencyCap:

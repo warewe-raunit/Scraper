@@ -23,6 +23,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 # No browser manager import needed since we use direct HTTP requests via curl_cffi.
+from api.services.bg_save import save_bg
 
 logger = structlog.get_logger(__name__)
 SESSIONS_DIR = ROOT / "sessions"
@@ -1318,10 +1319,7 @@ class LinkedInScraperService:
         
         # Save to database if db service configured
         if self.db and hasattr(self.db, "save_linkedin_profile"):
-            try:
-                await self.db.save_linkedin_profile(public_id, raw_data)
-            except Exception as e:
-                logger.error("failed_to_save_profile_to_db", public_id=public_id, error=str(e))
+            save_bg(self.db.save_linkedin_profile(public_id, raw_data), log_event="linkedin_bg_db_save_failed")
                 
         return {
             "success": True,

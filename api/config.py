@@ -101,6 +101,10 @@ YOUTUBE_REQUEST_TIMEOUT = _env_int("YOUTUBE_REQUEST_TIMEOUT", 15)
 # burning the full request timeout before we move on or fall back to direct.
 YOUTUBE_PROXY_REQUEST_TIMEOUT = _env_int("YOUTUBE_PROXY_REQUEST_TIMEOUT", 8)
 YOUTUBE_KEY_REQUEST_TIMEOUT = _env_int("YOUTUBE_KEY_REQUEST_TIMEOUT", 10)
+# How long a resolved INNERTUBE_API_KEY is reused before a proactive re-fetch.
+# The key is a static public value, so this is a slow safety net (default 6h),
+# not a per-session token TTL; a key-rejected 400 invalidates it immediately.
+YOUTUBE_INNERTUBE_KEY_TTL = _env_int("YOUTUBE_INNERTUBE_KEY_TTL", 21600)
 YOUTUBE_MAX_RETRIES = _env_int("YOUTUBE_MAX_RETRIES", 8)
 YOUTUBE_PROXY_COOLDOWN_SECONDS = _env_int("YOUTUBE_PROXY_COOLDOWN_SECONDS", 300)
 # InnerTube is a public API that works without a proxy. After this many proxy

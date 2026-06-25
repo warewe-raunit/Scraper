@@ -24,6 +24,7 @@ if str(ROOT) not in sys.path:
 from tools.browser_manager import launch_browser
 from api.services.proxy_base import ProxyRotatingService
 from api.search_locations import hl_for_country
+from api.services.bg_save import save_bg
 from api import config
 
 logger = structlog.get_logger(__name__)
@@ -38,6 +39,7 @@ class YouTubeScraperService(ProxyRotatingService):
     def __init__(self, db: Optional[Any] = None):
         super().__init__(db, pool_label="youtube_proxy")
         self._api_key: Optional[str] = None
+        self._api_key_expires_at: float = 0.0  # monotonic deadline; 0 = no key cached
         self._api_key_lock = asyncio.Lock()
         # Cross-request channel subscriber-count cache (channel_id -> (text, count,
         # expiry_monotonic)). Sub counts barely move, and popular channels recur
@@ -49,92 +51,125 @@ class YouTubeScraperService(ProxyRotatingService):
         logger.info("youtube_scraper_service_initialized", proxy_count=len(self.proxy_pool))
 
     async def _get_innertube_key(self, max_retries: int = 2) -> str:
+        """Return a cached INNERTUBE_API_KEY, re-fetching once its TTL lapses.
+
+        The key is a static public value, but caching it forever means a stale
+        one (YouTube rotates it, or the hardcoded fallback ages out) can never
+        self-heal — every request would keep reusing the dead key and burn the
+        retry budget. A TTL forces a periodic re-fetch; `_invalidate_innertube_key`
+        forces one immediately when a request comes back key-rejected.
         """
-        Extract the INNERTUBE_API_KEY from YouTube.
-        1. Check cached key.
-        2. Make GET request to YouTube homepage.
-        3. Use Playwright to extract key if GET is blocked.
-        4. Fall back to hardcoded public key.
-        """
-        if self._api_key:
+        now = time.monotonic()
+        if self._api_key and now < self._api_key_expires_at:
             return self._api_key
 
         async with self._api_key_lock:
-            # Recheck inside lock
-            if self._api_key:
+            # Recheck inside lock — another coroutine may have refreshed it.
+            now = time.monotonic()
+            if self._api_key and now < self._api_key_expires_at:
                 return self._api_key
 
-            # Method 1: GET request extraction with retries
-            max_key_retries = 3
-            for attempt in range(1, max_key_retries + 1):
-                proxy = self._get_next_proxy()
-                try:
-                    loop = asyncio.get_running_loop()
-                    session = requests.Session()
-                    if proxy:
-                        session.proxies = {"http": proxy, "https": proxy}
-                    
-                    headers = {
-                        "user-agent": config.YOUTUBE_DEFAULT_USER_AGENT,
-                        "accept-language": "en-US,en;q=0.9",
-                    }
+            key, is_fallback = await self._fetch_innertube_key(max_retries)
+            self._api_key = key
+            # Real key: cache for the full TTL. Fallback constant: cache only
+            # briefly so the next request retries live extraction instead of
+            # getting stuck on the last-resort key.
+            ttl = config.YOUTUBE_INNERTUBE_KEY_TTL
+            self._api_key_expires_at = time.monotonic() + (min(ttl, 300) if is_fallback else ttl)
+            return key
 
-                    response = await loop.run_in_executor(
-                        None,
-                        lambda: session.get("https://www.youtube.com/", headers=headers, impersonate=config.HTTP_IMPERSONATE, timeout=config.YOUTUBE_KEY_REQUEST_TIMEOUT)
-                    )
-                    
-                    if response.status_code == 200:
-                        match = re.search(r'"INNERTUBE_API_KEY":"([^"]+)"', response.text)
-                        if match:
-                            self._api_key = match.group(1)
-                            logger.info("extracted_innertube_key_via_http", key=self._api_key[:10] + "...", attempt=attempt)
-                            return self._api_key
-                    else:
-                        if proxy:
-                            self._cool_down_proxy(proxy, duration_seconds=config.YOUTUBE_PROXY_COOLDOWN_SECONDS)
-                        logger.warn("http_innertube_key_extraction_non_200", status=response.status_code, attempt=attempt)
-                except Exception as e:
+    def _invalidate_innertube_key(self) -> None:
+        """Drop the cached key so the next `_get_innertube_key` re-fetches."""
+        self._api_key = None
+        self._api_key_expires_at = 0.0
+
+    @staticmethod
+    def _innertube_key_rejected(status: int, body: str) -> bool:
+        """True when a non-200 looks like the InnerTube key itself was rejected
+        (refreshing it helps) rather than generic bot-gating (it won't). YouTube
+        has no key-validation endpoint, so this is a string match on the 400
+        body — widen the markers if a new phrasing slips through.
+        # ponytail: heuristic match; tighten only if a real 400 is misclassified.
+        """
+        if status != 400:
+            return False
+        b = body.lower()
+        return any(m in b for m in ("api key", "api_key", "keyinvalid", "key_invalid"))
+
+    async def _fetch_innertube_key(self, max_retries: int = 2) -> tuple:
+        """Resolve a fresh INNERTUBE_API_KEY. Returns ``(key, is_fallback)``.
+        1. GET request to YouTube homepage (with retries).
+        2. Playwright extraction if GET is blocked.
+        3. Hardcoded public key as last resort (is_fallback=True).
+        """
+        # Method 1: GET request extraction with retries
+        max_key_retries = 3
+        for attempt in range(1, max_key_retries + 1):
+            proxy = self._get_next_proxy()
+            try:
+                loop = asyncio.get_running_loop()
+                session = requests.Session()
+                if proxy:
+                    session.proxies = {"http": proxy, "https": proxy}
+
+                headers = {
+                    "user-agent": config.YOUTUBE_DEFAULT_USER_AGENT,
+                    "accept-language": "en-US,en;q=0.9",
+                }
+
+                response = await loop.run_in_executor(
+                    None,
+                    lambda: session.get("https://www.youtube.com/", headers=headers, impersonate=config.HTTP_IMPERSONATE, timeout=config.YOUTUBE_KEY_REQUEST_TIMEOUT)
+                )
+
+                if response.status_code == 200:
+                    match = re.search(r'"INNERTUBE_API_KEY":"([^"]+)"', response.text)
+                    if match:
+                        logger.info("extracted_innertube_key_via_http", key=match.group(1)[:10] + "...", attempt=attempt)
+                        return match.group(1), False
+                else:
                     if proxy:
                         self._cool_down_proxy(proxy, duration_seconds=config.YOUTUBE_PROXY_COOLDOWN_SECONDS)
-                    logger.warn("http_innertube_key_extraction_failed", attempt=attempt, error=str(e))
-                    if attempt < max_key_retries:
-                        await asyncio.sleep(0.5)
-
-            # Method 2: Playwright fallback
-            try:
-                logger.info("falling_back_to_playwright_for_key")
-                pw_proxy = self._get_next_proxy()
-                pw, browser, context, page = await launch_browser(
-                    account_id="acc_01",
-                    proxy_url=pw_proxy,
-                    headless=True
-                )
-                try:
-                    await page.goto("https://www.youtube.com/", wait_until="domcontentloaded", timeout=20000)
-                    key = await page.evaluate("() => window.ytcfg ? window.ytcfg.get('INNERTUBE_API_KEY') : null")
-                    if not key:
-                        html = await page.content()
-                        match = re.search(r'"INNERTUBE_API_KEY":"([^"]+)"', html)
-                        if match:
-                            key = match.group(1)
-                    
-                    if key:
-                        self._api_key = key
-                        logger.info("extracted_innertube_key_via_playwright", key=key[:10] + "...")
-                        return key
-                finally:
-                    await context.close()
-                    await browser.close()
-                    await pw.stop()
+                    logger.warn("http_innertube_key_extraction_non_200", status=response.status_code, attempt=attempt)
             except Exception as e:
-                logger.warn("playwright_innertube_key_extraction_failed", error=str(e))
+                if proxy:
+                    self._cool_down_proxy(proxy, duration_seconds=config.YOUTUBE_PROXY_COOLDOWN_SECONDS)
+                logger.warn("http_innertube_key_extraction_failed", attempt=attempt, error=str(e))
+                if attempt < max_key_retries:
+                    await asyncio.sleep(0.5)
 
-            # Method 3: Last-resort public key (overridable via env).
-            fallback_key = config.YOUTUBE_FALLBACK_INNERTUBE_KEY
-            logger.warn("using_fallback_innertube_key", key=fallback_key[:10] + "...")
-            self._api_key = fallback_key
-            return fallback_key
+        # Method 2: Playwright fallback
+        try:
+            logger.info("falling_back_to_playwright_for_key")
+            pw_proxy = self._get_next_proxy()
+            pw, browser, context, page = await launch_browser(
+                account_id="acc_01",
+                proxy_url=pw_proxy,
+                headless=True
+            )
+            try:
+                await page.goto("https://www.youtube.com/", wait_until="domcontentloaded", timeout=20000)
+                key = await page.evaluate("() => window.ytcfg ? window.ytcfg.get('INNERTUBE_API_KEY') : null")
+                if not key:
+                    html = await page.content()
+                    match = re.search(r'"INNERTUBE_API_KEY":"([^"]+)"', html)
+                    if match:
+                        key = match.group(1)
+
+                if key:
+                    logger.info("extracted_innertube_key_via_playwright", key=key[:10] + "...")
+                    return key, False
+            finally:
+                await context.close()
+                await browser.close()
+                await pw.stop()
+        except Exception as e:
+            logger.warn("playwright_innertube_key_extraction_failed", error=str(e))
+
+        # Method 3: Last-resort public key (overridable via env).
+        fallback_key = config.YOUTUBE_FALLBACK_INNERTUBE_KEY
+        logger.warn("using_fallback_innertube_key", key=fallback_key[:10] + "...")
+        return fallback_key, True
 
     def _get_client_context(self, client_name: str = "WEB", user_agent: Optional[str] = None, country: Optional[str] = None) -> dict:
         """Build the client context required by InnerTube endpoints.
@@ -232,12 +267,14 @@ class YouTubeScraperService(ProxyRotatingService):
                 
         thumbnails = renderer.get("thumbnail", {}).get("thumbnails", [])
         
+        views_display = views_text or short_views_text
         return {
             "id": video_id,
             "video_id": video_id,
             "title": title,
             "description": desc_snippet,
-            "views": views_text or short_views_text,
+            "views": views_display,
+            "view_count": self.parse_count_text(views_display),
             "published_time": published_time,
             "duration": length_text,
             "channel_name": channel_name,
@@ -264,12 +301,18 @@ class YouTubeScraperService(ProxyRotatingService):
             elif isinstance(part, str):
                 contents.append(part)
                 
+        channel_name = ""
         for c in contents:
-            if "views" in c.lower() or "watching" in c.lower():
+            cl = c.lower()
+            if "views" in cl or "watching" in cl:
                 views_text = c
-            elif "ago" in c.lower() or "streamed" in c.lower() or "new" in c.lower():
+            elif "ago" in cl or "streamed" in cl or "premiered" in cl:
                 published_time = c
-                
+            elif not channel_name and not re.match(r"^\d+(?::\d+)+$", c.strip()):
+                # First row that isn't views/time/duration is the channel name
+                # (the new lockup UI buries it here instead of a byline field).
+                channel_name = c
+
         # Duration
         length_text = ""
         badges = self.find_nested_keys(vm, "thumbnailBadgeViewModel")
@@ -303,9 +346,10 @@ class YouTubeScraperService(ProxyRotatingService):
             "title": title,
             "description": "",
             "views": views_text,
+            "view_count": self.parse_count_text(views_text),
             "published_time": published_time,
             "duration": length_text,
-            "channel_name": "",
+            "channel_name": channel_name,
             "channel_id": channel_id,
             "channel_url": f"https://www.youtube.com/channel/{channel_id}" if channel_id else "",
             "thumbnails": thumbnails,
@@ -498,25 +542,24 @@ class YouTubeScraperService(ProxyRotatingService):
         return ""
 
     @staticmethod
-    def parse_subscriber_text(text: Optional[str]) -> Optional[int]:
-        """Parse YouTube's subscriber-count text into an integer, or None when
-        hidden/unparseable.
+    def parse_count_text(text: Optional[str]) -> Optional[int]:
+        """Parse any YouTube count string into an integer, or None when
+        absent/unparseable. Works for views, likes, and subscribers alike.
 
         Handles abbreviated forms (K/M/B, which YouTube rounds, so the result is
-        approximate near boundaries) and plain comma-grouped counts:
-            "1.2M subscribers" -> 1_200_000
+        approximate near boundaries), plain comma-grouped counts, and raw ints:
+            "1.2M views"        -> 1_200_000
             "12.3K subscribers" -> 12_300
-            "1,234 subscribers" -> 1_234
-            "1.1B subscribers"  -> 1_100_000_000
-            "No subscribers" / "" / None -> None
+            "1,234 likes"       -> 1_234
+            "12345"             -> 12_345
+            "No views" / "" / None -> None
         """
         if not text:
             return None
-        m = re.search(r"([\d,]+(?:\.\d+)?)\s*([KMB])?", text, re.IGNORECASE)
+        m = re.search(r"([\d,]+(?:\.\d+)?)\s*([KMB])?", str(text), re.IGNORECASE)
         if not m:
             return None
-        num_str, suffix = m.group(1), m.group(2)
-        num_str = num_str.replace(",", "")
+        num_str, suffix = m.group(1).replace(",", ""), m.group(2)
         try:
             value = float(num_str)
         except ValueError:
@@ -525,6 +568,12 @@ class YouTubeScraperService(ProxyRotatingService):
             (suffix or "").lower(), 1
         )
         return int(value * mult)
+
+    @staticmethod
+    def parse_subscriber_text(text: Optional[str]) -> Optional[int]:
+        """Subscriber-count text -> int, or None when hidden/unparseable. Thin
+        alias over parse_count_text; kept for call-site clarity."""
+        return YouTubeScraperService.parse_count_text(text)
 
     async def get_channel_subscriber_count(self, channel_id: str) -> tuple[str, Optional[int]]:
         """Resolve a channel's subscriber count. Returns ``(text, count)`` where
@@ -610,6 +659,7 @@ class YouTubeScraperService(ProxyRotatingService):
         immediately without attempting direct connections.
         """
         last_exception = None
+        key_refreshed = False  # refresh the shared key at most once per call
         for attempt in range(1, max_retries + 1):
             key = await self._get_innertube_key()
             url = f"https://www.youtube.com/youtubei/v1/{endpoint}?key={key}"
@@ -663,6 +713,14 @@ class YouTubeScraperService(ProxyRotatingService):
 
                 if response.status_code == 200:
                     return response.json()
+
+                # A key-rejected 400 won't be fixed by rotating proxies — the
+                # key is shared across attempts. Invalidate once so the next
+                # attempt re-fetches a fresh key and reuses it.
+                if not key_refreshed and self._innertube_key_rejected(response.status_code, response.text):
+                    self._invalidate_innertube_key()
+                    key_refreshed = True
+                    logger.warn("innertube_key_rejected_refreshing", endpoint=endpoint, attempt=attempt)
 
                 raise RuntimeError(f"InnerTube POST request failed with status {response.status_code}: {response.text[:200]}")
             except Exception as e:
@@ -786,11 +844,15 @@ class YouTubeScraperService(ProxyRotatingService):
         # Per-request channel sub-count cache: channel_id -> (text, count|None).
         sub_cache: Dict[str, tuple] = {}
         lookups_done = 0
+        scanned = 0            # total videos examined across all pages
+        dropped_over_cap = 0   # resolved but over max_subscribers
+        dropped_unresolved = 0 # channel lookup returned None (hidden OR failed)
 
         async def _passing(new_videos: List[dict]) -> List[dict]:
             """Resolve sub counts for new videos' channels and return only those
             at/under the cap (strict: hidden/unresolvable channels are dropped)."""
-            nonlocal lookups_done
+            nonlocal lookups_done, scanned, dropped_over_cap, dropped_unresolved
+            scanned += len(new_videos)
             # Unique channel ids we haven't resolved yet, bounded by the lookup ceiling.
             need = list(dict.fromkeys(
                 v.get("channel_id") for v in new_videos
@@ -816,18 +878,30 @@ class YouTubeScraperService(ProxyRotatingService):
             for v in new_videos:
                 cid = v.get("channel_id")
                 if not cid or cid not in sub_cache:
+                    dropped_unresolved += 1  # not looked up (ceiling) or no channel id
                     continue  # unresolved channel -> drop (strict)
                 text, count = sub_cache[cid]
-                if count is None or count > max_subscribers:
-                    continue  # hidden or over the cap -> drop
+                if count is None:
+                    dropped_unresolved += 1  # hidden OR lookup failed
+                    continue
+                if count > max_subscribers:
+                    dropped_over_cap += 1
+                    continue
                 kept.append({**v, "subscribers": text, "subscriber_count": count})
             return kept
 
         first = self.extract_videos(data)
         videos = (await _passing(first)) if filtering else first
 
+        # Why the scan stopped — so a caller can tell a trustworthy "0 results"
+        # (we scanned every available result) from a truncated one (we hit a
+        # ceiling and gave up). "limit_reached" / "results_exhausted" are
+        # complete; "lookup_ceiling" / "page_ceiling" are partial.
+        stop_reason = "results_exhausted"
         # Paginate until we have `limit` videos (passing, when filtering).
-        if len(videos) < limit:
+        if len(videos) >= limit:
+            stop_reason = "limit_reached"
+        else:
             tokens = self.find_nested_keys(data, "continuationItemRenderer")
             current_token = None
             if tokens:
@@ -838,6 +912,7 @@ class YouTubeScraperService(ProxyRotatingService):
             try:
                 while current_token and len(videos) < limit and pages < max_pages:
                     if filtering and lookups_done >= config.YOUTUBE_SUBFILTER_MAX_CHANNEL_LOOKUPS:
+                        stop_reason = "lookup_ceiling"
                         break  # lookup ceiling hit
                     pages += 1
                     next_payload = {
@@ -854,6 +929,7 @@ class YouTubeScraperService(ProxyRotatingService):
                         if not any(x["id"] == v["id"] for x in videos):
                             videos.append(v)
                             if len(videos) >= limit:
+                                stop_reason = "limit_reached"
                                 break
 
                     # Extract next continuation token
@@ -862,22 +938,42 @@ class YouTubeScraperService(ProxyRotatingService):
                         current_token = next_tokens[0].get("continuationEndpoint", {}).get("continuationCommand", {}).get("token")
                     else:
                         current_token = None
+                # Loop fell through without hitting a ceiling or the limit:
+                # either we ran out of pages to fetch or exhausted continuations.
+                if stop_reason == "results_exhausted" and pages >= max_pages and current_token:
+                    stop_reason = "page_ceiling"
             except Exception as e:
                 logger.warn("youtube_search_pagination_failed", query=query, error=str(e))
+                stop_reason = "error"
 
         # Slice results to requested limit
         videos = videos[:limit]
 
         if self.db:
-            await self.db.save_youtube_videos(videos)
-            
-        return {
+            save_bg(self.db.save_youtube_videos(videos), log_event="youtube_bg_db_save_failed")
+
+        result = {
             "query": query,
             "sort": sort,
             "timeframe": timeframe,
             "results_count": len(videos),
             "videos": videos
         }
+        # When filtering, tell the caller HOW complete this answer is, so a "0
+        # results" from a fully-scanned query is distinguishable from one that
+        # hit a ceiling and stopped early. `complete=False` means "there may be
+        # more matches I didn't scan" — not "no more matches exist".
+        if filtering:
+            result["filter"] = {
+                "max_subscribers": max_subscribers,
+                "complete": stop_reason in ("results_exhausted", "limit_reached"),
+                "stop_reason": stop_reason,
+                "scanned": scanned,
+                "channels_resolved": lookups_done,
+                "dropped_over_cap": dropped_over_cap,
+                "dropped_unresolved": dropped_unresolved,
+            }
+        return result
 
     async def get_video_details(self, url_or_id: str, comments_limit: int = 20, include_raw: bool = False) -> Dict[str, Any]:
         """Retrieve video details, stream formats, and comments using player and next APIs."""
@@ -1047,13 +1143,19 @@ class YouTubeScraperService(ProxyRotatingService):
             "video_id": video_id,
             "title": title,
             "description": description,
-            "view_count": views,
-            "like_count": likes,
+            # Counts come back in mixed formats (raw "12345" from the player,
+            # "12,345 views" from next). Expose a normalized integer plus the
+            # original string so neither the number nor YouTube's wording is lost.
+            "view_count": self.parse_count_text(views) or 0,
+            "view_count_text": views,
+            "like_count": self.parse_count_text(likes) or 0,
+            "like_count_text": likes,
             "length_seconds": int(details.get("lengthSeconds", "0")) if details.get("lengthSeconds") else 0,
             "channel": {
                 "name": channel_name,
                 "id": channel_id,
                 "subscribers": subscribers,
+                "subscriber_count": self.parse_subscriber_text(subscribers),
                 "url": f"https://www.youtube.com/channel/{channel_id}" if channel_id else ""
             },
             "thumbnails": details.get("thumbnail", {}).get("thumbnails", []),
@@ -1076,15 +1178,15 @@ class YouTubeScraperService(ProxyRotatingService):
             
         if self.db:
             if channel_id:
-                await self.db.save_youtube_channel({
+                save_bg(self.db.save_youtube_channel({
                     "id": channel_id,
                     "name": channel_name,
                     "subscribers": subscribers,
                     "url": f"https://www.youtube.com/channel/{channel_id}"
-                })
-            await self.db.save_youtube_videos([res])
+                }), log_event="youtube_bg_db_save_failed")
+            save_bg(self.db.save_youtube_videos([res]), log_event="youtube_bg_db_save_failed")
             if comments:
-                await self.db.save_youtube_comments(comments, video_id)
+                save_bg(self.db.save_youtube_comments(comments, video_id), log_event="youtube_bg_db_save_failed")
                 
         return res
 
@@ -1182,7 +1284,13 @@ class YouTubeScraperService(ProxyRotatingService):
             # Check other header shapes
             metadata = data.get("metadata", {})
             channel_name = metadata.get("channelMetadataRenderer", {}).get("title", "")
-            
+
+        # The channel's own subscriber count lives in its header — previously
+        # never extracted (saved as ""), so the channel endpoint returned no
+        # subscriber data at all.
+        channel_subscribers = self.extract_subscriber_count(data)
+        channel_subscriber_count = self.parse_subscriber_text(channel_subscribers)
+
         # Backfill channel info into the videos list
         for v in videos:
             if not v.get("channel_id"):
@@ -1193,17 +1301,19 @@ class YouTubeScraperService(ProxyRotatingService):
                 v["channel_url"] = f"https://www.youtube.com/channel/{resolved_channel_id}"
                 
         if self.db:
-            await self.db.save_youtube_channel({
+            save_bg(self.db.save_youtube_channel({
                 "id": resolved_channel_id,
                 "name": channel_name,
-                "subscribers": "",
+                "subscribers": channel_subscribers,
                 "url": f"https://www.youtube.com/channel/{resolved_channel_id}"
-            })
-            await self.db.save_youtube_videos(videos)
-            
+            }), log_event="youtube_bg_db_save_failed")
+            save_bg(self.db.save_youtube_videos(videos), log_event="youtube_bg_db_save_failed")
+
         return {
             "channel_id": resolved_channel_id,
             "channel_name": channel_name,
+            "subscribers": channel_subscribers,
+            "subscriber_count": channel_subscriber_count,
             "tab_type": tab_type,
             "results_count": len(videos),
             "videos": videos
@@ -1232,8 +1342,8 @@ class YouTubeScraperService(ProxyRotatingService):
             playlist_title = metadata.get("playlistMetadataRenderer", {}).get("title", "")
             
         if self.db:
-            await self.db.save_youtube_videos(videos)
-            
+            save_bg(self.db.save_youtube_videos(videos), log_event="youtube_bg_db_save_failed")
+
         return {
             "playlist_id": clean_playlist_id,
             "title": playlist_title,
