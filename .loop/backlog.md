@@ -22,8 +22,11 @@
   (`_try(p)` failover loops ~819/866) are deliberate first-working-proxy
   semantics — parallelizing them would waste the proxy pool and multiply load
   per user request. No N+1 latency bug present.
-- [ ] `youtube.py` `_get_api_key` builds a fresh `requests.Session()` per attempt
-  — confirm whether a reused session would help or hurt proxy rotation. DoD:
-  decision recorded; change only if it measurably helps without breaking rotation.
+- [x] `youtube.py` INNERTUBE_API_KEY lifecycle. RESOLVED (2026-06-25): the
+  per-attempt `requests.Session()` is correct (each attempt uses a different
+  proxy; key fetch isn't a hot path). The real issue was the key being cached
+  forever with no refresh-on-failure. Fixed: TTL reuse + invalidate-once on a
+  key-rejected 400 (`YOUTUBE_INNERTUBE_KEY_TTL`, `_fetch_innertube_key`,
+  `_innertube_key_rejected`). Superseded the session-reuse question.
 
 _Append failures or newly discovered work below._

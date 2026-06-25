@@ -1,5 +1,5 @@
-........................................................................ [ 66%]
-.....................................                                    [100%]
+........................................................................ [ 61%]
+..............................................                           [100%]
 ============================== warnings summary ===============================
 api\main.py:36
   C:\Users\aman\reddit_stealth_scraper\api\main.py:36: DeprecationWarning: 'asyncio.WindowsSelectorEventLoopPolicy' is deprecated and slated for removal in Python 3.16
@@ -10,4 +10,4 @@ api\main.py:36
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
-109 passed, 2 warnings in 16.36s
+118 passed, 2 warnings in 17.12s
