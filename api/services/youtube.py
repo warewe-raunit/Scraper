@@ -24,6 +24,7 @@ if str(ROOT) not in sys.path:
 from tools.browser_manager import launch_browser
 from api.services.proxy_base import ProxyRotatingService
 from api.search_locations import hl_for_country
+from api.services.bg_save import save_bg
 from api import config
 
 logger = structlog.get_logger(__name__)
@@ -892,8 +893,8 @@ class YouTubeScraperService(ProxyRotatingService):
         videos = videos[:limit]
 
         if self.db:
-            await self.db.save_youtube_videos(videos)
-            
+            save_bg(self.db.save_youtube_videos(videos), log_event="youtube_bg_db_save_failed")
+
         result = {
             "query": query,
             "sort": sort,
@@ -1114,15 +1115,15 @@ class YouTubeScraperService(ProxyRotatingService):
             
         if self.db:
             if channel_id:
-                await self.db.save_youtube_channel({
+                save_bg(self.db.save_youtube_channel({
                     "id": channel_id,
                     "name": channel_name,
                     "subscribers": subscribers,
                     "url": f"https://www.youtube.com/channel/{channel_id}"
-                })
-            await self.db.save_youtube_videos([res])
+                }), log_event="youtube_bg_db_save_failed")
+            save_bg(self.db.save_youtube_videos([res]), log_event="youtube_bg_db_save_failed")
             if comments:
-                await self.db.save_youtube_comments(comments, video_id)
+                save_bg(self.db.save_youtube_comments(comments, video_id), log_event="youtube_bg_db_save_failed")
                 
         return res
 
@@ -1231,13 +1232,13 @@ class YouTubeScraperService(ProxyRotatingService):
                 v["channel_url"] = f"https://www.youtube.com/channel/{resolved_channel_id}"
                 
         if self.db:
-            await self.db.save_youtube_channel({
+            save_bg(self.db.save_youtube_channel({
                 "id": resolved_channel_id,
                 "name": channel_name,
                 "subscribers": "",
                 "url": f"https://www.youtube.com/channel/{resolved_channel_id}"
-            })
-            await self.db.save_youtube_videos(videos)
+            }), log_event="youtube_bg_db_save_failed")
+            save_bg(self.db.save_youtube_videos(videos), log_event="youtube_bg_db_save_failed")
             
         return {
             "channel_id": resolved_channel_id,
@@ -1270,8 +1271,8 @@ class YouTubeScraperService(ProxyRotatingService):
             playlist_title = metadata.get("playlistMetadataRenderer", {}).get("title", "")
             
         if self.db:
-            await self.db.save_youtube_videos(videos)
-            
+            save_bg(self.db.save_youtube_videos(videos), log_event="youtube_bg_db_save_failed")
+
         return {
             "playlist_id": clean_playlist_id,
             "title": playlist_title,

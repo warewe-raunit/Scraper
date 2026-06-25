@@ -18,6 +18,7 @@ from tools.unauth_x_scraper import scrape_profile, scrape_search, scrape_thread
 from tools.retry_policy import AttemptOutcome, RetryPolicy, robust_retry
 from tools.proxy_provider import get_proxy_provider
 from api.services.proxy_base import ProxyRotatingService
+from api.services.bg_save import save_bg
 
 logger = structlog.get_logger(__name__)
 
@@ -80,9 +81,9 @@ class XScraperService(ProxyRotatingService):
             if result.get("success"):
                 if self.db:
                     if result.get("profile"):
-                        await self.db.save_x_profile(result["profile"])
+                        save_bg(self.db.save_x_profile(result["profile"]), log_event="x_bg_db_save_failed")
                     if result.get("tweets"):
-                        await self.db.save_x_tweets(result["tweets"])
+                        save_bg(self.db.save_x_tweets(result["tweets"]), log_event="x_bg_db_save_failed")
                 return AttemptOutcome(success=True, result=result)
             logger.warning(
                 "x_profile_attempt_failed_rotating_proxy",
@@ -162,7 +163,7 @@ class XScraperService(ProxyRotatingService):
             )
             if result.get("success"):
                 if self.db and result.get("tweets"):
-                    await self.db.save_x_tweets(result["tweets"])
+                    save_bg(self.db.save_x_tweets(result["tweets"]), log_event="x_bg_db_save_failed")
                 return AttemptOutcome(success=True, result=result)
             logger.warning(
                 "x_search_attempt_failed_rotating_proxy",
@@ -236,7 +237,7 @@ class XScraperService(ProxyRotatingService):
             )
             if result.get("success"):
                 if self.db and result.get("replies"):
-                    await self.db.save_x_tweets(result["replies"])
+                    save_bg(self.db.save_x_tweets(result["replies"]), log_event="x_bg_db_save_failed")
                 return AttemptOutcome(success=True, result=result)
             logger.warning(
                 "x_thread_attempt_failed_rotating_proxy",
