@@ -267,12 +267,14 @@ class YouTubeScraperService(ProxyRotatingService):
                 
         thumbnails = renderer.get("thumbnail", {}).get("thumbnails", [])
         
+        views_display = views_text or short_views_text
         return {
             "id": video_id,
             "video_id": video_id,
             "title": title,
             "description": desc_snippet,
-            "views": views_text or short_views_text,
+            "views": views_display,
+            "view_count": self.parse_count_text(views_display),
             "published_time": published_time,
             "duration": length_text,
             "channel_name": channel_name,
@@ -299,12 +301,18 @@ class YouTubeScraperService(ProxyRotatingService):
             elif isinstance(part, str):
                 contents.append(part)
                 
+        channel_name = ""
         for c in contents:
-            if "views" in c.lower() or "watching" in c.lower():
+            cl = c.lower()
+            if "views" in cl or "watching" in cl:
                 views_text = c
-            elif "ago" in c.lower() or "streamed" in c.lower() or "new" in c.lower():
+            elif "ago" in cl or "streamed" in cl or "premiered" in cl:
                 published_time = c
-                
+            elif not channel_name and not re.match(r"^\d+(?::\d+)+$", c.strip()):
+                # First row that isn't views/time/duration is the channel name
+                # (the new lockup UI buries it here instead of a byline field).
+                channel_name = c
+
         # Duration
         length_text = ""
         badges = self.find_nested_keys(vm, "thumbnailBadgeViewModel")
@@ -338,9 +346,10 @@ class YouTubeScraperService(ProxyRotatingService):
             "title": title,
             "description": "",
             "views": views_text,
+            "view_count": self.parse_count_text(views_text),
             "published_time": published_time,
             "duration": length_text,
-            "channel_name": "",
+            "channel_name": channel_name,
             "channel_id": channel_id,
             "channel_url": f"https://www.youtube.com/channel/{channel_id}" if channel_id else "",
             "thumbnails": thumbnails,
@@ -533,25 +542,24 @@ class YouTubeScraperService(ProxyRotatingService):
         return ""
 
     @staticmethod
-    def parse_subscriber_text(text: Optional[str]) -> Optional[int]:
-        """Parse YouTube's subscriber-count text into an integer, or None when
-        hidden/unparseable.
+    def parse_count_text(text: Optional[str]) -> Optional[int]:
+        """Parse any YouTube count string into an integer, or None when
+        absent/unparseable. Works for views, likes, and subscribers alike.
 
         Handles abbreviated forms (K/M/B, which YouTube rounds, so the result is
-        approximate near boundaries) and plain comma-grouped counts:
-            "1.2M subscribers" -> 1_200_000
+        approximate near boundaries), plain comma-grouped counts, and raw ints:
+            "1.2M views"        -> 1_200_000
             "12.3K subscribers" -> 12_300
-            "1,234 subscribers" -> 1_234
-            "1.1B subscribers"  -> 1_100_000_000
-            "No subscribers" / "" / None -> None
+            "1,234 likes"       -> 1_234
+            "12345"             -> 12_345
+            "No views" / "" / None -> None
         """
         if not text:
             return None
-        m = re.search(r"([\d,]+(?:\.\d+)?)\s*([KMB])?", text, re.IGNORECASE)
+        m = re.search(r"([\d,]+(?:\.\d+)?)\s*([KMB])?", str(text), re.IGNORECASE)
         if not m:
             return None
-        num_str, suffix = m.group(1), m.group(2)
-        num_str = num_str.replace(",", "")
+        num_str, suffix = m.group(1).replace(",", ""), m.group(2)
         try:
             value = float(num_str)
         except ValueError:
@@ -560,6 +568,12 @@ class YouTubeScraperService(ProxyRotatingService):
             (suffix or "").lower(), 1
         )
         return int(value * mult)
+
+    @staticmethod
+    def parse_subscriber_text(text: Optional[str]) -> Optional[int]:
+        """Subscriber-count text -> int, or None when hidden/unparseable. Thin
+        alias over parse_count_text; kept for call-site clarity."""
+        return YouTubeScraperService.parse_count_text(text)
 
     async def get_channel_subscriber_count(self, channel_id: str) -> tuple[str, Optional[int]]:
         """Resolve a channel's subscriber count. Returns ``(text, count)`` where
@@ -1129,13 +1143,19 @@ class YouTubeScraperService(ProxyRotatingService):
             "video_id": video_id,
             "title": title,
             "description": description,
-            "view_count": views,
-            "like_count": likes,
+            # Counts come back in mixed formats (raw "12345" from the player,
+            # "12,345 views" from next). Expose a normalized integer plus the
+            # original string so neither the number nor YouTube's wording is lost.
+            "view_count": self.parse_count_text(views) or 0,
+            "view_count_text": views,
+            "like_count": self.parse_count_text(likes) or 0,
+            "like_count_text": likes,
             "length_seconds": int(details.get("lengthSeconds", "0")) if details.get("lengthSeconds") else 0,
             "channel": {
                 "name": channel_name,
                 "id": channel_id,
                 "subscribers": subscribers,
+                "subscriber_count": self.parse_subscriber_text(subscribers),
                 "url": f"https://www.youtube.com/channel/{channel_id}" if channel_id else ""
             },
             "thumbnails": details.get("thumbnail", {}).get("thumbnails", []),
@@ -1264,7 +1284,13 @@ class YouTubeScraperService(ProxyRotatingService):
             # Check other header shapes
             metadata = data.get("metadata", {})
             channel_name = metadata.get("channelMetadataRenderer", {}).get("title", "")
-            
+
+        # The channel's own subscriber count lives in its header — previously
+        # never extracted (saved as ""), so the channel endpoint returned no
+        # subscriber data at all.
+        channel_subscribers = self.extract_subscriber_count(data)
+        channel_subscriber_count = self.parse_subscriber_text(channel_subscribers)
+
         # Backfill channel info into the videos list
         for v in videos:
             if not v.get("channel_id"):
@@ -1278,14 +1304,16 @@ class YouTubeScraperService(ProxyRotatingService):
             save_bg(self.db.save_youtube_channel({
                 "id": resolved_channel_id,
                 "name": channel_name,
-                "subscribers": "",
+                "subscribers": channel_subscribers,
                 "url": f"https://www.youtube.com/channel/{resolved_channel_id}"
             }), log_event="youtube_bg_db_save_failed")
             save_bg(self.db.save_youtube_videos(videos), log_event="youtube_bg_db_save_failed")
-            
+
         return {
             "channel_id": resolved_channel_id,
             "channel_name": channel_name,
+            "subscribers": channel_subscribers,
+            "subscriber_count": channel_subscriber_count,
             "tab_type": tab_type,
             "results_count": len(videos),
             "videos": videos
