@@ -50,7 +50,15 @@ def _build(enum_name: str, ids: List[str]) -> Optional[Type[Enum]]:
     if not members:
         return None
     # str-mixin Enum (3.10-compatible). type=str makes each member a real str.
-    return Enum(enum_name, members, type=str)
+    cls = Enum(enum_name, members, type=str)
+    # Pickle serializes an enum member by qualified name (<module>.<__qualname__>),
+    # and __qualname__ here is `enum_name`. The functional API binds the class to a
+    # private var, so without this the lookup `api.account_choices.<enum_name>`
+    # fails — and under multi-worker (loguru enqueue=True) any log record carrying
+    # an account_id enum raises PicklingError and the line is DROPPED. Register the
+    # class under its own name so members are picklable.
+    globals()[enum_name] = cls
+    return cls
 
 
 def account_id_value(account_id) -> str:
