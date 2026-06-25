@@ -114,6 +114,9 @@ def test_filter_reports_completeness_and_drop_breakdown(monkeypatch):
     assert f["dropped_over_cap"] == 1      # UCbig
     assert f["dropped_unresolved"] == 1    # UChidden
     assert out["results_count"] == 1       # UCsmall kept
+    # Invariant: every scanned video lands in exactly one bucket. If this breaks,
+    # the completeness counters are lying and a "0 results" answer can't be trusted.
+    assert out["results_count"] + f["dropped_over_cap"] + f["dropped_unresolved"] == f["scanned"]
 
 
 def test_none_is_noop_no_channel_lookups(monkeypatch):
