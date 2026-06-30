@@ -25,6 +25,12 @@ ExecStart=/bin/bash deployment/start_api.sh
 
 Restart=always
 RestartSec=5
+# Raise the file-descriptor ceiling. The proxy health daemon opens hundreds of
+# concurrent sockets (GOODPROXIES_HEALTHCHECK_WORKERS) every few seconds, and each
+# worker also opens session-cookie files. The default 1024 soft limit gets
+# exhausted under load -> "[Errno 24] Too many open files": session reads fail
+# (LinkedIn 401s) and proxy healthchecks can't run (the pool starves to ~17 live).
+LimitNOFILE=1048576
 StandardOutput=journal
 StandardError=journal
 
